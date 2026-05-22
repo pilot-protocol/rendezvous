@@ -1,5 +1,9 @@
 # rendezvous
 
+[![ci](https://github.com/pilot-protocol/rendezvous/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/rendezvous/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/rendezvous/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/rendezvous)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 The Pilot Protocol rendezvous server. Tracks node registrations, network memberships, trust links, and routing state for the overlay. Supports hot-standby replication, WAL-backed durability, an admin REST API, and a live operational dashboard.
 
 > **This repository is published for source-code transparency and auditability.** It is **not** a self-hosting guide. The canonical Pilot Protocol rendezvous is operated by Vulture Labs at `34.71.57.205:9000` (with the companion beacon at `34.71.57.205:9001`); production daemons connect there by default. If you want to read the code that produced the binary your daemon is talking to, you're in the right place.
@@ -43,3 +47,7 @@ go build ./cmd/rendezvous
 ```
 
 The build is hermetic Go with no cgo; any Go toolchain at the version pinned in `go.mod` will reproduce the binary.
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
