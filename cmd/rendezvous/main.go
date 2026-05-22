@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/beacon"
+	"github.com/pilot-protocol/beacon"
 	"github.com/TeoSlayer/pilotprotocol/pkg/config"
 	"github.com/TeoSlayer/pilotprotocol/pkg/logging"
 	registry "github.com/pilot-protocol/rendezvous"

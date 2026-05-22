@@ -41,3 +41,7 @@ replace github.com/pilot-protocol/policy => ../policy
 replace github.com/pilot-protocol/handshake => ../handshake
 
 replace github.com/pilot-protocol/runtime => ../runtime
+
+require github.com/pilot-protocol/beacon v0.0.0
+
+replace github.com/pilot-protocol/beacon => ../beacon
