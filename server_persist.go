@@ -64,7 +64,7 @@ type rawNodeCopy struct {
 // to replicas. Non-blocking: actual serialization happens in saveLoop
 // (disk) and replicaPushLoop (replicas), each on its own cadence.
 // Caller must hold s.mu (read or write lock).
-// Delegated to walStore (R6.1).
+// Delegated to walStore.
 func (s *Server) save() {
 	s.walStore.TriggerSave()
 }
@@ -172,7 +172,7 @@ func (s *Server) flushSave() error {
 		}
 	}
 
-	// Copy trust pairs and handshake inboxes from the trust sub-package (R2.1).
+	// Copy trust pairs and handshake inboxes from the trust sub-package.
 	trustPairs := s.trust.Pairs()
 	handshakeInbox, handshakeResponses := s.trust.InboxSnapshot()
 	var inviteInbox map[uint32][]*NetworkInvite
@@ -343,7 +343,7 @@ func (s *Server) flushSave() error {
 	s.restartMu.Unlock()
 	snap.LastHeartbeat = s.lastHeartbeatMs.Load()
 
-	// Snapshot probe states from dashboard Handler (R5.1).
+	// Snapshot probe states from dashboard Handler.
 	snap.ProbeStates = s.dashboard.GetProbeStates()
 	snap.TotalNodes = nodeCount
 	snap.OnlineNodes = onlineCount
@@ -547,7 +547,7 @@ func (s *Server) load() error {
 		s.restartMu.Unlock()
 
 		// Restore per-probe state into the dashboard Handler and account for the
-		// downtime gap between the prior last-success timestamp and now (R5.1).
+		// downtime gap between the prior last-success timestamp and now.
 		if len(snap.ProbeStates) > 0 {
 			probeCutoff := time.Now().Add(-dashpkg.ProbeRetention).UnixMilli()
 			restored := make(map[string]*dashpkg.ProbeState, len(snap.ProbeStates))
@@ -697,7 +697,7 @@ func (s *Server) load() error {
 		s.networks[n.ID] = net
 	}
 
-	// Restore trust pairs (R2.1: delegate to trust sub-package)
+	// Restore trust pairs (delegated to the trust sub-package).
 	s.trust.RestorePairs(snap.TrustPairs)
 	if len(snap.TrustPairs) > 0 {
 		slog.Info("loaded trust pairs", "count", len(snap.TrustPairs))
@@ -713,7 +713,7 @@ func (s *Server) load() error {
 		slog.Info("loaded pub_key_idx", "persisted", len(snap.PubKeyIdx), "total", len(s.pubKeyIdx))
 	}
 
-	// Restore handshake inboxes (R2.1: delegate to trust sub-package)
+	// Restore handshake inboxes (delegated to the trust sub-package).
 	{
 		inboxMap := make(map[uint32][]*trustpkg.HandshakeRelayMsg, len(snap.HandshakeInbox))
 		respMap := make(map[uint32][]*trustpkg.HandshakeResponseMsg, len(snap.HandshakeResponses))
@@ -799,9 +799,9 @@ func (s *Server) load() error {
 
 	// Restore enterprise config (IDP, audit export, RBAC pre-assignments).
 	// Validate the persisted URL even though the setter would have validated it
-	// at configuration time — snapshots predating the urlvalidate extraction
-	// (commit a318fe4) may contain URLs that would be rejected today, and a
-	// compromised primary in replication scenarios could write hostile values.
+	// at configuration time — older snapshots may contain URLs that would be
+	// rejected today, and a compromised primary in replication scenarios could
+	// write hostile values.
 	if snap.IDPConfig != nil {
 		if err := urlvalidate.Validate(snap.IDPConfig.URL); err != nil {
 			slog.Warn("skipping restored IDP config with invalid URL", "url", snap.IDPConfig.URL, "err", err)

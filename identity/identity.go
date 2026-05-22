@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package identity implements the registry's identity, key-lifecycle, and
-// identity-provider handlers. It is extracted from pkg/registry/server as
-// part of the R2.3 registry decomposition.
+// identity-provider handlers.
 //
 // Thread safety: all exported methods are safe for concurrent use.
 package identity

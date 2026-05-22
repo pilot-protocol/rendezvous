@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package dashboard — stats types and stats-collector loop (R5.2).
+// Package dashboard — stats types and stats-collector loop.
 //
-// This file holds the time-series types (StatsSample, NetHistoryRing,
+// This file holds the time-series types: StatsSample, NetHistoryRing,
 // NetworkSampleEntry, NetworkStats, DashboardStats, BeaconStatsProvider,
-// ReleaseBanner, StatsSampleResult) that were extracted from
-// pkg/registry/server/server.go as part of the R5.2 decomposition.
+// ReleaseBanner, StatsSampleResult.
 
 package dashboard
 

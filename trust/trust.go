@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package trust implements the registry's trust-pair and handshake-relay
-// store. It is extracted from pkg/registry/server as part of the R2.1
-// registry decomposition.
+// store.
 //
 // Thread safety: all exported methods are safe for concurrent use.
 package trust

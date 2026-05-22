@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package routing implements the beacon-registration and NAT punch-coordination
-// handlers extracted from the registry server (R1.4 decomposition).
+// handlers for the registry server.
 //
 // The package owns the beacon cluster state (registration, TTL-based listing)
 // and the punch endpoint lookup.  It exposes a Store that holds the beacon

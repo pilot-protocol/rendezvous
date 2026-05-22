@@ -7,11 +7,8 @@ package server
 // (e.g. "register", "create_network", ...) to a thin closure that calls
 // the corresponding `s.handleX(...)` method on *Server.
 //
-// This file is the R3 dispatch layer per architecture-notes/07-REGISTRY-LAYERS.md.
 // Handlers themselves stay defined as methods on *Server (in server.go and
-// related files); this layer only routes msgType -> handler. Tier R0.1
-// of the registry-server extraction plan: refactor only, zero behavior
-// change.
+// related files); this layer only routes msgType -> handler.
 type Handler func(s *Server, msg map[string]interface{}, remoteAddr string) (map[string]interface{}, error)
 
 // handlers is the dispatch table consulted by Server.handleMessage.

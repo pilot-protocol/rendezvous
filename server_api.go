@@ -140,10 +140,9 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 		}
 	}
 
-	// R3 dispatch: registration-table lookup replaces the previous
-	// 130-line switch (Tier R0.1 of the registry-server extraction plan).
-	// Behavior is byte-identical to the prior switch — the unknown-type
-	// error path uses the same %q-quoted message.
+	// Dispatch via the registration-table lookup in dispatch.go.
+	// The unknown-type error path uses the same %q-quoted message
+	// as the historical switch this replaced.
 	h, ok := handlers[msgType]
 	if !ok {
 		return nil, fmt.Errorf("unknown message type: %q", msgType)
@@ -151,7 +150,7 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 	return h(s, msg, remoteAddr)
 }
 
-// --- routing.PunchBackend implementation (R1.4) ---
+// --- routing.PunchBackend implementation ---
 //
 // These methods satisfy routing.PunchBackend so routing.Store can call back
 // into the server for node lookups without importing the server package.

@@ -9,10 +9,10 @@ import (
 )
 
 // dispatchMsgTypes is the full set of msgTypes routed by handleMessage's
-// dispatch switch (server.go:2017-2148). This is hard-coded because R0.5
-// is a pre-extraction pin: if the dispatch switch grows or shrinks, this
-// list MUST be updated to match — adding to one without the other is the
-// exact failure mode this test exists to catch.
+// dispatch switch (server.go:2017-2148). This is hard-coded as a pin: if
+// the dispatch switch grows or shrinks, this list MUST be updated to
+// match — adding to one without the other is the exact failure mode this
+// test exists to catch.
 //
 // Order matches the dispatch switch top-to-bottom for ease of review.
 var dispatchMsgTypes = []string{

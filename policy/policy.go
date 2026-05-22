@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package policy implements the registry's network-policy and expression-policy
-// handlers. It is extracted from pkg/registry/server as part of the R2.4
-// registry decomposition.
+// handlers.
 //
 // Thread safety: all exported methods are safe for concurrent use; locking is
 // delegated to the Read/Write callbacks supplied by the parent server.

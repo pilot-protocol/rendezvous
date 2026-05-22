@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package audit manages the registry audit log ring buffer and optional
-// external export (Splunk HEC, syslog/CEF, plain JSON). It is extracted
-// from the registry server monolith as part of the R1.2 decomposition plan
-// (architecture-notes/08-REGISTRY-EXTRACTION.md).
+// external export (Splunk HEC, syslog/CEF, plain JSON).
 //
 // Fan-out from the server's audit() helper to the ring buffer and exporter
 // is async: server.audit() publishes an "audit.entry" event on the shared

@@ -2,11 +2,11 @@
 
 package server
 
-// dashboard.go — thin shim that wires Server to the dashboard sub-package (R5.1).
+// dashboard.go — thin shim that wires Server to the dashboard sub-package.
 //
-// All HTTP serving, probe-loop, pulse-ring, and banner state have been extracted
-// to pkg/registry/server/dashboard. This file keeps the public methods on Server
-// that callers (cmd/rendezvous, tests) already depend on.
+// All HTTP serving, probe-loop, pulse-ring, and banner state live in the
+// dashboard sub-package. This file keeps the public methods on Server that
+// callers (cmd/rendezvous, tests) already depend on.
 
 import (
 	"strings"

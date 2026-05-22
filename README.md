@@ -1,13 +1,14 @@
 # rendezvous
 
-Pilot Protocol rendezvous server. Tracks node registrations, network
-memberships, trust links, and routing state for the overlay; supports
-hot-standby replication, WAL-backed durability, an admin REST API,
-and a live operational dashboard.
+The Pilot Protocol rendezvous server. Tracks node registrations, network memberships, trust links, and routing state for the overlay. Supports hot-standby replication, WAL-backed durability, an admin REST API, and a live operational dashboard.
 
-This is a **standalone binary**, not a daemon plugin. Operators run
-one (or a hot-standby pair) at the network edge; daemons connect to
-it via `pkg/registry/client` in the protocol repo.
+> **This repository is published for source-code transparency and auditability.** It is **not** a self-hosting guide. The canonical Pilot Protocol rendezvous is operated by Vulture Labs at `34.71.57.205:9000` (with the companion beacon at `34.71.57.205:9001`); production daemons connect there by default. If you want to read the code that produced the binary your daemon is talking to, you're in the right place.
+
+## Architecture
+
+The rendezvous is the control plane for the overlay. Daemons register here on startup, look up peers, fetch network membership, and stream live events. It is intentionally a small, durable service: registrations + memberships + trust links live in a JSON-encoded store, all state mutations go through a WAL, and a leader/follower pair can run hot-standby behind a virtual IP.
+
+The server speaks a length-prefixed JSON RPC over TCP on port 9000 (registry) and exposes an admin REST API and live HTML+JSON dashboard on port 3000. Beacon coordination runs alongside on the companion beacon process (see the `beacon` repo).
 
 ## Layout
 
@@ -18,7 +19,7 @@ it via `pkg/registry/client` in the protocol repo.
 | `api/` | HTTP/JSON admin API handlers. |
 | `audit/` | Audit-log emitter + export. |
 | `authz/` | Admin-token bearer auth. |
-| `dashboard/` | Live HTML+JSON dashboard (R5.1). |
+| `dashboard/` | Live HTML+JSON dashboard. |
 | `directory/` | Node-info directory + caches. |
 | `events/` | Pub/sub event bus for clients. |
 | `identity/` | Ed25519 identity verification. |
@@ -30,35 +31,15 @@ it via `pkg/registry/client` in the protocol repo.
 | `trust/` | Trust-link replication + validation. |
 | `wal/` | Write-ahead log for durable persistence. |
 | `webhook/` | Outbound webhook dispatcher. |
-| `cmd/rendezvous/` | Production binary (`pilot-rendezvous`). |
-| `cmd/registry/` | Minimal variant used by some test fixtures. |
+| `cmd/rendezvous/` | Production binary entrypoint. |
+| `cmd/registry/` | Minimal variant used by test fixtures. |
 
-## Build + run
+## Build locally
+
+If you want to compile the source locally — for example to read the exact binary that produced your daemon's traffic, or to step through it under a debugger:
 
 ```bash
-go build -o pilot-rendezvous ./cmd/rendezvous
-./pilot-rendezvous -beacon :9001 -listen :9000 -store /var/lib/pilot/registry.json
+go build ./cmd/rendezvous
 ```
 
-## Import paths
-
-Daemon-side consumers in the protocol repo still get the client +
-wire format from `pkg/registry/{client,wire}`. The server-side
-package is imported only by test fixtures:
-
-```go
-import "github.com/pilot-protocol/rendezvous"
-
-s := rendezvous.NewWithStore(beaconAddr, "")
-go s.ListenAndServe(":0")
-```
-
-(Note the package name is still `server` inside the module — the
-external module path is `rendezvous`. We'll rename the package on a
-future tag if it bothers anyone.)
-
-## Releasing
-
-Tag a SemVer version (e.g. `v0.1.0`); web4's test fixtures consume
-this via `require github.com/pilot-protocol/rendezvous v0.1.0`.
-During co-development consumers use `replace ../rendezvous`.
+The build is hermetic Go with no cgo; any Go toolchain at the version pinned in `go.mod` will reproduce the binary.

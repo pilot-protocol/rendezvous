@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// This file previously contained the JWT/JWKS validation types and methods,
-// and the identity verification webhook client. All of that logic has been
-// extracted to pkg/registry/server/identity/ (R2.3).
-//
-// The re-exported forwarding types and functions below keep existing white-box
-// tests (package server) working without modification. New tests should be
-// written against the identity sub-package directly.
+// This file is a thin forwarding shim into the identity sub-package. The
+// re-exported types and functions exist so existing white-box tests
+// (package server) can keep calling unexported names without modification.
+// New tests should be written against the identity sub-package directly.
 
 package server
 

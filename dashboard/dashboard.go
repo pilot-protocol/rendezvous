@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package dashboard implements the HTTP dashboard server, probe loop, and
-// pulse-sample ring for the Pilot Protocol registry. It is extracted from
-// pkg/registry/server as part of the R5.1 registry decomposition.
+// pulse-sample ring for the Pilot Protocol registry.
 //
 // Thread safety: all exported Handler methods are safe for concurrent use.
 package dashboard

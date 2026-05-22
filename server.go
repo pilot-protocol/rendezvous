@@ -152,10 +152,10 @@ type Server struct {
 	deltaLog *deltaLog
 
 	// Beacon cluster: beacon instances register themselves for peer discovery.
-	// Kept as a nil placeholder; live state is owned by s.routing (R1.4).
+	// Kept as a nil placeholder; live state is owned by s.routing.
 	beacons map[uint32]*beaconEntry
 
-	// routing holds the extracted beacon/punch routing handlers (R1.4).
+	// routing holds the beacon/punch routing handlers.
 	routing *routing.Store
 
 	// Prometheus metrics

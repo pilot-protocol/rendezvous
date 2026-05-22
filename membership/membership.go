@@ -3,8 +3,6 @@
 // Package membership implements the registry's network membership handlers:
 // create, delete, rename, join, leave, invite, kick, promote, demote,
 // transfer-ownership, role query, member-tags, task-exec, and list-networks.
-// It is extracted from pkg/registry/server as part of the R4.1 registry
-// decomposition.
 //
 // Thread safety: all exported Handler* methods are safe for concurrent use.
 // Locking is delegated to the server through mu (shared with Server) and

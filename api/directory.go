@@ -6,12 +6,11 @@ import "time"
 
 // NodeInfo is a read-only snapshot of a directory entry.
 //
-// Field shape mirrors pkg/registry/server.NodeInfo so that adoption
-// (in later extraction tiers) is mechanical: the directory store will
-// either type-alias api.NodeInfo or copy fields into it on read. The
-// internal atomic counters that today live on server.NodeInfo
-// (lastSeenNano, lastVerifiedNano) are intentionally absent — readers
-// receive the resolved LastSeen value, not the raw atomic.
+// Field shape mirrors the internal server.NodeInfo so the directory store
+// can either type-alias api.NodeInfo or copy fields into it on read. The
+// internal atomic counters that live on server.NodeInfo (lastSeenNano,
+// lastVerifiedNano) are intentionally absent — readers receive the
+// resolved LastSeen value, not the raw atomic.
 type NodeInfo struct {
 	ID         uint32
 	Owner      string // email or identifier (for key rotation)

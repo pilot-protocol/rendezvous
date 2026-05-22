@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package wal implements the write-ahead log (WAL) and persistence lifecycle
-// for the registry server. It is extracted from pkg/registry/server as part
-// of the registry monolith decomposition (R6.1).
+// for the registry server.
 //
 // The WAL closes the data-loss window between snapshot saves. flushSave runs
 // on saveLoopInterval (5s); a crash between saves would otherwise drop every

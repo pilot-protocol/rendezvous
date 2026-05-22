@@ -2,8 +2,7 @@
 
 // Package directory implements the registry's node directory: registration,
 // lookup, resolve, deregister, heartbeat, list-nodes, hostname/tag/visibility
-// management, and the stale-node reaper. It is extracted from
-// pkg/registry/server as part of the R4.2 registry decomposition.
+// management, and the stale-node reaper.
 //
 // Thread safety: all exported Handler* methods are safe for concurrent use.
 // Locking is delegated to the server through mu (shared with Server) and

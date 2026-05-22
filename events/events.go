@@ -1,23 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Package events provides an in-process publish/subscribe event bus for
-// the registry server's internal layers (R2-R7) to communicate without
-// importing each other.
+// the registry server's internal layers to communicate without importing
+// each other.
 //
-// The bus is the structural fix for the R5 sibling rule defined in
-// architecture-notes/07-REGISTRY-LAYERS.md: directory, membership,
-// trust, policy, polo, identity, and routing stores never import each
-// other. Cross-store side effects (e.g. directory cache invalidation
-// when membership changes, key-index updates when identity rotates a
-// key) flow through Bus.Publish / Bus.Subscribe instead.
-//
-// Same shape as pkg/coreapi.EventBus on the daemon side; different
-// package because the registry server's L8 surface is distinct from
-// the daemon's L10 plugin ABI.
-//
-// This file is Tier R0.2 of the registry-server extraction plan
-// (architecture-notes/08-REGISTRY-EXTRACTION.md). It has zero
-// consumers; subsequent tiers wire it into existing handlers.
+// The bus enforces the store-sibling rule: directory, membership, trust,
+// policy, polo, identity, and routing stores never import each other.
+// Cross-store side effects (e.g. directory cache invalidation when
+// membership changes, key-index updates when identity rotates a key)
+// flow through Bus.Publish / Bus.Subscribe instead.
 package events
 
 import (

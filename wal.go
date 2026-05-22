@@ -4,7 +4,7 @@ package server
 
 // This file re-exports WAL types from the wal sub-package so that the rest of
 // the server package can reference them without qualification. The actual
-// implementation lives in pkg/registry/server/wal (R6.1 extraction).
+// implementation lives in the wal sub-package.
 
 import walpkg "github.com/pilot-protocol/rendezvous/wal"
 
