@@ -1,6 +1,6 @@
 module github.com/pilot-protocol/rendezvous
 
-go 1.25.3
+go 1.25.10
 
 require (
 	github.com/TeoSlayer/pilotprotocol v0.0.0
@@ -9,8 +9,8 @@ require (
 
 require (
 	github.com/coder/websocket v1.8.14 // indirect
-	golang.org/x/net v0.54.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 )
 
 replace github.com/TeoSlayer/pilotprotocol => ../web4

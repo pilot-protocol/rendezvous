@@ -5,7 +5,9 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
@@ -147,6 +149,28 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 	if !ok {
 		return nil, fmt.Errorf("unknown message type: %q", msgType)
 	}
+
+	// Per-request panic boundary: a panicking handler must not crash
+	// the registry process — registries serve the entire fleet, so
+	// "one bad request" cannot be a DoS vector. Convert the panic to
+	// a normal error; the offending caller gets an error response,
+	// every other in-flight request is unaffected. The metric defer
+	// above still fires (it runs LIFO after this defer); ErrorsTotal
+	// gets incremented via the err != nil branch.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("registry handler panic recovered: type=%q panic=%v", msgType, r)
+			resp = nil
+			s.metrics.ErrorsTotal.WithLabel(msgType + ":panic").Inc()
+			slog.Error("registry handler panicked",
+				"type", msgType,
+				"panic", fmt.Sprintf("%v", r),
+				"remote_addr", remoteAddr,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+
 	return h(s, msg, remoteAddr)
 }
 

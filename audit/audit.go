@@ -12,6 +12,7 @@ package audit
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -279,7 +280,11 @@ func BuildEntry(action string, netID uint16, nodeID uint32, attrs ...any) Entry 
 			if details != "" {
 				details += ", "
 			}
-			details += fmt.Sprintf("%s=%v", k, attrs[i+1])
+			val := attrs[i+1]
+			if redactKey(k) {
+				val = "<redacted>"
+			}
+			details += fmt.Sprintf("%s=%v", k, val)
 		}
 	}
 
@@ -290,4 +295,32 @@ func BuildEntry(action string, netID uint16, nodeID uint32, attrs ...any) Entry 
 		NodeID:    nodeID,
 		Details:   details,
 	}
+}
+
+// redactKey returns true when an attribute key is known to carry
+// secret material that must not be persisted in the audit log.
+//
+// The audit log was already a security-relevant surface (anyone with
+// log read can replay history); leaving tokens and passwords in the
+// Details field made it ALSO a credential-disclosure surface. The
+// redaction list is conservative — only fields whose name strongly
+// implies "secret" are redacted; legitimate non-secret keys with
+// similar names should be renamed in the call site rather than added
+// to an exclude list.
+func redactKey(k string) bool {
+	switch strings.ToLower(k) {
+	case "token", "admin_token", "password", "passwd", "secret",
+		"api_key", "apikey", "private_key", "signature", "challenge",
+		"auth", "authorization", "bearer", "credential", "credentials":
+		return true
+	}
+	// Suffix heuristic: anything ending in "_token", "_secret",
+	// "_password", "_key" is treated as sensitive.
+	low := strings.ToLower(k)
+	for _, suf := range []string{"_token", "_secret", "_password", "_key"} {
+		if strings.HasSuffix(low, suf) {
+			return true
+		}
+	}
+	return false
 }
