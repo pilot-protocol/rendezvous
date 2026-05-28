@@ -1394,13 +1394,24 @@ func (st *Store) HandleResolveHostname(msg map[string]interface{}) (map[string]i
 // --------------------------------------------------------------------------
 
 // HandleListNodes handles a list_nodes message.
+//
+// All networks (backbone and non-backbone) require the admin token.
+// The previous behaviour — non-backbone listings were unauthenticated —
+// was a P0 enumeration vector: any peer on the overlay could
+// enumerate any network's members by sending list_nodes(network_id=N).
+// All six production daemon call sites already pass the admin token,
+// so the tighter policy doesn't break existing legitimate callers.
 func (st *Store) HandleListNodes(msg map[string]interface{}, requireAdminToken func(msg map[string]interface{}) error) (map[string]interface{}, error) {
 	netID := jsonUint16(msg, "network_id")
 
-	if netID == 0 {
-		if err := requireAdminToken(msg); err != nil {
+	if err := requireAdminToken(msg); err != nil {
+		if netID == 0 {
 			return nil, fmt.Errorf("listing backbone nodes is not permitted (use lookup with a specific node_id)")
 		}
+		return nil, fmt.Errorf("list_nodes(network_id=%d): admin token required", netID)
+	}
+
+	if netID == 0 {
 		body, err := st.AdminListNodesCached()
 		if err != nil {
 			return nil, err
