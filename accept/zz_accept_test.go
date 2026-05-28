@@ -202,3 +202,30 @@ func TestLogSamplerSuppressesIntermediateOccurrences(t *testing.T) {
 		t.Fatal("5th occurrence (interval hit) should log")
 	}
 }
+
+// ── TLS config hardening tests ───────────────────────────────────────────
+
+func TestSetTLSMinVersionAndCiphers(t *testing.T) {
+	t.Parallel()
+	// Self-signed path: SetTLS("","") exercises the hardened tls.Config.
+	a := NewAcceptor(10, nil)
+	if err := a.SetTLS("", ""); err != nil {
+		t.Fatalf("SetTLS: %v", err)
+	}
+	cfg := a.TLSConfig()
+	if cfg == nil {
+		t.Fatal("TLSConfig is nil after SetTLS")
+	}
+	if cfg.MinVersion == 0 {
+		t.Fatal("MinVersion is zero — TLS 1.0 / 1.1 allowed")
+	}
+	if cfg.MinVersion < tls.VersionTLS12 {
+		t.Fatalf("MinVersion=%d < TLS 1.2", cfg.MinVersion)
+	}
+	if len(cfg.CipherSuites) == 0 {
+		t.Fatal("CipherSuites is empty")
+	}
+	if len(cfg.CurvePreferences) == 0 {
+		t.Fatal("CurvePreferences is empty")
+	}
+}
