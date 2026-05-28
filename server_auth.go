@@ -244,6 +244,7 @@ func (s *Server) verifyNodeSignature(node *NodeInfo, msg map[string]interface{},
 	return authzpkg.VerifyNodeSignature(node.PublicKey, s.authz.AdminToken(), msg, challenge)
 }
 
+
 // verifyHeartbeatSignature verifies a signature using a detached public key and
 // a pre-copied admin token. All values are copied under RLock before calling,
 // so this method requires no lock and is safe for concurrent heartbeat processing.

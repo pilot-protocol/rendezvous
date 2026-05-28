@@ -118,18 +118,45 @@ func (ls *logSampler) Cleanup() {
 // ── Rate limiter ──────────────────────────────────────────────────────────────
 
 // RateLimiter tracks per-IP registration attempts using a token bucket.
+//
+// Whitelist (optional): a list of CIDR ranges, each paired with an
+// elevated per-window rate. When an IP falls into a whitelist CIDR, its
+// bucket is created (or refilled toward) the elevated rate instead of
+// the default `rate`. Whitelisted IPs also bypass the maxBuckets cap —
+// since IP whitelisting is an operator-set trust signal and TCP source
+// addresses cannot be spoofed, it is safe to always grant them a bucket
+// slot. The whitelist is consulted only on bucket creation; existing
+// buckets retain whatever per-bucket rate they were created with until
+// they go idle and Cleanup() evicts them, after which the next request
+// will re-evaluate the whitelist.
 type RateLimiter struct {
 	mu         sync.Mutex
 	buckets    map[string]*bucket
 	rate       int
 	window     time.Duration
 	maxBuckets int
+	whitelist  []whitelistRule
 	now        func() time.Time
+}
+
+// WhitelistEntry pairs a CIDR with its elevated per-window rate. Operator-
+// supplied via RateLimiter.SetWhitelist / Acceptor.SetRateLimitWhitelist.
+// Empty CIDR or non-positive Rate is rejected by SetWhitelist.
+type WhitelistEntry struct {
+	CIDR string
+	Rate int
+}
+
+// whitelistRule is the parsed internal form of a WhitelistEntry.
+type whitelistRule struct {
+	net  *net.IPNet
+	rate int
 }
 
 type bucket struct {
 	tokens   float64
 	lastFill time.Time
+	rate     int // per-bucket rate (default or whitelist-elevated; set at creation)
 }
 
 // NewRateLimiter creates a rate limiter allowing rate requests per window per IP.
@@ -164,26 +191,41 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	now := rl.now()
 	b, ok := rl.buckets[ip]
 	if !ok {
-		if rl.maxBuckets > 0 && len(rl.buckets) >= rl.maxBuckets {
-			threshold := now.Add(-2 * rl.window)
-			for ip2, b2 := range rl.buckets {
-				if b2.lastFill.Before(threshold) {
-					delete(rl.buckets, ip2)
+		// Whitelist lookup at bucket-creation time: matched IPs get an
+		// elevated per-bucket rate and bypass the maxBuckets cap.
+		bucketRate, whitelisted := rl.whitelistRateLocked(ip)
+		if !whitelisted {
+			bucketRate = rl.rate
+			if rl.maxBuckets > 0 && len(rl.buckets) >= rl.maxBuckets {
+				threshold := now.Add(-2 * rl.window)
+				for ip2, b2 := range rl.buckets {
+					if b2.lastFill.Before(threshold) {
+						delete(rl.buckets, ip2)
+					}
+				}
+				if len(rl.buckets) >= rl.maxBuckets {
+					return false
 				}
 			}
-			if len(rl.buckets) >= rl.maxBuckets {
-				return false
-			}
 		}
-		rl.buckets[ip] = &bucket{tokens: float64(rl.rate) - 1, lastFill: now}
+		rl.buckets[ip] = &bucket{tokens: float64(bucketRate) - 1, lastFill: now, rate: bucketRate}
 		return true
 	}
 
+	// Per-bucket rate (set at creation; whitelist changes after creation
+	// take effect on the next bucket rebuild via Cleanup).
+	bRate := b.rate
+	if bRate <= 0 {
+		// Backstop for buckets created before the per-bucket-rate field
+		// existed (defensive; should not happen in practice).
+		bRate = rl.rate
+	}
+
 	elapsed := now.Sub(b.lastFill)
-	refill := float64(rl.rate) * (float64(elapsed) / float64(rl.window))
+	refill := float64(bRate) * (float64(elapsed) / float64(rl.window))
 	b.tokens += refill
-	if b.tokens > float64(rl.rate) {
-		b.tokens = float64(rl.rate)
+	if b.tokens > float64(bRate) {
+		b.tokens = float64(bRate)
 	}
 	b.lastFill = now
 
@@ -192,6 +234,77 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// whitelistRateLocked returns the elevated rate for ip if any whitelist
+// CIDR contains it, else (0, false). Caller must hold rl.mu.
+func (rl *RateLimiter) whitelistRateLocked(ip string) (int, bool) {
+	if len(rl.whitelist) == 0 {
+		return 0, false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return 0, false
+	}
+	for _, w := range rl.whitelist {
+		if w.net.Contains(parsed) {
+			return w.rate, true
+		}
+	}
+	return 0, false
+}
+
+// SetWhitelist installs (or replaces) the elevated-rate whitelist. Each
+// entry's CIDR is parsed; on any parse error or non-positive rate the
+// call returns the error and leaves the existing whitelist unchanged
+// (fail-closed so a typo in operator config can't silently drop the
+// elevations operators relied on).
+//
+// Bare IP literals (e.g. "1.2.3.4" with no slash) are auto-promoted to
+// /32 (IPv4) or /128 (IPv6) for convenience. CIDR matching applies to
+// both families.
+//
+// Entries take effect on next bucket creation. Existing buckets keep
+// the per-bucket rate they were created with; the periodic Cleanup
+// reaper evicts idle buckets, after which the next request from that
+// IP picks up the current whitelist.
+func (rl *RateLimiter) SetWhitelist(entries []WhitelistEntry) error {
+	parsed := make([]whitelistRule, 0, len(entries))
+	for i, e := range entries {
+		if e.Rate <= 0 {
+			return fmt.Errorf("whitelist entry %d (%q): rate must be > 0, got %d", i, e.CIDR, e.Rate)
+		}
+		cidr := e.CIDR
+		if cidr == "" {
+			return fmt.Errorf("whitelist entry %d: empty CIDR", i)
+		}
+		if !strings.Contains(cidr, "/") {
+			if ip := net.ParseIP(cidr); ip != nil {
+				if ip.To4() != nil {
+					cidr += "/32"
+				} else {
+					cidr += "/128"
+				}
+			}
+		}
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("whitelist entry %d (%q): %w", i, e.CIDR, err)
+		}
+		parsed = append(parsed, whitelistRule{net: ipnet, rate: e.Rate})
+	}
+	rl.mu.Lock()
+	rl.whitelist = parsed
+	rl.mu.Unlock()
+	return nil
+}
+
+// WhitelistSize returns the number of installed whitelist rules (for testing
+// and operator-facing introspection).
+func (rl *RateLimiter) WhitelistSize() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.whitelist)
 }
 
 // Cleanup removes stale buckets. Call periodically.
@@ -468,6 +581,33 @@ func (a *Acceptor) SetMaxConnections(max int64) {
 // LogSamplerCleanup resets the log sampler counters. Call from a maintenance loop.
 func (a *Acceptor) LogSamplerCleanup() {
 	a.logSampler.Cleanup()
+}
+
+// SetRateLimitWhitelist installs an elevated-rate whitelist on the
+// Acceptor's rate limiter. See RateLimiter.SetWhitelist for semantics.
+// Operator-facing entry point — fail-closed on parse errors.
+func (a *Acceptor) SetRateLimitWhitelist(entries []WhitelistEntry) error {
+	return a.rateLimiter.SetWhitelist(entries)
+}
+
+// RateLimitWhitelistSize returns the number of installed whitelist rules.
+func (a *Acceptor) RateLimitWhitelistSize() int {
+	return a.rateLimiter.WhitelistSize()
+}
+
+// RateLimiterCleanup evicts idle per-IP buckets. Call from a maintenance loop.
+//
+// Without periodic invocation the only eviction path is the in-line one in
+// Allow() — and it runs only when an unknown IP arrives AND the bucket
+// map is already at maxBuckets. Once the cap is reached, legitimate IPs
+// arriving as the map fills get rejected until an active bucket either
+// stops sending (so its lastFill goes stale) and a new IP collides with
+// the full map at the right moment to trigger eviction. Wiring this into
+// the same 10-second reapLoop that handles stale nodes/beacons keeps the
+// bucket count proportional to recently-active IPs rather than to
+// peak-historic-active IPs.
+func (a *Acceptor) RateLimiterCleanup() {
+	a.rateLimiter.Cleanup()
 }
 
 // ShouldLog delegates to the internal log sampler. Returns true if this

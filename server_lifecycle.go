@@ -163,6 +163,7 @@ func (s *Server) reapLoop() {
 			s.reapStaleNodes()
 			s.reapStaleBeacons()
 			s.accept.LogSamplerCleanup()
+			s.accept.RateLimiterCleanup()
 		case <-s.done:
 			return
 		}
