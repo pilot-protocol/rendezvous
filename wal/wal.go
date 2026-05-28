@@ -129,15 +129,18 @@ func (w *WAL) Append(entry DeltaEntry) error {
 		return ErrWALFull
 	}
 
-	// Write [4-byte length][data]
+	// Write [4-byte length][data] as a single Write to avoid a
+	// torn-record window: a crash between the length write and the
+	// data write would leave a valid length prefix on disk with no
+	// corresponding data, which causes Replay to fail on recovery.
 	var lenBuf [4]byte
 	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	record := make([]byte, 0, 4+len(data))
+	record = append(record, lenBuf[:]...)
+	record = append(record, data...)
 
-	if _, err := w.f.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("write WAL length: %w", err)
-	}
-	if _, err := w.f.Write(data); err != nil {
-		return fmt.Errorf("write WAL data: %w", err)
+	if _, err := w.f.Write(record); err != nil {
+		return fmt.Errorf("write WAL record: %w", err)
 	}
 	if err := w.f.Sync(); err != nil {
 		return fmt.Errorf("sync WAL: %w", err)
@@ -179,6 +182,17 @@ func (w *WAL) Replay(fn func(DeltaEntry) error) (int, error) {
 
 		data := make([]byte, length)
 		if _, err := io.ReadFull(w.f, data); err != nil {
+			// If the data read comes up short (EOF or
+			// ErrUnexpectedEOF), this is a torn tail from a
+			// crash that occurred after writing the length
+			// prefix but before writing the full payload.
+			// Return the entries replayed so far rather than
+			// failing the entire recovery — the torn entry
+			// will be re-created by the next mutation that
+			// arrives and gets appended.
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
 			return count, fmt.Errorf("read WAL data at entry %d: %w", count, err)
 		}
 
