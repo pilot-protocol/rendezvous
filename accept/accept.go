@@ -527,7 +527,22 @@ func (a *Acceptor) SetTLS(certFile, keyFile string) error {
 		if err != nil {
 			return fmt.Errorf("load TLS keypair: %w", err)
 		}
-		a.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		a.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			},
+			CurvePreferences: []tls.CurveID{
+				tls.X25519,
+				tls.CurveP256,
+			},
+		}
 		slog.Info("registry TLS configured", "cert", certFile)
 		return nil
 	}
@@ -536,7 +551,22 @@ func (a *Acceptor) SetTLS(certFile, keyFile string) error {
 	if err != nil {
 		return fmt.Errorf("generate self-signed cert: %w", err)
 	}
-	a.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	a.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+		},
+	}
 	slog.Info("registry TLS configured with auto-generated self-signed certificate")
 	return nil
 }
