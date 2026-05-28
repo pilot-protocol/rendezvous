@@ -79,6 +79,7 @@ start_service() {
 
 health_check() {
     log "Running health checks (${HEALTH_TIMEOUT}s timeout, every ${HEALTH_INTERVAL}s)..."
+    HEALTH_FILE=$(mktemp -t pilot-health.XXXXXX)
     ELAPSED=0
     while [ "$ELAPSED" -lt "$HEALTH_TIMEOUT" ]; do
         sleep "$HEALTH_INTERVAL"
@@ -91,26 +92,26 @@ health_check() {
         fi
 
         # Check HTTP endpoint
-        HTTP_CODE=$(curl -s -o /tmp/health-response.json -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+        HTTP_CODE=$(curl -s -o "$HEALTH_FILE" -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
         if [ "$HTTP_CODE" != "200" ]; then
             log "Health: HTTP $HTTP_CODE (${ELAPSED}s)"
             continue
         fi
 
         # Check node and trust counts
-        NODES=$(jq -r '.total_nodes // 0' /tmp/health-response.json 2>/dev/null || echo "0")
-        TRUSTS=$(jq -r '.total_trust_links // 0' /tmp/health-response.json 2>/dev/null || echo "0")
+        NODES=$(jq -r '.total_nodes // 0' "$HEALTH_FILE" 2>/dev/null || echo "0")
+        TRUSTS=$(jq -r '.total_trust_links // 0' "$HEALTH_FILE" 2>/dev/null || echo "0")
 
         if [ "$NODES" -ge 10000 ] && [ "$TRUSTS" -ge 10000 ]; then
             log "Health check PASSED — nodes=$NODES trusts=$TRUSTS (${ELAPSED}s)"
-            rm -f /tmp/health-response.json
+            rm -f "$HEALTH_FILE"
             return 0
         fi
         log "Health: nodes=$NODES trusts=$TRUSTS — waiting (${ELAPSED}s)"
     done
 
     log "Health check FAILED after ${HEALTH_TIMEOUT}s"
-    rm -f /tmp/health-response.json
+    rm -f "$HEALTH_FILE"
     return 1
 }
 
