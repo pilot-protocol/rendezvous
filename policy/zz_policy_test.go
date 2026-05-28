@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // --- test helpers ---

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // helperHandlerWithDone returns a handler whose Done channel is the supplied

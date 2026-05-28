@@ -23,9 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/rendezvous/events"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 	pilotcrypto "github.com/pilot-protocol/common/crypto"
 )
 

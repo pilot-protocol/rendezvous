@@ -10,7 +10,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	identpkg "github.com/pilot-protocol/rendezvous/identity"
 	walpkg "github.com/pilot-protocol/rendezvous/wal"
 	"github.com/pilot-protocol/common/crypto"

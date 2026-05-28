@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/rendezvous/authz"
 )
 

@@ -17,8 +17,8 @@ import (
 
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
-	"github.com/TeoSlayer/pilotprotocol/pkg/urlvalidate"
+	"github.com/pilot-protocol/common/registry/wire"
+	"github.com/pilot-protocol/common/urlvalidate"
 	"github.com/pilot-protocol/common/fsutil"
 )
 

@@ -14,7 +14,7 @@ import (
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	replpkg "github.com/pilot-protocol/rendezvous/replication"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
-	"github.com/TeoSlayer/pilotprotocol/pkg/urlvalidate"
+	"github.com/pilot-protocol/common/urlvalidate"
 )
 
 // handleSubscribeReplication is called when a client sends {"type": "subscribe_replication"}.

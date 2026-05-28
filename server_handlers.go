@@ -8,7 +8,7 @@ import (
 	"strconv"
 
 	acceptpkg "github.com/pilot-protocol/rendezvous/accept"
-	"github.com/TeoSlayer/pilotprotocol/pkg/urlvalidate"
+	"github.com/pilot-protocol/common/urlvalidate"
 )
 
 // sanitizeListenAddr delegates to acceptpkg.SanitizeListenAddr.

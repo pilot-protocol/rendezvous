@@ -21,8 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/protocol"
+	"github.com/pilot-protocol/common/registry/wire"
 	"github.com/pilot-protocol/common/crypto"
 )
 

@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/beacon"
-	"github.com/TeoSlayer/pilotprotocol/pkg/config"
-	"github.com/TeoSlayer/pilotprotocol/pkg/logging"
+	"github.com/pilot-protocol/common/config"
+	"github.com/pilot-protocol/common/logging"
 	registry "github.com/pilot-protocol/rendezvous"
 )
 
