@@ -3,6 +3,7 @@
 package wal_test
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -286,6 +287,62 @@ func mustMarshal(t *testing.T, v interface{}) json.RawMessage {
 		t.Fatalf("json.Marshal: %v", err)
 	}
 	return b
+}
+
+// TestWALReplayTornTail verifies that a WAL file with a partial final record
+// (length prefix written but data missing — the crash-window bug) is handled
+// gracefully: Replay returns the entries before the torn tail without error.
+func TestWALReplayTornTail(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "torn.wal")
+
+	// Write a complete entry followed by a torn partial entry directly to
+	// the file (bypass Append so we can create the torn state).
+	good := wal.DeltaEntry{Type: wal.DeltaRegister, NodeID: 42}
+	goodData, err := json.Marshal(good)
+	if err != nil {
+		t.Fatalf("marshal good entry: %v", err)
+	}
+
+	var buf []byte
+	// Complete entry: [4-byte len][data]
+	len4 := make([]byte, 4)
+	binary.LittleEndian.PutUint32(len4, uint32(len(goodData)))
+	buf = append(buf, len4...)
+	buf = append(buf, goodData...)
+	// Torn tail: [4-byte len for 512 bytes][no data following]
+	lenTorn := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenTorn, 512)
+	buf = append(buf, lenTorn...)
+
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	w, err := wal.NewWAL(path)
+	if err != nil {
+		t.Fatalf("NewWAL: %v", err)
+	}
+	defer w.Close()
+
+	var replayed []wal.DeltaEntry
+	count, err := w.Replay(func(e wal.DeltaEntry) error {
+		replayed = append(replayed, e)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Replay should not error on torn tail: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("Replay count = %d, want 1 (only the complete entry)", count)
+	}
+	if len(replayed) != 1 {
+		t.Fatalf("replayed %d entries, want 1", len(replayed))
+	}
+	if replayed[0].Type != wal.DeltaRegister || replayed[0].NodeID != 42 {
+		t.Errorf("replayed entry = %+v, want DeltaRegister node 42", replayed[0])
+	}
 }
 
 // Ensure the test binary doesn't import os only for the unused import linter.
