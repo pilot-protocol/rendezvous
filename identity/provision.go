@@ -14,7 +14,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // Blueprint type aliases. The canonical definitions live in

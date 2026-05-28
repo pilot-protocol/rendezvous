@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/crypto"
 )
 

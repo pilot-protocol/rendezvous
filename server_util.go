@@ -18,7 +18,7 @@ import (
 	membpkg "github.com/pilot-protocol/rendezvous/membership"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
 	webhookpkg "github.com/pilot-protocol/rendezvous/webhook"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 type (

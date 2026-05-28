@@ -16,7 +16,7 @@ import (
 	"time"
 
 	walpkg "github.com/pilot-protocol/rendezvous/wal"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // connWriter wraps a net.Conn with a write mutex to prevent interleaved

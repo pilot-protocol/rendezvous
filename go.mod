@@ -3,8 +3,8 @@ module github.com/pilot-protocol/rendezvous
 go 1.25.10
 
 require (
-	github.com/TeoSlayer/pilotprotocol v0.0.0
-	github.com/pilot-protocol/common v0.1.0
+	github.com/TeoSlayer/pilotprotocol v0.0.0 // indirect
+	github.com/pilot-protocol/common v0.2.0
 )
 
 require (
@@ -16,3 +16,5 @@ require (
 replace github.com/TeoSlayer/pilotprotocol => ../web4
 
 require github.com/pilot-protocol/beacon v0.1.0
+
+replace github.com/pilot-protocol/common => ../common

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 	"github.com/pilot-protocol/common/crypto"
 )
 

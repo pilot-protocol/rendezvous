@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/rendezvous/events"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // Entry records a single audit event. The JSON tags match the on-wire format

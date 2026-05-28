@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
+	"github.com/pilot-protocol/common/protocol"
 	acceptpkg "github.com/pilot-protocol/rendezvous/accept"
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	authzpkg "github.com/pilot-protocol/rendezvous/authz"

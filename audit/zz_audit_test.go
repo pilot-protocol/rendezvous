@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/rendezvous/events"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // ---------------------------------------------------------------------------

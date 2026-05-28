@@ -18,7 +18,7 @@ import (
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	membpkg "github.com/pilot-protocol/rendezvous/membership"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
-	"github.com/TeoSlayer/pilotprotocol/pkg/registry/wire"
+	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // SnapshotNode is the JSON-serializable form of a single registry node.
