@@ -3,6 +3,9 @@
 package identity
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -276,5 +279,124 @@ func TestJsonUint32_Helper(t *testing.T) {
 	}
 	if got := jsonUint32(map[string]interface{}{"k": "string"}, "k"); got != 0 {
 		t.Errorf("non-float: got %d", got)
+	}
+}
+
+// TestStore_SetIdentityWebhookSecret_GetRoundtrip (PILOT-240).
+func TestStore_SetIdentityWebhookSecret_GetRoundtrip(t *testing.T) {
+	t.Parallel()
+	st := newTestStore()
+	if got := st.GetIdentityWebhookSecret(); got != "" {
+		t.Errorf("initial = %q, want empty", got)
+	}
+	st.SetIdentityWebhookSecret("my-secret")
+	if got := st.GetIdentityWebhookSecret(); got != "my-secret" {
+		t.Errorf("after Set = %q", got)
+	}
+	st.SetIdentityWebhookSecret("")
+	if got := st.GetIdentityWebhookSecret(); got != "" {
+		t.Errorf("after clear = %q", got)
+	}
+}
+
+// TestStore_VerifyToken_SignsRequest (PILOT-240).
+func TestStore_VerifyToken_SignsRequest(t *testing.T) {
+	t.Parallel()
+	const secret = "my-secret"
+	var gotSig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Pilot-Signature-256")
+		respBody := []byte(`{"verified":true,"external_id":"user-42"}`)
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(respBody)
+		w.Header().Set("X-Pilot-Signature-256", hex.EncodeToString(mac.Sum(nil)))
+		w.Write(respBody)
+	}))
+	defer srv.Close()
+
+	st := newTestStore()
+	st.SetWebhookURL(srv.URL)
+	st.SetIdentityWebhookSecret(secret)
+
+	got, err := st.VerifyToken("my-token")
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if got != "user-42" {
+		t.Errorf("got %q, want user-42", got)
+	}
+	if gotSig == "" {
+		t.Fatal("X-Pilot-Signature-256 request header not set")
+	}
+	expectedBody, _ := json.Marshal(identityVerifyRequest{Token: "my-token"})
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(expectedBody)
+	want := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(gotSig), []byte(want)) {
+		t.Errorf("request HMAC mismatch: got %s, want %s", gotSig, want)
+	}
+}
+
+// TestStore_VerifyToken_RejectsUnsignedResponse (PILOT-240).
+func TestStore_VerifyToken_RejectsUnsignedResponse(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"verified":true,"external_id":"user-42"}`))
+	}))
+	defer srv.Close()
+	st := newTestStore()
+	st.SetWebhookURL(srv.URL)
+	st.SetIdentityWebhookSecret("my-secret")
+	if _, err := st.VerifyToken("my-token"); err == nil {
+		t.Fatal("expected rejection when response is unsigned")
+	}
+}
+
+// TestStore_VerifyToken_RejectsWrongSignature (PILOT-240).
+func TestStore_VerifyToken_RejectsWrongSignature(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		respBody := []byte(`{"verified":true,"external_id":"user-42"}`)
+		w.Header().Set("X-Pilot-Signature-256", "deadbeef")
+		w.Write(respBody)
+	}))
+	defer srv.Close()
+	st := newTestStore()
+	st.SetWebhookURL(srv.URL)
+	st.SetIdentityWebhookSecret("my-secret")
+	if _, err := st.VerifyToken("my-token"); err == nil {
+		t.Fatal("expected rejection when response signature mismatches")
+	}
+}
+
+// TestStore_VerifyToken_NoSignatureWithoutSecret (PILOT-240): backward compat.
+func TestStore_VerifyToken_NoSignatureWithoutSecret(t *testing.T) {
+	t.Parallel()
+	var gotSig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Pilot-Signature-256")
+		w.Write([]byte(`{"verified":true,"external_id":"user-42"}`))
+	}))
+	defer srv.Close()
+	st := newTestStore()
+	st.SetWebhookURL(srv.URL)
+	got, err := st.VerifyToken("my-token")
+	if err != nil {
+		t.Fatalf("VerifyToken: %v", err)
+	}
+	if got != "user-42" || gotSig != "" {
+		t.Errorf("got %q sig=%q, want user-42 sig empty", got, gotSig)
+	}
+}
+
+// TestStore_VerifyToken_WithSecret_EmptyTokenShortCircuits (PILOT-240).
+func TestStore_VerifyToken_WithSecret_EmptyTokenShortCircuits(t *testing.T) {
+	t.Parallel()
+	st := newTestStore()
+	st.SetWebhookURL("https://idp/verify")
+	st.SetIdentityWebhookSecret("my-secret")
+	got, err := st.VerifyToken("")
+	if err != nil || got != "" {
+		t.Errorf("empty token with secret: got (%q, %v)", got, err)
 	}
 }

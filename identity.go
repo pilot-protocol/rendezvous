@@ -152,6 +152,17 @@ func (s *Server) GetIdentityWebhookURL() string {
 	return s.identity.GetWebhookURL()
 }
 
+// SetIdentityWebhookSecret sets the HMAC-SHA256 pre-shared secret for
+// identity webhook request/response signing (PILOT-240).
+func (s *Server) SetIdentityWebhookSecret(secret string) {
+	s.identity.SetIdentityWebhookSecret(secret)
+}
+
+// GetIdentityWebhookSecret returns the current identity webhook HMAC secret.
+func (s *Server) GetIdentityWebhookSecret() string {
+	return s.identity.GetIdentityWebhookSecret()
+}
+
 func (s *Server) provisionCallbacks() identpkg.ProvisionCallbacks {
 	return identpkg.ProvisionCallbacks{
 		FindOrCreateNetwork:     s.findOrCreateNetwork,

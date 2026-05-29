@@ -1045,6 +1045,13 @@ func (st *Store) HandleKickMember(msg map[string]interface{}) (map[string]interf
 		return nil, fmt.Errorf("cannot kick the network owner")
 	}
 
+	// Admins can kick members but not other admins.
+	callerNodeID := jsonUint32(msg, "node_id")
+	if callerRole, ok := network.MemberRoles[callerNodeID]; ok &&
+		callerRole == RoleAdmin && network.MemberRoles[targetNodeID] == RoleAdmin {
+		return nil, fmt.Errorf("admins cannot kick other admins")
+	}
+
 	found := false
 	for i, m := range network.Members {
 		if m == targetNodeID {

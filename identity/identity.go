@@ -12,7 +12,9 @@ import (
 	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,6 +61,25 @@ var ErrKeyRotatedConcurrently = fmt.Errorf("rotate_key: key rotated concurrently
 // sharedHTTPClient is reused across identity webhook and JWKS fetch calls so
 // that the underlying TCP connections are pooled by the transport layer.
 var sharedHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+// jwksHTTPClient is a hardened HTTP client used ONLY for JWKS key-fetch
+// (fetchJWKSKeys). It disables redirects entirely (a redirect during JWKS
+// fetch is a protocol anomaly and a supply-chain attack vector) and enforces
+// a TLS 1.2 minimum version.
+//
+// TLS certificate pinning per-IDP is a follow-up tracked in PILOT-241; it
+// requires a new BlueprintIdentityProvider field in common/registry/wire.
+var jwksHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
+}
 
 // NodeView is the read/write interface the Store uses to access node data.
 // All methods must be safe for concurrent use.
@@ -141,9 +162,10 @@ type Store struct {
 	nodes NodeView
 	cb    Callbacks
 
-	mu                 sync.RWMutex
-	identityWebhookURL string
-	idpConfig          *BlueprintIdentityProvider
+	mu                  sync.RWMutex
+	identityWebhookURL  string
+	identityWebhookSecret string
+	idpConfig           *BlueprintIdentityProvider
 
 	jwksCache *JWKSCache
 }
@@ -179,11 +201,34 @@ func (st *Store) GetWebhookURL() string {
 	return st.identityWebhookURL
 }
 
+// SetIdentityWebhookSecret sets the HMAC-SHA256 pre-shared secret for
+// identity webhook request/response signing (PILOT-240). When non-empty,
+// VerifyToken signs outbound requests and verifies response signatures.
+func (st *Store) SetIdentityWebhookSecret(secret string) {
+	st.mu.Lock()
+	st.identityWebhookSecret = secret
+	st.mu.Unlock()
+}
+
+// GetIdentityWebhookSecret returns the currently configured identity
+// webhook HMAC secret.
+func (st *Store) GetIdentityWebhookSecret() string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.identityWebhookSecret
+}
+
 // VerifyToken sends the token to the configured identity webhook and returns
 // the verified external ID. Returns ("", nil) if no webhook is configured.
+//
+// When a webhook secret is configured, outbound requests carry an
+// X-Pilot-Signature-256 HMAC-SHA256 header, and the response MUST include
+// a matching X-Pilot-Signature-256 header — unsigned responses are rejected
+// (PILOT-240).
 func (st *Store) VerifyToken(token string) (string, error) {
 	st.mu.RLock()
 	url := st.identityWebhookURL
+	secret := st.identityWebhookSecret
 	st.mu.RUnlock()
 
 	if url == "" {
@@ -198,7 +243,21 @@ func (st *Store) VerifyToken(token string) (string, error) {
 		return "", fmt.Errorf("marshal identity request: %w", err)
 	}
 
-	resp, err := sharedHTTPClient.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build identity request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// HMAC-SHA256 request signing (PILOT-240): when a secret is configured,
+	// sign the request body so the webhook can verify the caller.
+	if secret != "" {
+		reqMac := hmac.New(sha256.New, []byte(secret))
+		reqMac.Write(body)
+		req.Header.Set("X-Pilot-Signature-256", hex.EncodeToString(reqMac.Sum(nil)))
+	}
+
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		slog.Warn("identity webhook request failed", "error", err)
 		return "", fmt.Errorf("identity verification failed: %w", err)
@@ -212,6 +271,23 @@ func (st *Store) VerifyToken(token string) (string, error) {
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		return "", fmt.Errorf("read identity response: %w", err)
+	}
+
+	// HMAC-SHA256 response verification (PILOT-240): when a secret is
+	// configured, the response MUST carry a valid X-Pilot-Signature-256
+	// header. Unsigned or mis-signed responses are rejected to prevent
+	// webhook-spoofing attacks.
+	if secret != "" {
+		respSig := resp.Header.Get("X-Pilot-Signature-256")
+		if respSig == "" {
+			return "", fmt.Errorf("identity webhook response missing X-Pilot-Signature-256 header")
+		}
+		respMac := hmac.New(sha256.New, []byte(secret))
+		respMac.Write(respBody)
+		expected := hex.EncodeToString(respMac.Sum(nil))
+		if !hmac.Equal([]byte(respSig), []byte(expected)) {
+			return "", fmt.Errorf("identity webhook response signature mismatch")
+		}
 	}
 
 	var result identityVerifyResponse
@@ -946,7 +1022,7 @@ func FetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
 }
 
 func fetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
-	resp, err := sharedHTTPClient.Get(jwksURL)
+	resp, err := jwksHTTPClient.Get(jwksURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}

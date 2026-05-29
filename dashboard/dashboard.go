@@ -503,11 +503,12 @@ func (h *Handler) Serve(addr string) error {
 	})
 
 	// /api/banner — admin-only management endpoint for the dashboard notice.
-	// Both GET and PUT require the admin token (header X-Admin-Token or
-	// query admin_token=). PUT body is the new banner text (empty = clear).
+	// GET accepts the admin token via header X-Admin-Token or query admin_token=.
+	// POST/PUT require X-Admin-Token header (no query fallback — CSRF protection).
 	mux.HandleFunc("/api/banner", func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Admin-Token")
-		if token == "" {
+		// Query-param fallback only for GET (read-only, no CSRF risk).
+		if token == "" && r.Method == http.MethodGet {
 			token = r.URL.Query().Get("admin_token")
 		}
 		adminToken := h.cb.GetAdminToken()
@@ -960,7 +961,7 @@ function renderNetworks(networks){
   var st=document.getElementById('token-status');st.textContent='authenticated';st.className='status ok';
   var html='';
   networks.forEach(function(n){
-    html+='<tr><td>'+n.name+' <span class="net-id">#'+n.id+'</span></td><td>'+fmt(n.members)+'</td><td>'+fmt(n.online)+'</td><td>'+fmt(n.requests)+'</td></tr>';
+    html+='<tr><td>'+escapeHtml(n.name)+' <span class="net-id">#'+n.id+'</span></td><td>'+fmt(n.members)+'</td><td>'+fmt(n.online)+'</td><td>'+fmt(n.requests)+'</td></tr>';
   });
   tbody.innerHTML=html;
 }
