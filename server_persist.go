@@ -484,21 +484,23 @@ func (s *Server) load() error {
 		slog.Info("migrating legacy snapshot (version 0) to current format")
 	}
 
-	// Verify snapshot checksum if present
+	// Verify snapshot checksum if present. PILOT-78: previously this
+	// only logged a warning on mismatch and continued loading corrupt
+	// data into the registry's in-memory state. Now returns an error
+	// so the caller can fall back to a backup or abort cleanly.
 	if snap.Checksum != "" {
 		savedChecksum := snap.Checksum
 		snap.Checksum = ""
 		verifyData, verifyErr := json.Marshal(snap)
-		if verifyErr == nil {
-			hash := sha256.Sum256(verifyData)
-			computed := hex.EncodeToString(hash[:])
-			if computed != savedChecksum {
-				slog.Warn("snapshot checksum mismatch — data may be corrupted",
-					"expected", savedChecksum, "computed", computed)
-			} else {
-				slog.Info("snapshot checksum verified")
-			}
+		if verifyErr != nil {
+			return fmt.Errorf("snapshot checksum verification failed (re-marshal): %w", verifyErr)
 		}
+		hash := sha256.Sum256(verifyData)
+		computed := hex.EncodeToString(hash[:])
+		if computed != savedChecksum {
+			return fmt.Errorf("snapshot checksum mismatch — refusing to load corrupt data: expected %s, computed %s", savedChecksum, computed)
+		}
+		slog.Info("snapshot checksum verified")
 		snap.Checksum = savedChecksum // restore for completeness
 	}
 
