@@ -1395,23 +1395,26 @@ func (st *Store) HandleResolveHostname(msg map[string]interface{}) (map[string]i
 
 // HandleListNodes handles a list_nodes message.
 //
-// All networks (backbone and non-backbone) require the admin token.
-// The previous behaviour — non-backbone listings were unauthenticated —
-// was a P0 enumeration vector: any peer on the overlay could
-// enumerate any network's members by sending list_nodes(network_id=N).
-// All six production daemon call sites already pass the admin token,
-// so the tighter policy doesn't break existing legitimate callers.
+// Threat model (per PILOT-347):
+//
+//   - netID == 0 (backbone) — admin-only. Listing the entire overlay's
+//     nodes is a real enumeration vector and only network administrators
+//     (those holding the admin token) need this view. Normal users
+//     should use lookup with a specific node_id.
+//   - netID != 0 (per-network) — open to any caller. Users are members
+//     of networks they joined; they need to enumerate the members of
+//     their own networks to send messages, run discovery, etc. The
+//     previous "all listings require admin token" policy locked every
+//     user out of their own networks because only the network admins
+//     hold the admin token — see PILOT-347.
 func (st *Store) HandleListNodes(msg map[string]interface{}, requireAdminToken func(msg map[string]interface{}) error) (map[string]interface{}, error) {
 	netID := jsonUint16(msg, "network_id")
 
-	if err := requireAdminToken(msg); err != nil {
-		if netID == 0 {
+	if netID == 0 {
+		// Backbone listing — admin-only.
+		if err := requireAdminToken(msg); err != nil {
 			return nil, fmt.Errorf("listing backbone nodes is not permitted (use lookup with a specific node_id)")
 		}
-		return nil, fmt.Errorf("list_nodes(network_id=%d): admin token required", netID)
-	}
-
-	if netID == 0 {
 		body, err := st.AdminListNodesCached()
 		if err != nil {
 			return nil, err
@@ -1419,6 +1422,8 @@ func (st *Store) HandleListNodes(msg map[string]interface{}, requireAdminToken f
 		return map[string]interface{}{RawResponseKey: body}, nil
 	}
 
+	// Per-network listing — open. Users need to list the members of
+	// the networks they belong to without holding the network admin token.
 	body, err := st.PerNetworkListNodesCached(netID)
 	if err != nil {
 		return nil, err
