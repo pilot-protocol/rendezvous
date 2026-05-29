@@ -21,6 +21,46 @@ func TestHandleKickMember_CannotKickOwner(t *testing.T) {
 	}
 }
 
+func TestHandleKickMember_AdminCannotKickAdmin(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv()
+	// owner=1, member=2, member=3
+	netID := enterpriseNetworkWithMembers(t, e, 1, 2, 3)
+
+	// Promote 2 and 3 both to admin (use admin_token bypass)
+	for _, n := range []uint32{2, 3} {
+		_, err := e.st.HandlePromoteMember(map[string]interface{}{
+			"admin_token":    "admin",
+			"network_id":     float64(netID),
+			"target_node_id": float64(n),
+		})
+		if err != nil {
+			t.Fatalf("promote %d to admin: %v", n, err)
+		}
+	}
+
+	// Node 2 (admin) tries to kick node 3 (also admin) using RBAC (no admin_token)
+	_, err := e.st.HandleKickMember(map[string]interface{}{
+		"network_id":     float64(netID),
+		"target_node_id": float64(3),
+		"node_id":        float64(2),
+	})
+	if err == nil || !strings.Contains(err.Error(), "admins") {
+		t.Errorf("err = %v, want admin-kick-admin error", err)
+	}
+
+	// Verify node 3 is still a member (not actually kicked)
+	e.mu.RLock()
+	net, ok := e.networks[netID]
+	e.mu.RUnlock()
+	if !ok {
+		t.Fatal("network disappeared")
+	}
+	if _, stillMember := net.MemberRoles[3]; !stillMember {
+		t.Error("node 3 was kicked — should still be a member")
+	}
+}
+
 func TestHandleKickMember_NotAMember(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv()
