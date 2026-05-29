@@ -503,11 +503,12 @@ func (h *Handler) Serve(addr string) error {
 	})
 
 	// /api/banner — admin-only management endpoint for the dashboard notice.
-	// Both GET and PUT require the admin token (header X-Admin-Token or
-	// query admin_token=). PUT body is the new banner text (empty = clear).
+	// GET accepts the admin token via header X-Admin-Token or query admin_token=.
+	// POST/PUT require X-Admin-Token header (no query fallback — CSRF protection).
 	mux.HandleFunc("/api/banner", func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Admin-Token")
-		if token == "" {
+		// Query-param fallback only for GET (read-only, no CSRF risk).
+		if token == "" && r.Method == http.MethodGet {
 			token = r.URL.Query().Get("admin_token")
 		}
 		adminToken := h.cb.GetAdminToken()
