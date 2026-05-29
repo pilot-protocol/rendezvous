@@ -20,6 +20,12 @@ import (
 // BeaconTTL is how long a beacon registration is valid without re-register.
 const BeaconTTL = 60 * time.Second
 
+// BeaconRegisterCooldown is the minimum interval between successive
+// HandleBeaconRegister calls for the same beacon ID. This prevents an
+// attacker (even an admin-token-armed one) from churning through many
+// distinct beacon IDs faster than one per cooldown window.
+const BeaconRegisterCooldown = 10 * time.Second
+
 type BeaconEntry struct {
 	ID       uint32
 	Addr     string
@@ -81,10 +87,18 @@ func (st *Store) HandleBeaconRegister(msg map[string]interface{}) (map[string]in
 	}
 
 	st.mu.Lock()
+	now := st.now()
+	if existing, ok := st.beacons[beaconID]; ok {
+		if elapsed := now.Sub(existing.LastSeen); elapsed < BeaconRegisterCooldown {
+			st.mu.Unlock()
+			remain := BeaconRegisterCooldown - elapsed
+			return nil, fmt.Errorf("beacon %d re-registered too soon: cooldown %v remaining", beaconID, remain.Round(time.Second))
+		}
+	}
 	st.beacons[beaconID] = &BeaconEntry{
 		ID:       beaconID,
 		Addr:     addr,
-		LastSeen: st.now(),
+		LastSeen: now,
 	}
 	st.mu.Unlock()
 
