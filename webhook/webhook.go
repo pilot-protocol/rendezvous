@@ -14,6 +14,9 @@ package webhook
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -45,6 +48,7 @@ type dispatcher struct {
 	failed         atomic.Uint64
 	delivered      atomic.Uint64
 	initialBackoff time.Duration
+	secret         string // HMAC-SHA256 pre-shared secret (empty = no sig)
 
 	// Dead letter queue: stores last N failed events for retry/inspection
 	dlqMu    sync.Mutex
@@ -141,6 +145,15 @@ func (d *dispatcher) post(ev *Event) {
 		return
 	}
 
+	// HMAC-SHA256 signature: if a secret is configured, sign the body
+	// so the receiver can verify authenticity+integrity (PILOT-239).
+	var sigHeader string
+	if d.secret != "" {
+		mac := hmac.New(sha256.New, []byte(d.secret))
+		mac.Write(body)
+		sigHeader = hex.EncodeToString(mac.Sum(nil))
+	}
+
 	backoff := d.initialBackoff
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -148,7 +161,16 @@ func (d *dispatcher) post(ev *Event) {
 			backoff *= 2
 		}
 
-		resp, err := d.client.Post(d.url, "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, d.url, bytes.NewReader(body))
+		if err != nil {
+			slog.Warn("registry webhook POST request build failed", "action", ev.Action, "error", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if sigHeader != "" {
+			req.Header.Set("X-Pilot-Signature-256", sigHeader)
+		}
+		resp, err := d.client.Do(req)
 		if err != nil {
 			slog.Warn("registry webhook POST failed", "action", ev.Action, "attempt", attempt+1, "error", err)
 			continue
@@ -237,6 +259,18 @@ func (st *Store) SetURL(url string) {
 	if url != "" {
 		st.disp = newDispatcher(url)
 		slog.Info("registry webhook configured", "url", url)
+	}
+}
+
+// SetSecret sets the HMAC-SHA256 pre-shared secret for outbound webhook
+// signatures. When non-empty, every outbound POST includes an
+// X-Pilot-Signature-256 header with the hex-encoded HMAC-SHA256 of the
+// request body (PILOT-239). No-op when no dispatcher is active.
+func (st *Store) SetSecret(secret string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.disp != nil {
+		st.disp.secret = secret
 	}
 }
 
