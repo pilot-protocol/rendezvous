@@ -960,7 +960,7 @@ function renderNetworks(networks){
   var st=document.getElementById('token-status');st.textContent='authenticated';st.className='status ok';
   var html='';
   networks.forEach(function(n){
-    html+='<tr><td>'+n.name+' <span class="net-id">#'+n.id+'</span></td><td>'+fmt(n.members)+'</td><td>'+fmt(n.online)+'</td><td>'+fmt(n.requests)+'</td></tr>';
+    html+='<tr><td>'+escapeHtml(n.name)+' <span class="net-id">#'+n.id+'</span></td><td>'+fmt(n.members)+'</td><td>'+fmt(n.online)+'</td><td>'+fmt(n.requests)+'</td></tr>';
   });
   tbody.innerHTML=html;
 }
