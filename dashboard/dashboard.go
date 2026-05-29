@@ -1034,10 +1034,10 @@ function drawChart(svg,tip,samples,valFn,labelFn,color,unit,zoomY){
       var anchor='middle';
       if(i===0)anchor='start';
       else if(i===vals.length-1)anchor='end';
-      html+='<text x="'+x.toFixed(1)+'" y="'+(padT+cH+16)+'" fill="'+muted2+'" font-size="9" text-anchor="'+anchor+'" font-family="monospace">'+lbl+'</text>';
+      html+='<text x="'+x.toFixed(1)+'" y="'+(padT+cH+16)+'" fill="'+muted2+'" font-size="9" text-anchor="'+anchor+'" font-family="monospace">'+escapeHtml(lbl)+'</text>';
     }
     var rw=cW/(vals.length||1);
-    html+='<rect x="'+(x-rw/2).toFixed(1)+'" y="'+padT+'" width="'+rw.toFixed(1)+'" height="'+cH+'" fill="transparent" data-val="'+vals[i]+'" data-lbl="'+lbl+'" data-x="'+x.toFixed(1)+'"/>';
+    html+='<rect x="'+(x-rw/2).toFixed(1)+'" y="'+padT+'" width="'+rw.toFixed(1)+'" height="'+cH+'" fill="transparent" data-val="'+vals[i]+'" data-lbl="'+escapeHtml(lbl)+'" data-x="'+x.toFixed(1)+'"/>';
   }
   svg.innerHTML=html;
   if(tip){
