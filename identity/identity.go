@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -59,6 +60,25 @@ var ErrKeyRotatedConcurrently = fmt.Errorf("rotate_key: key rotated concurrently
 // sharedHTTPClient is reused across identity webhook and JWKS fetch calls so
 // that the underlying TCP connections are pooled by the transport layer.
 var sharedHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+// jwksHTTPClient is a hardened HTTP client used ONLY for JWKS key-fetch
+// (fetchJWKSKeys). It disables redirects entirely (a redirect during JWKS
+// fetch is a protocol anomaly and a supply-chain attack vector) and enforces
+// a TLS 1.2 minimum version.
+//
+// TLS certificate pinning per-IDP is a follow-up tracked in PILOT-241; it
+// requires a new BlueprintIdentityProvider field in common/registry/wire.
+var jwksHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
+}
 
 // NodeView is the read/write interface the Store uses to access node data.
 // All methods must be safe for concurrent use.
@@ -946,7 +966,7 @@ func FetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
 }
 
 func fetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
-	resp, err := sharedHTTPClient.Get(jwksURL)
+	resp, err := jwksHTTPClient.Get(jwksURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
