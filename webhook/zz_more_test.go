@@ -160,11 +160,16 @@ func TestDispatcher_EmitAfterCloseIsNoop(t *testing.T) {
 func TestStore_SetSecret_SignsWebhook(t *testing.T) {
 	t.Parallel()
 	secret := "test-secret-pilot"
-	var sigHeader string
-	var bodyBytes []byte
+	var (
+		mu         sync.Mutex
+		sigHeader  string
+		bodyBytes  []byte
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		sigHeader = r.Header.Get("X-Pilot-Signature-256")
 		bodyBytes, _ = io.ReadAll(r.Body)
+		mu.Unlock()
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
@@ -177,23 +182,27 @@ func TestStore_SetSecret_SignsWebhook(t *testing.T) {
 
 	st.Emit("test.secret", map[string]interface{}{"k": "v"})
 
+	getSig := func() string { mu.Lock(); defer mu.Unlock(); return sigHeader }
+	getBody := func() []byte { mu.Lock(); defer mu.Unlock(); return bodyBytes }
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if sigHeader != "" {
+		if getSig() != "" {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if sigHeader == "" {
+	gotSig := getSig()
+	if gotSig == "" {
 		t.Fatal("X-Pilot-Signature-256 header not set when secret is configured")
 	}
 
 	// Verify the HMAC ourselves.
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(bodyBytes)
+	mac.Write(getBody())
 	expected := hex.EncodeToString(mac.Sum(nil))
-	if sigHeader != expected {
-		t.Fatalf("HMAC mismatch: got %s, want %s", sigHeader, expected)
+	if gotSig != expected {
+		t.Fatalf("HMAC mismatch: got %s, want %s", gotSig, expected)
 	}
 }
 
@@ -201,9 +210,14 @@ func TestStore_SetSecret_SignsWebhook(t *testing.T) {
 // header is added when the secret is empty (backward-compatible).
 func TestStore_SetSecret_NoSignatureWhenNoSecret(t *testing.T) {
 	t.Parallel()
-	var sigHeader string
+	var (
+		mu        sync.Mutex
+		sigHeader string
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		sigHeader = r.Header.Get("X-Pilot-Signature-256")
+		mu.Unlock()
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
@@ -225,7 +239,10 @@ func TestStore_SetSecret_NoSignatureWhenNoSecret(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if sigHeader != "" {
+	mu.Lock()
+	got := sigHeader
+	mu.Unlock()
+	if got != "" {
 		t.Fatal("X-Pilot-Signature-256 should NOT be set when no secret configured")
 	}
 }
