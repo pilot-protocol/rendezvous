@@ -3,6 +3,10 @@
 package webhook
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -150,6 +154,82 @@ func TestDispatcher_EmitAfterCloseIsNoop(t *testing.T) {
 }
 
 // TestDispatcher_RaceyCloseEmit ensures concurrent Emit+Close doesn't panic.
+// TestStore_SetSecret_SignsWebhook verifies that when a secret is set,
+// outbound webhook POSTs carry an X-Pilot-Signature-256 header with the
+// hex-encoded HMAC-SHA256 of the request body (PILOT-239).
+func TestStore_SetSecret_SignsWebhook(t *testing.T) {
+	t.Parallel()
+	secret := "test-secret-pilot"
+	var sigHeader string
+	var bodyBytes []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sigHeader = r.Header.Get("X-Pilot-Signature-256")
+		bodyBytes, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	st := NewStore()
+	defer st.Close()
+	st.SetInitialBackoff(time.Millisecond)
+	st.SetURL(srv.URL)
+	st.SetSecret(secret)
+
+	st.Emit("test.secret", map[string]interface{}{"k": "v"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sigHeader != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sigHeader == "" {
+		t.Fatal("X-Pilot-Signature-256 header not set when secret is configured")
+	}
+
+	// Verify the HMAC ourselves.
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(bodyBytes)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if sigHeader != expected {
+		t.Fatalf("HMAC mismatch: got %s, want %s", sigHeader, expected)
+	}
+}
+
+// TestStore_SetSecret_NoSignatureWhenNoSecret verifies that no signature
+// header is added when the secret is empty (backward-compatible).
+func TestStore_SetSecret_NoSignatureWhenNoSecret(t *testing.T) {
+	t.Parallel()
+	var sigHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sigHeader = r.Header.Get("X-Pilot-Signature-256")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	st := NewStore()
+	defer st.Close()
+	st.SetInitialBackoff(time.Millisecond)
+	st.SetURL(srv.URL)
+	// Do NOT call SetSecret — default is empty.
+
+	st.Emit("test.nosecret", map[string]interface{}{"k": "v"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, delivered, _ := st.disp.stats()
+		if delivered > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if sigHeader != "" {
+		t.Fatal("X-Pilot-Signature-256 should NOT be set when no secret configured")
+	}
+}
+
 func TestDispatcher_RaceyCloseEmit(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
