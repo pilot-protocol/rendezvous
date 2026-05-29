@@ -199,6 +199,60 @@ func TestHandlePunchRequesterNotParticipant(t *testing.T) {
 	}
 }
 
+func TestBeaconRegisterCooldown(t *testing.T) {
+	t.Parallel()
+	st := routing.NewStore(nil)
+
+	base := time.Now()
+	st.SetClock(func() time.Time { return base })
+
+	// First register should succeed.
+	resp, err := st.HandleBeaconRegister(map[string]interface{}{
+		"beacon_id": float64(1),
+		"addr":      "1.2.3.4:9001",
+	})
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if resp["type"] != "beacon_register_ok" {
+		t.Fatalf("unexpected type: %v", resp["type"])
+	}
+
+	// Immediate re-register within cooldown should fail.
+	_, err = st.HandleBeaconRegister(map[string]interface{}{
+		"beacon_id": float64(1),
+		"addr":      "1.2.3.4:9001",
+	})
+	if err == nil {
+		t.Fatal("expected cooldown error for immediate re-register")
+	}
+
+	// Advance past cooldown — re-register should succeed again.
+	st.SetClock(func() time.Time { return base.Add(routing.BeaconRegisterCooldown + time.Second) })
+	resp, err = st.HandleBeaconRegister(map[string]interface{}{
+		"beacon_id": float64(1),
+		"addr":      "1.2.3.4:9001",
+	})
+	if err != nil {
+		t.Fatalf("re-register after cooldown: %v", err)
+	}
+	if resp["type"] != "beacon_register_ok" {
+		t.Fatalf("unexpected type after cooldown: %v", resp["type"])
+	}
+
+	// Different beacon ID should NOT be affected by the cooldown on ID 1.
+	resp, err = st.HandleBeaconRegister(map[string]interface{}{
+		"beacon_id": float64(2),
+		"addr":      "5.6.7.8:9001",
+	})
+	if err != nil {
+		t.Fatalf("different beacon ID should bypass cooldown: %v", err)
+	}
+	if resp["type"] != "beacon_register_ok" {
+		t.Fatalf("unexpected type for different beacon: %v", resp["type"])
+	}
+}
+
 func TestHandlePunchBackendVerifyError(t *testing.T) {
 	t.Parallel()
 	be := &stubBackend{
