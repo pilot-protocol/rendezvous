@@ -274,19 +274,16 @@ func BuildEntry(action string, netID uint16, nodeID uint32, attrs ...any) Entry 
 		}
 	}
 
-	var details string
+	var b strings.Builder
 	for i := 0; i+1 < len(attrs); i += 2 {
 		if k, ok := attrs[i].(string); ok && k != "node_id" && k != "network_id" {
-			if details != "" {
-				details += ", "
+			if b.Len() > 0 {
+				b.WriteString(", ")
 			}
-			val := attrs[i+1]
-			if redactKey(k) {
-				val = "<redacted>"
-			}
-			details += fmt.Sprintf("%s=%v", k, val)
+			b.WriteString(formatVal(k, attrs[i+1]))
 		}
 	}
+	details := b.String()
 
 	return Entry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -323,4 +320,104 @@ func redactKey(k string) bool {
 		}
 	}
 	return false
+}
+
+// formatVal formats a key=value pair, recursing into maps and
+// scanning string values for embedded secrets.
+func formatVal(k string, v any) string {
+	if redactKey(k) {
+		return fmt.Sprintf("%s=<redacted>", k)
+	}
+	switch val := v.(type) {
+	case map[string]interface{}:
+		return formatMap(k, val)
+	case string:
+		return fmt.Sprintf("%s=%s", k, scanSecrets(val))
+	default:
+		return fmt.Sprintf("%s=%v", k, v)
+	}
+}
+
+// formatMap formats a map value recursively, redacting nested secret keys.
+func formatMap(prefix string, m map[string]interface{}) string {
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString("={")
+	first := true
+	for k, v := range m {
+		if !first {
+			b.WriteString(", ")
+		}
+		first = false
+		if redactKey(k) {
+			b.WriteString(k + "=<redacted>")
+			continue
+		}
+		switch val := v.(type) {
+		case map[string]interface{}:
+			b.WriteString(formatMap(k, val))
+		case string:
+			b.WriteString(k + "=" + scanSecrets(val))
+		default:
+			fmt.Fprintf(&b, "%s=%v", k, v)
+		}
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
+// scanSecrets walks s replacing known secret-pattern values with "<redacted>".
+// It uses substring-matching (not regex) to keep the dependency surface small.
+func scanSecrets(s string) string {
+	if !strings.Contains(s, "token") && !strings.Contains(s, "secret") &&
+		!strings.Contains(s, "passw") && !strings.Contains(s, "key") {
+		return s
+	}
+	orig := s
+	for _, prefix := range secretKeyPrefixes {
+		searchFrom := 0
+		for {
+			idx := strings.Index(orig[searchFrom:], prefix)
+			if idx < 0 {
+				break
+			}
+			idx += searchFrom
+			tail := orig[idx+len(prefix):]
+			valEnd := findValueEnd(tail)
+			if valEnd == 0 {
+				searchFrom = idx + len(prefix)
+				continue
+			}
+			orig = orig[:idx+len(prefix)] + "<redacted>" + orig[idx+len(prefix)+valEnd:]
+			searchFrom = idx + len(prefix) + len("<redacted>")
+		}
+	}
+	return orig
+}
+
+// findValueEnd returns the length of the value after a secret-key prefix,
+// stopping at the first whitespace, comma, quote, or end-of-string.
+func findValueEnd(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', ',', '"', '\n', '\r', '\t':
+			return i
+		}
+	}
+	return len(s)
+}
+
+// secretKeyPrefixes are the patterns scanSecrets looks for in string values;
+// longer prefixes come first to avoid partial matches.
+var secretKeyPrefixes = []string{
+	`"admin_token":"`, `admin_token=`,
+	`"private_key":"`, `private_key=`,
+	`"api_key":"`, `api_key=`,
+	`"signature":"`, `signature=`,
+	`"token":"`, `token=`,
+	`"password":"`, `password=`,
+	`"passwd":"`, `passwd=`,
+	`"secret":"`, `secret=`,
+	`"bearer":"`, `bearer=`,
+	`"credential":"`, `credential=`,
 }

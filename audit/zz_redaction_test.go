@@ -59,3 +59,56 @@ func TestBuildEntryDoesNotRedactNonSecretKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildEntryRecursiveRedaction verifies that BuildEntry recurses into
+// map values and scans string values for embedded secrets.
+func TestBuildEntryRecursiveRedaction(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nested map", func(t *testing.T) {
+		e := BuildEntry("nested", 0, 0, "config", map[string]interface{}{
+			"host":  "example.com",
+			"token": "sk-secret",
+		})
+		if strings.Contains(e.Details, "sk-secret") {
+			t.Errorf("leaked nested token: %q", e.Details)
+		}
+		if !strings.Contains(e.Details, "example.com") {
+			t.Errorf("missing non-secret nested value: %q", e.Details)
+		}
+	})
+
+	t.Run("deeply nested map", func(t *testing.T) {
+		e := BuildEntry("deep", 0, 0, "wrap", map[string]interface{}{
+			"inner": map[string]interface{}{"api_key": "sk-deep", "name": "svc"},
+		})
+		if strings.Contains(e.Details, "sk-deep") {
+			t.Errorf("leaked deeply nested api_key: %q", e.Details)
+		}
+	})
+
+	t.Run("stringified JSON", func(t *testing.T) {
+		e := BuildEntry("json", 0, 0,
+			"raw", `{"host":"ex.com","token":"sk-emb"}`,
+		)
+		if strings.Contains(e.Details, "sk-emb") {
+			t.Errorf("leaked embedded token in JSON string: %q", e.Details)
+		}
+	})
+
+	t.Run("key=value string", func(t *testing.T) {
+		e := BuildEntry("kv", 0, 0,
+			"env", "host=ex.com,api_key=sk-kv,debug=true",
+		)
+		if strings.Contains(e.Details, "sk-kv") {
+			t.Errorf("leaked api_key in key=value string: %q", e.Details)
+		}
+	})
+
+	t.Run("clean string untouched", func(t *testing.T) {
+		clean := "host=ex.com,port=8443"
+		if result := scanSecrets(clean); result != clean {
+			t.Errorf("scanSecrets altered clean string: %q -> %q", clean, result)
+		}
+	})
+}
