@@ -542,7 +542,6 @@ func (h *Handler) Serve(addr string) error {
 
 	mux.HandleFunc("/api/pulse", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ts":             time.Now().UnixMilli(),
 			"total_requests": h.cb.RequestCount(),
