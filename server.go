@@ -139,6 +139,10 @@ type Server struct {
 	// Extracted to pkg/registry/server/replication (R7.1).
 	replMgr *replpkg.Manager
 
+	// term is the monotonic replication epoch, incremented on primary promotion.
+	// Standbys reject snapshots from a primary whose term is stale.
+	term uint64
+
 	// authz holds the authorization checker (admin/dashboard tokens, role gates,
 	// enterprise gates, signature verification). Extracted to pkg/registry/server/authz (R3.1).
 	authz *authzpkg.Checker

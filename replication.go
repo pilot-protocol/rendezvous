@@ -175,6 +175,9 @@ func (s *Server) snapshotJSON() []byte {
 		}
 	}
 
+	// Replication term for fencing (PILOT-328).
+	snap.Term = s.term
+
 	// Enterprise config — pointers; not mutated post-init in practice but we
 	// still snapshot the pointer under RLock and Marshal will read whatever
 	// they point to. Acceptable: these are config blobs whose mutation
@@ -237,6 +240,16 @@ func (s *Server) applySnapshot(data []byte) error {
 	var snap snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return fmt.Errorf("unmarshal: %w", err)
+	}
+
+	// PILOT-328: reject snapshots from a stale-term primary.
+	s.mu.RLock()
+	currentTerm := s.term
+	s.mu.RUnlock()
+	if snap.Term < currentTerm {
+		slog.Warn("replication: rejecting snapshot from stale primary",
+			"snapshot_term", snap.Term, "current_term", currentTerm)
+		return nil // not an error — we just ignore the stale push
 	}
 
 	// --- Phase 1: build all the new maps OUTSIDE any lock ---
@@ -417,6 +430,7 @@ func (s *Server) applySnapshot(data []byte) error {
 	s.inviteInbox = newInviteInbox
 	s.nextNode = snap.NextNode
 	s.nextNet = snap.NextNet
+	s.term = snap.Term // PILOT-328: track replication epoch
 	if newRBACPreAssign != nil {
 		s.rbacPreAssign = newRBACPreAssign
 	}
