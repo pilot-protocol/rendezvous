@@ -336,6 +336,52 @@ func TestServer_HandleGetAuditLog_FiltersByNetwork(t *testing.T) {
 	}
 }
 
+func TestServer_HandleGetAuditLog_LimitCappedAt100(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, "admin")
+	for i := 0; i < 200; i++ {
+		s.appendAudit("evt", 0, 0)
+	}
+	resp, err := s.handleGetAuditLog(map[string]interface{}{
+		"admin_token": "admin",
+		"limit":       float64(999),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := resp["entries"].([]map[string]interface{})
+	if len(entries) > 100 {
+		t.Fatalf("limit capped: got %d entries, want <= 100", len(entries))
+	}
+}
+
+func TestServer_HandleGetAuditLog_OffsetsPastFirstPage(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, "admin")
+	s.appendAudit("oldest", 0, 0)
+	s.appendAudit("middle", 0, 0)
+	s.appendAudit("newest", 0, 0)
+	resp, err := s.handleGetAuditLog(map[string]interface{}{
+		"admin_token": "admin",
+		"limit":       float64(2),
+		"offset":      float64(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := resp["entries"].([]map[string]interface{})
+	if len(entries) != 2 {
+		t.Fatalf("offset+limit: got %d entries, want 2", len(entries))
+	}
+	// With offset=1, newest is skipped; should get middle, then oldest
+	if entries[0]["action"] != "middle" {
+		t.Fatalf("first after offset: %v, want middle", entries[0]["action"])
+	}
+	if entries[1]["action"] != "oldest" {
+		t.Fatalf("second after offset: %v, want oldest", entries[1]["action"])
+	}
+}
+
 // --- handleBeaconRegister -----------------------------------------------
 
 func TestServer_HandleBeaconRegister_RequiresAdmin(t *testing.T) {
