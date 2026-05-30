@@ -145,7 +145,7 @@ func (m *Manager) PushDelta(entries []walpkg.DeltaEntry, seqNo uint64) {
 // subscribers so standbys can detect primary failure within ~30s.
 // It blocks until done is closed.
 func (m *Manager) StartHeartbeat(done <-chan struct{}) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
