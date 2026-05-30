@@ -11,6 +11,9 @@
 package audit
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -28,6 +31,14 @@ type Entry struct {
 	NetworkID uint16 `json:"network_id,omitempty"`
 	NodeID    uint32 `json:"node_id,omitempty"`
 	Details   string `json:"details,omitempty"`
+
+	// Hash-chain fields for tamper-evidence.
+	// PrevHash is the SHA-256 hex digest of the previous entry
+	// (empty for the genesis entry). Hash is the SHA-256 hex
+	// digest of this entry encompassing PrevHash, Timestamp,
+	// Action, NetworkID, NodeID, and Details.
+	PrevHash string `json:"prev_hash,omitempty"`
+	Hash     string `json:"hash,omitempty"`
 }
 
 const maxEntries = 1000
@@ -37,6 +48,11 @@ const maxEntries = 1000
 type Store struct {
 	mu  sync.Mutex
 	log []Entry
+
+	// lastHash caches the hash of the most recent entry to avoid
+	// re-reading the ring buffer on every Append. Empty for a
+	// fresh or empty store.
+	lastHash string
 
 	// Export adapter — nil when export is disabled.
 	exporter *AuditExporter
@@ -114,12 +130,20 @@ func (st *Store) handleExporterFanout(evt events.Event) {
 // Append directly inserts an entry into the ring buffer and forwards it to
 // the exporter (if configured). It is used by the snapshot restore path
 // which bypasses the bus (no need to publish historical entries).
+//
+// Each entry is linked to its predecessor via a SHA-256 hash chain,
+// providing tamper-evident integrity. The genesis entry has an empty
+// PrevHash.
 func (st *Store) Append(e Entry) {
+	e.PrevHash = st.lastHash
+	e.Hash = hashEntry(e.PrevHash, e.Timestamp, e.Action, e.NetworkID, e.NodeID, e.Details)
+
 	st.mu.Lock()
 	if len(st.log) >= maxEntries {
 		st.log = st.log[1:]
 	}
 	st.log = append(st.log, e)
+	st.lastHash = e.Hash
 	exp := st.exporter
 	st.mu.Unlock()
 
@@ -141,11 +165,13 @@ func (st *Store) Snapshot() []Entry {
 }
 
 // RestoreLog replaces the ring buffer with the provided slice (used during
-// snapshot restore on startup).
+// snapshot restore on startup). If the entries already carry a valid hash
+// chain it is preserved; otherwise the chain is rebuilt from scratch.
 func (st *Store) RestoreLog(entries []Entry) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.log = entries
+	st.rebuildHashChain()
 }
 
 // SetExporter replaces the current exporter with a new one built from cfg.
@@ -244,6 +270,77 @@ func (st *Store) FilteredEntries(filterNetID uint16, limit int) []map[string]int
 		out = []map[string]interface{}{}
 	}
 	return out
+}
+
+// hashEntry computes the SHA-256 hex digest of a single audit entry
+// linked to the previous entry via prevHash. The serialisation order is
+// deliberately not JSON — we use binary.Write for the fixed-width fields
+// to avoid any ambiguity around field ordering, whitespace, or encoding
+// differences that could break the chain across versions.
+func hashEntry(prevHash, timestamp, action string, networkID uint16, nodeID uint32, details string) string {
+	h := sha256.New()
+	h.Write([]byte(prevHash))
+	h.Write([]byte(timestamp))
+	h.Write([]byte(action))
+	var buf [4]byte
+	binary.BigEndian.PutUint16(buf[:2], networkID)
+	h.Write(buf[:2])
+	binary.BigEndian.PutUint32(buf[:4], nodeID)
+	h.Write(buf[:4])
+	h.Write([]byte(details))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// rebuildHashChain recomputes the hash chain from the first entry to the
+// last. Caller must hold st.mu. Idempotent: if the chain is already valid
+// we leave it untouched; if any entry carries zero hashes or a broken link
+// the chain is rebuilt.
+func (st *Store) rebuildHashChain() {
+	if len(st.log) == 0 {
+		st.lastHash = ""
+		return
+	}
+	for i := range st.log {
+		e := &st.log[i]
+		expected := hashEntry(e.PrevHash, e.Timestamp, e.Action, e.NetworkID, e.NodeID, e.Details)
+		if i == 0 {
+			// Genesis: accept the existing hash if it exists;
+			// otherwise compute and fill.
+			if e.Hash == "" {
+				e.PrevHash = ""
+				e.Hash = expected
+			}
+		} else {
+			prev := st.log[i-1]
+			if e.PrevHash != prev.Hash || e.Hash != expected {
+				e.PrevHash = prev.Hash
+				e.Hash = expected
+			}
+		}
+	}
+	st.lastHash = st.log[len(st.log)-1].Hash
+}
+
+// VerifyIntegrity walks the hash chain from the oldest entry to the
+// newest. It returns the index of the first entry whose hash does not
+// match, or -1 when the chain is fully intact.
+func (st *Store) VerifyIntegrity() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	var prevHash string
+	for i := range st.log {
+		e := &st.log[i]
+		if e.PrevHash != prevHash {
+			return i
+		}
+		expected := hashEntry(e.PrevHash, e.Timestamp, e.Action, e.NetworkID, e.NodeID, e.Details)
+		if e.Hash != expected {
+			return i
+		}
+		prevHash = e.Hash
+	}
+	return -1
 }
 
 func BuildEntry(action string, netID uint16, nodeID uint32, attrs ...any) Entry {
