@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pilot-protocol/rendezvous/audit"
 	"github.com/pilot-protocol/rendezvous/events"
 )
 
@@ -379,6 +380,9 @@ func (st *Store) HandleGetWebhook() map[string]interface{} {
 }
 
 // HandleGetWebhookDLQ requires admin-token verification by the caller.
+// PILOT-314: applies audit.RedactMap to each entry's Details so that
+// any secret material not caught at audit-build time is stripped before
+// the DLQ payload reaches the caller.
 func (st *Store) HandleGetWebhookDLQ() map[string]interface{} {
 	st.mu.RLock()
 	d := st.disp
@@ -393,7 +397,7 @@ func (st *Store) HandleGetWebhookDLQ() map[string]interface{} {
 				"timestamp": ev.Timestamp.Format("2006-01-02T15:04:05Z"),
 			}
 			if len(ev.Details) > 0 {
-				entry["details"] = ev.Details
+				entry["details"] = audit.RedactMap(ev.Details)
 			}
 			evts = append(evts, entry)
 		}

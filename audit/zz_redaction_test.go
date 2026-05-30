@@ -59,3 +59,48 @@ func TestBuildEntryDoesNotRedactNonSecretKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestRedactMap verifies the exported redaction helper used by the
+// webhook DLQ read API (PILOT-314).
+func TestRedactMap(t *testing.T) {
+	t.Parallel()
+
+	t.Run("redacts sensitive keys", func(t *testing.T) {
+		in := map[string]interface{}{
+			"token":     "abc123",
+			"hostname":  "public-host",
+			"api_key":   "sk-live",
+			"reason":    "ok",
+			"db_secret": "pw", // suffix _secret
+		}
+		got := RedactMap(in)
+		if got["token"] != "<redacted>" {
+			t.Errorf("token = %v, want <redacted>", got["token"])
+		}
+		if got["api_key"] != "<redacted>" {
+			t.Errorf("api_key = %v, want <redacted>", got["api_key"])
+		}
+		if got["db_secret"] != "<redacted>" {
+			t.Errorf("db_secret = %v, want <redacted>", got["db_secret"])
+		}
+		if got["hostname"] != "public-host" {
+			t.Errorf("hostname = %v, want public-host", got["hostname"])
+		}
+		if got["reason"] != "ok" {
+			t.Errorf("reason = %v, want ok", got["reason"])
+		}
+	})
+
+	t.Run("nil-safe", func(t *testing.T) {
+		if got := RedactMap(nil); got != nil {
+			t.Errorf("RedactMap(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("empty map", func(t *testing.T) {
+		got := RedactMap(map[string]interface{}{})
+		if len(got) != 0 {
+			t.Errorf("RedactMap({}) len = %d, want 0", len(got))
+		}
+	})
+}
