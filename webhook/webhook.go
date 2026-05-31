@@ -51,9 +51,10 @@ type dispatcher struct {
 	secret         string // HMAC-SHA256 pre-shared secret (empty = no sig)
 
 	// Dead letter queue: stores last N failed events for retry/inspection
-	dlqMu    sync.Mutex
-	dlqItems []*Event
-	dlqMax   int
+	dlqMu     sync.Mutex
+	dlqItems  []*Event
+	dlqMax    int
+	dlqDropped atomic.Uint64 // events evicted from DLQ ring
 }
 
 const (
@@ -199,6 +200,8 @@ func (d *dispatcher) addToDLQ(ev *Event) {
 	defer d.dlqMu.Unlock()
 	if len(d.dlqItems) >= d.dlqMax {
 		d.dlqItems = d.dlqItems[1:] // drop oldest
+		d.dlqDropped.Add(1)
+		slog.Warn("registry webhook DLQ full, dropping oldest event", "dlq_max", d.dlqMax)
 	}
 	d.dlqItems = append(d.dlqItems, ev)
 }
@@ -360,21 +363,23 @@ func (st *Store) HandleGetWebhook() map[string]interface{} {
 	st.mu.RUnlock()
 
 	url := ""
-	var delivered, failed, dropped uint64
+	var delivered, failed, dropped, dlqDropped uint64
 	dlqLen := 0
 	if d != nil {
 		url = d.url
 		delivered, failed, dropped = d.stats()
+		dlqDropped = d.dlqDropped.Load()
 		dlqLen = len(d.getDLQ())
 	}
 	return map[string]interface{}{
-		"type":      "get_webhook_ok",
-		"enabled":   d != nil,
-		"url":       url,
-		"delivered": delivered,
-		"failed":    failed,
-		"dropped":   dropped,
-		"dlq_size":  dlqLen,
+		"type":        "get_webhook_ok",
+		"enabled":     d != nil,
+		"url":         url,
+		"delivered":   delivered,
+		"failed":      failed,
+		"dropped":     dropped,
+		"dlq_size":    dlqLen,
+		"dlq_dropped": dlqDropped,
 	}
 }
 

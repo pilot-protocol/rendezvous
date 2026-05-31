@@ -139,6 +139,10 @@ func TestDispatcher_AddToDLQ_DropsOldestWhenFull(t *testing.T) {
 	if got[0].EventID != 3 || got[1].EventID != 4 {
 		t.Errorf("DLQ contents = %v, want oldest dropped", got)
 	}
+	// Verify the dlqDropped counter tracks evictions (5 pushes into cap 2 = 3 drops).
+	if n := d.dlqDropped.Load(); n != 3 {
+		t.Errorf("dlqDropped = %d, want 3", n)
+	}
 }
 
 func TestDispatcher_EmitAfterCloseIsNoop(t *testing.T) {
