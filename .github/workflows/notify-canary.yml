@@ -1,0 +1,23 @@
+name: Notify Canary
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'pilot-protocol',
+              repo: 'pilot-canary',
+              event_type: 'canary-build',
+              client_payload: { repo: 'rendezvous', ref: context.sha }
+            });
