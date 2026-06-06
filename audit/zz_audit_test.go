@@ -362,6 +362,47 @@ func TestAuditExporterExportBufferFullIncrementsDropped(t *testing.T) {
 	}
 }
 
+// TestFormatCEFEscapesInjectionCharactersInAction verifies that pipe, equals,
+// backslash, and newline characters in Action are CEF-escaped so an attacker
+// cannot inject fake header fields or extension key=value pairs.
+func TestFormatCEFEscapesInjectionCharactersInAction(t *testing.T) {
+	t.Parallel()
+	ae := &AuditExporter{config: &wire.BlueprintAuditExport{Format: "syslog_cef"}}
+	action := "register|cn2=99|src=10.0.0.1|act=succeeded"
+	body, err := ae.formatCEF(&Entry{Action: action, NetworkID: 1, NodeID: 2})
+	if err != nil {
+		t.Fatalf("formatCEF: %v", err)
+	}
+	line := string(body)
+	// The raw pipe must not appear as a bare separator.
+	if strings.Contains(line, "|cn2=99") {
+		t.Fatalf("CEF output contains unescaped pipe in Action injection: %s", line)
+	}
+	// The escaped pipe should appear.
+	if !strings.Contains(line, `\|cn2`) {
+		t.Fatalf("CEF output missing escaped pipe in Action: %s", line)
+	}
+}
+
+// TestFormatCEFEscapesInjectionCharactersInDetails verifies that pipe and
+// equals characters in Details are CEF-escaped.
+func TestFormatCEFEscapesInjectionCharactersInDetails(t *testing.T) {
+	t.Parallel()
+	ae := &AuditExporter{config: &wire.BlueprintAuditExport{Format: "syslog_cef"}}
+	details := "error|msg=something bad\nline2"
+	body, err := ae.formatCEF(&Entry{Action: "register", NetworkID: 1, NodeID: 2, Details: details})
+	if err != nil {
+		t.Fatalf("formatCEF: %v", err)
+	}
+	line := string(body)
+	if strings.Contains(line, "|msg=") {
+		t.Fatalf("Details contains unescaped pipe: %s", line)
+	}
+	if strings.Contains(line, "\nline2") {
+		t.Fatalf("Details contains unescaped newline: %s", line)
+	}
+}
+
 // TestSendUnknownFormatUsesJSON verifies the default JSON fallback.
 func TestSendUnknownFormatUsesJSON(t *testing.T) {
 	t.Parallel()

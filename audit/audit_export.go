@@ -204,6 +204,17 @@ func (ae *AuditExporter) formatSplunkHEC(entry *Entry) ([]byte, error) {
 	return json.Marshal(hec)
 }
 
+// cefEscape escapes |, =, \, \r, and \n characters as \|, \=, \\, \r, \n
+// so that user-controlled fields cannot inject fake CEF headers or extensions.
+func cefEscape(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "=", "\\=")
+	s = strings.ReplaceAll(s, "|", "\\|")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	return s
+}
+
 // formatCEF produces a CEF (Common Event Format) line for SIEM ingestion.
 // Format: CEF:0|Pilot|Registry|1.0|<action>|<action>|<severity>|<extensions>
 func (ae *AuditExporter) formatCEF(entry *Entry) ([]byte, error) {
@@ -214,16 +225,18 @@ func (ae *AuditExporter) formatCEF(entry *Entry) ([]byte, error) {
 		severity = 4 // medium
 	}
 
+	safeAction := cefEscape(entry.Action)
+
 	extensions := fmt.Sprintf("dvc=pilot-registry dvchost=registry "+
 		"cs1=%s cs1Label=action cn1=%d cn1Label=network_id cn2=%d cn2Label=node_id",
-		entry.Action, entry.NetworkID, entry.NodeID)
+		safeAction, entry.NetworkID, entry.NodeID)
 
 	if entry.Details != "" {
-		extensions += fmt.Sprintf(" msg=%s", entry.Details)
+		extensions += fmt.Sprintf(" msg=%s", cefEscape(entry.Details))
 	}
 
 	line := fmt.Sprintf("CEF:0|Pilot|Registry|1.0|%s|%s|%d|%s",
-		entry.Action, entry.Action, severity, extensions)
+		safeAction, safeAction, severity, extensions)
 
 	return []byte(line), nil
 }
