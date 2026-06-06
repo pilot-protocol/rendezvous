@@ -7,6 +7,12 @@ on:
     workflows: [CI]
     types: [completed]
 
+# PILOT-113: explicit minimal permissions. Default GITHUB_TOKEN scope
+# is write-all; this workflow only needs to read the repo and dispatch
+# an external event using a PAT secret.
+permissions:
+  contents: read
+
 jobs:
   notify:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
