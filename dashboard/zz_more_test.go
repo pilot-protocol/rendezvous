@@ -262,11 +262,11 @@ func TestLocalhostOnly_RejectsRemote(t *testing.T) {
 	}
 }
 
-func TestLocalhostOnly_HonorsXRealIPFromLocalhost(t *testing.T) {
+func TestLocalhostOnly_IgnoresXRealIPFromLocalhost(t *testing.T) {
 	t.Parallel()
-	// When the direct connection is localhost but X-Real-IP is a remote
-	// address, the middleware must use the X-Real-IP value for the
-	// allow/deny check (i.e. reject).
+	// When the direct connection is localhost, the middleware must allow
+	// regardless of X-Real-IP header (which may be spoofed by a remote
+	// attacker through a reverse proxy on the same host).
 	called := false
 	h := localhostOnly(func(http.ResponseWriter, *http.Request) { called = true })
 	r := httptest.NewRequest("GET", "/", nil)
@@ -274,8 +274,8 @@ func TestLocalhostOnly_HonorsXRealIPFromLocalhost(t *testing.T) {
 	r.Header.Set("X-Real-IP", "8.8.8.8")
 	rw := httptest.NewRecorder()
 	h(rw, r)
-	if called {
-		t.Error("X-Real-IP=remote should be blocked even from loopback")
+	if !called {
+		t.Error("X-Real-IP should be ignored; loopback request should pass")
 	}
 }
 

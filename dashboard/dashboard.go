@@ -422,17 +422,10 @@ func readSmallBody(r *http.Request, maxBytes int64) (string, error) {
 }
 
 // localhostOnly rejects requests not originating from loopback.
-// Trusts X-Real-IP only when the direct connection is from localhost.
 func localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		clientIP := remoteIP
-		if remoteIP == "127.0.0.1" || remoteIP == "::1" || remoteIP == "localhost" {
-			if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-				clientIP = realIP
-			}
-		}
-		if clientIP != "127.0.0.1" && clientIP != "::1" && clientIP != "localhost" {
+		if remoteIP != "127.0.0.1" && remoteIP != "::1" && remoteIP != "localhost" {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -472,13 +465,7 @@ func (h *Handler) Serve(addr string) error {
 
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		clientIP := remoteIP
-		if remoteIP == "127.0.0.1" || remoteIP == "::1" || remoteIP == "localhost" {
-			if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-				clientIP = realIP
-			}
-		}
-		if clientIP != "127.0.0.1" && clientIP != "::1" && clientIP != "localhost" {
+		if remoteIP != "127.0.0.1" && remoteIP != "::1" && remoteIP != "localhost" {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -644,13 +631,7 @@ func (h *Handler) Serve(addr string) error {
 	// Snapshot trigger endpoint (POST only, localhost only).
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		clientIP := remoteIP
-		if remoteIP == "127.0.0.1" || remoteIP == "::1" || remoteIP == "localhost" {
-			if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-				clientIP = realIP
-			}
-		}
-		if clientIP != "127.0.0.1" && clientIP != "::1" && clientIP != "localhost" {
+		if remoteIP != "127.0.0.1" && remoteIP != "::1" && remoteIP != "localhost" {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
