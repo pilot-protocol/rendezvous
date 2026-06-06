@@ -1,7 +1,7 @@
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
-github.com/pilot-protocol/beacon v0.2.1 h1:NMNcXIC3ra5S9f6617FYH/MvcUZv0d9dJPAOb7FbORs=
-github.com/pilot-protocol/beacon v0.2.1/go.mod h1:2J4opW4hQRdUSQhszi3a5GrlTGxm7JgBH9Q7j/ZrC7U=
+github.com/pilot-protocol/beacon v0.2.2 h1:G1P5wuBK75LTSGHhpjNsN7bWi8JiZ0bWk3yjWcQNkwA=
+github.com/pilot-protocol/beacon v0.2.2/go.mod h1:k/cHbldwYkkF7dN1WDlaDPGqiRfFgIAmiB71fXSPYW0=
 github.com/pilot-protocol/common v0.4.0 h1:lH1WdQBU5Zan1rAqF/kYpcJO6vBoYVWXrWUNwMX10jA=
 github.com/pilot-protocol/common v0.4.0/go.mod h1:yrAwPXGVMbXU+SADvOCmbdXjK/wJ3uA0KshyLvRlej4=
 golang.org/x/net v0.55.0 h1:bcvxaJn3e1U6InsFWt1JUq1aSjnRxLzT2rtD2KfkDF8=
