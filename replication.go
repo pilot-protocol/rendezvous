@@ -539,7 +539,7 @@ func (s *Server) standbySession(primaryAddr string) error {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(45 * time.Second)) //nolint:errcheck
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
 		msg, err := readMessage(conn)
 		if err != nil {
 			if err == io.EOF {
