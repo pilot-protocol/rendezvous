@@ -104,6 +104,60 @@ func TestHandleGetWebhookDLQ(t *testing.T) {
 	}
 }
 
+// TestHandleGetWebhookDLQRedactSecrets verifies that PILOT-314 is fixed:
+// sensitive keys (token, password, etc.) in DLQ event Details are redacted
+// when retrieved via HandleGetWebhookDLQ.
+func TestHandleGetWebhookDLQRedactSecrets(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(400) // client error → DLQ
+	}))
+	defer srv.Close()
+
+	st := webhook.NewStore()
+	defer st.Close()
+	st.SetInitialBackoff(time.Millisecond)
+	st.HandleSetWebhook(srv.URL)
+
+	// Emit an event with a secret-bearing details map.
+	st.Emit("dlq.secret", map[string]interface{}{
+		"admin_token": "supersecret",
+		"hostname":    "public-host",
+		"password":    "hunter2",
+		"reason":      "test",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	var dlqResp map[string]interface{}
+	for time.Now().Before(deadline) {
+		dlqResp = st.HandleGetWebhookDLQ()
+		if count, _ := dlqResp["count"].(int); count >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	evts, _ := dlqResp["events"].([]map[string]interface{})
+	if len(evts) < 1 {
+		t.Fatal("expected at least 1 DLQ event")
+	}
+	details, _ := evts[0]["details"].(map[string]interface{})
+
+	// Secret keys must be redacted.
+	for _, key := range []string{"admin_token", "password"} {
+		if v, ok := details[key]; !ok || v != "<redacted>" {
+			t.Errorf("details[%q] = %v, want <redacted>", key, v)
+		}
+	}
+	// Non-secret keys must pass through.
+	if v := details["hostname"]; v != "public-host" {
+		t.Errorf("details[hostname] = %v, want public-host", v)
+	}
+	if v := details["reason"]; v != "test" {
+		t.Errorf("details[reason] = %v, want test", v)
+	}
+}
+
 // TestSubscribeFansOutFromEventBus verifies that Store.Subscribe causes
 // events published on the bus to be delivered to the webhook endpoint.
 func TestSubscribeFansOutFromEventBus(t *testing.T) {

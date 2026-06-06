@@ -324,3 +324,26 @@ func redactKey(k string) bool {
 	}
 	return false
 }
+
+// RedactMap returns a shallow copy of m with any values whose keys
+// match redactKey replaced by "<redacted>". Nil-safe (returns nil).
+//
+// PILOT-314: the DLQ read API (HandleGetWebhookDLQ) returns event
+// Details verbatim. If audit redaction wasn't exhaustive, the DLQ
+// becomes a credential-disclosure surface for anyone holding the
+// admin token. RedactMap allows callers outside package audit to
+// apply the same redaction rules on retrieval.
+func RedactMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if redactKey(k) {
+			out[k] = "<redacted>"
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
