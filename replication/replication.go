@@ -5,6 +5,24 @@
 // set of standby subscriber connections and broadcasts snapshots/deltas to
 // all of them. Directory-sync types and helpers used by the server-side
 // handler are also defined here.
+//
+// ## Consistency model
+//
+// Replication uses an AP (Available / Partition-Tolerant) model:
+// Push() and PushDelta() commit writes locally first, then broadcast
+// snapshots/deltas to all connected standbys on a best-effort basis.
+// The primary does NOT wait for standby acknowledgment — mutations
+// are considered committed once they land in the local WAL.
+//
+// If the primary crashes before a standby has received the latest deltas
+// (e.g. within the 1 s replicaPushInterval), those mutations are lost.
+// This is an intentional design choice for the AP side of the CAP
+// theorem: the rendezvous remains available under partition at the cost
+// of potential data loss on failover.
+//
+// Sync-replication mode (where the primary waits for at least one
+// standby ack before returning to the caller) is not yet implemented.
+// See PILOT-280 for discussion.
 package replication
 
 import (
