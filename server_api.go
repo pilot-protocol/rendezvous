@@ -27,6 +27,26 @@ func (s *Server) Reap() {
 	s.reapStaleBeacons()
 }
 
+// PromoteToPrimary increments the replication term and persists it, fencing
+// off a stale former primary. Safe to call on any server that should become
+// the sole write master. (PILOT-328)
+func (s *Server) PromoteToPrimary() error {
+	s.mu.Lock()
+	s.term++
+	newTerm := s.term
+	s.mu.Unlock()
+	slog.Warn("replication: server promoted to primary", "term", newTerm)
+	return s.flushSave()
+}
+
+// Term returns the current replication epoch.
+func (s *Server) Term() uint64 {
+	s.mu.RLock()
+	t := s.term
+	s.mu.RUnlock()
+	return t
+}
+
 // ── Dispatcher interface implementation ───────────────────────────────────────
 //
 // These methods satisfy accept.Dispatcher so that Acceptor can delegate all

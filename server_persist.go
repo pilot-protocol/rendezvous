@@ -509,6 +509,7 @@ func (s *Server) load() error {
 
 	s.nextNode = snap.NextNode
 	s.nextNet = snap.NextNet
+	s.term = snap.Term // PILOT-328: restore replication epoch
 
 	// Restore dashboard stats
 	if snap.TotalRequests > 0 {

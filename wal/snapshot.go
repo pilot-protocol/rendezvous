@@ -102,6 +102,10 @@ type Snapshot struct {
 	IDPConfig      *wire.BlueprintIdentityProvider `json:"idp_config,omitempty"`
 	AuditExportCfg *wire.BlueprintAuditExport      `json:"audit_export_config,omitempty"`
 	RBACPreAssign  map[string][]wire.BlueprintRole `json:"rbac_pre_assign,omitempty"` // networkID -> roles
+	// Term is the monotonic replication epoch, incremented on primary promotion.
+	// Standbys reject snapshots from a primary whose term is stale.
+	Term uint64 `json:"term,omitempty"`
+
 	// Integrity: SHA256 hex digest of all fields except Checksum
 	Checksum string `json:"checksum,omitempty"`
 }
