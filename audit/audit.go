@@ -58,6 +58,10 @@ type Store struct {
 	exporter *AuditExporter
 	cfg      *wire.BlueprintAuditExport
 
+	// storePath is the path to the registry snapshot file (e.g. /data/registry.json).
+	// When set, the audit exporter derives its WAL path from it.
+	storePath string
+
 	// unsub stops the bus subscriber goroutine started by Subscribe.
 	unsub func()
 }
@@ -176,6 +180,8 @@ func (st *Store) RestoreLog(entries []Entry) {
 
 // SetExporter replaces the current exporter with a new one built from cfg.
 // The old exporter (if any) is drained and closed. Pass nil cfg to disable.
+// If storePath was previously set via SetStorePath, the new exporter gets
+// a write-ahead log at "{storePath}.audit-export-wal".
 func (st *Store) SetExporter(cfg *wire.BlueprintAuditExport) {
 	st.mu.Lock()
 	old := st.exporter
@@ -183,7 +189,11 @@ func (st *Store) SetExporter(cfg *wire.BlueprintAuditExport) {
 		st.exporter = nil
 		st.cfg = nil
 	} else {
-		st.exporter = newAuditExporter(cfg)
+		walPath := ""
+		if st.storePath != "" {
+			walPath = st.storePath + ".audit-export-wal"
+		}
+		st.exporter = newAuditExporter(cfg, walPath)
 		st.cfg = cfg
 	}
 	st.mu.Unlock()
@@ -191,6 +201,15 @@ func (st *Store) SetExporter(cfg *wire.BlueprintAuditExport) {
 	if old != nil {
 		old.Close()
 	}
+}
+
+// SetStorePath records the registry snapshot file path so the audit
+// exporter can derive its WAL path ({storePath}.audit-export-wal).
+// Call once during server init, before SetExporter.
+func (st *Store) SetStorePath(p string) {
+	st.mu.Lock()
+	st.storePath = p
+	st.mu.Unlock()
 }
 
 // ExporterConfig returns the active export configuration (nil = disabled).

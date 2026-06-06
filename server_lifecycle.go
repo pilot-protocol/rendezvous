@@ -320,6 +320,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 	s.webhook = webhookpkg.NewStore()                  // R1.3: webhook sub-package
 	s.webhook.Subscribe(s.bus)                         // fan-out audit.entry events → webhook HTTP POST
 	s.auditStore = auditpkg.NewStore()                 // R1.2: audit sub-package
+	s.auditStore.SetStorePath(s.storePath)             // enable audit-export WAL when persistence is configured
 	s.auditStore.Subscribe(s.bus)                      // async ring-buffer + exporter fan-out
 	s.trust = trustpkg.NewStore(s, trustpkg.Callbacks{ // R2.1: trust sub-package
 		Save:                 s.save,

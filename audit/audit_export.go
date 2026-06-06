@@ -28,28 +28,65 @@ type AuditExporter struct {
 	closed    chan struct{}
 	exported  atomic.Uint64
 	dropped   atomic.Uint64
+	wal       *AuditWAL
 }
 
 // NewAuditExporter creates and starts a new AuditExporter for the given config.
 // It is exported so that the server package shim (audit_export.go) can
 // delegate to it without the sub-package re-implementing the constructor.
 func NewAuditExporter(cfg *wire.BlueprintAuditExport) *AuditExporter {
-	return newAuditExporter(cfg)
+	return newAuditExporter(cfg, "")
 }
 
-func newAuditExporter(cfg *wire.BlueprintAuditExport) *AuditExporter {
+// NewAuditExporterWithWAL creates and starts a new AuditExporter with an
+// on-disk write-ahead log at walPath. Use empty walPath to disable the WAL.
+func NewAuditExporterWithWAL(cfg *wire.BlueprintAuditExport, walPath string) *AuditExporter {
+	return newAuditExporter(cfg, walPath)
+}
+
+func newAuditExporter(cfg *wire.BlueprintAuditExport, walPath string) *AuditExporter {
+	w, err := NewAuditWAL(walPath)
+	if err != nil {
+		slog.Warn("audit exporter: failed to open WAL, continuing without persistence", "path", walPath, "error", err)
+	}
+
 	ae := &AuditExporter{
 		config: cfg,
 		ch:     make(chan *Entry, 1024),
 		client: &http.Client{Timeout: 10 * time.Second},
 		done:   make(chan struct{}),
 		closed: make(chan struct{}),
+		wal:    w,
 	}
+
+	// Replay any WAL entries from a previous crash into the channel.
+	// Non-blocking: if the channel fills, remaining entries are dropped
+	// (they will be replayed again on next restart until exported).
+	if w != nil {
+		pending, err := w.Pending()
+		if err != nil {
+			slog.Error("audit exporter: WAL replay failed", "error", err)
+		}
+		for i := range pending {
+			entry := pending[i] // capture
+			select {
+			case ae.ch <- &entry:
+			default:
+				slog.Warn("audit exporter: dropping replayed WAL entry (channel full)", "action", entry.Action)
+			}
+		}
+		if len(pending) > 0 {
+			slog.Info("audit exporter: replayed WAL entries", "count", len(pending))
+		}
+	}
+
 	go ae.run()
 	return ae
 }
 
-// Export queues an audit entry for export. Non-blocking; drops if buffer full.
+// Export queues an audit entry for export. The entry is persisted to the
+// write-ahead log before entering the channel. Non-blocking; drops if the
+// channel buffer is full, but the WAL copy survives a crash restart.
 func (ae *AuditExporter) Export(entry *Entry) {
 	if ae == nil {
 		return
@@ -59,15 +96,30 @@ func (ae *AuditExporter) Export(entry *Entry) {
 		return
 	default:
 	}
+
+	// Persist to WAL before attempting channel send. On a crash restart,
+	// WAL entries are replayed into the channel so no event is lost.
+	if ae.wal != nil {
+		if err := ae.wal.Append(entry); err != nil {
+			slog.Error("audit exporter: WAL append failed", "action", entry.Action, "error", err)
+		}
+	}
+
 	select {
 	case ae.ch <- entry:
 	case <-ae.closed:
 	default:
 		ae.dropped.Add(1)
+		slog.Warn("audit exporter: dropping entry (channel full)",
+			"action", entry.Action,
+			"dropped_total", ae.dropped.Load(),
+		)
 	}
 }
 
 // Close signals the background goroutine to stop and waits for it to drain.
+// After a clean drain, the WAL is truncated — all pending entries have been
+// sent to the external system.
 func (ae *AuditExporter) Close() {
 	if ae == nil {
 		return
@@ -83,6 +135,17 @@ func (ae *AuditExporter) Close() {
 	case <-ae.done:
 	case <-time.After(5 * time.Second):
 		slog.Warn("audit exporter drain timeout")
+	}
+
+	// Truncate WAL after clean drain. On crash, the WAL is preserved and
+	// replayed on next startup.
+	if ae.wal != nil {
+		if err := ae.wal.Truncate(); err != nil {
+			slog.Error("audit exporter: WAL truncate failed", "error", err)
+		}
+		if err := ae.wal.Close(); err != nil {
+			slog.Error("audit exporter: WAL close failed", "error", err)
+		}
 	}
 }
 
