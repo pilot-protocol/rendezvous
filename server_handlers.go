@@ -38,8 +38,12 @@ func (s *Server) handleGetAuditLog(msg map[string]interface{}) (map[string]inter
 
 	filterNetID := jsonUint16(msg, "network_id")
 	limit := 100
-	if l, ok := msg["limit"].(float64); ok && l > 0 && l <= 1000 {
+	if l, ok := msg["limit"].(float64); ok && l > 0 && l <= 100 {
 		limit = int(l)
+	}
+	offset := 0
+	if o, ok := msg["offset"].(float64); ok && o >= 0 {
+		offset = int(o)
 	}
 
 	s.auditMu.Lock()
@@ -47,11 +51,16 @@ func (s *Server) handleGetAuditLog(msg map[string]interface{}) (map[string]inter
 	copy(all, s.auditLog)
 	s.auditMu.Unlock()
 
-	// Filter and reverse (newest first)
+	// Filter and reverse (newest first). Skip offset-matched entries before collecting.
 	var entries []map[string]interface{}
+	skipped := 0
 	for i := len(all) - 1; i >= 0 && len(entries) < limit; i-- {
 		e := all[i]
 		if filterNetID != 0 && e.NetworkID != filterNetID {
+			continue
+		}
+		if skipped < offset {
+			skipped++
 			continue
 		}
 		m := map[string]interface{}{
