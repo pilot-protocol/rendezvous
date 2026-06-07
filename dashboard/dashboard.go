@@ -81,6 +81,12 @@ type Callbacks struct {
 	// /api/public-stats as total_nodes so it stays distinct from
 	// active_nodes (which post-reap is identical to NodeCount).
 	TotalEverRegistered func() int64
+	// BuildInfo returns the build-time identity of the running binary
+	// (version, git_commit, build_time, binary_sha256, go_version) so
+	// /api/public-stats can publish a verifiable record of what code is
+	// actually running. Returns nil when build info wasn't registered;
+	// the handler then omits the build_info field entirely.
+	BuildInfo func() map[string]string
 	// StaleThreshold returns the configured stale-node threshold.
 	StaleThreshold func() time.Duration
 	// TriggerSnapshot triggers a snapshot save.
@@ -647,9 +653,7 @@ func (h *Handler) Serve(addr string) error {
 		// "live."
 		throughput := h.RecentThroughput(10)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		payload := map[string]interface{}{
 			"server_time":      now.Unix(),
 			"uptime_seconds":   int64(now.Sub(startTime).Seconds()),
 			"active_nodes":     h.cb.OnlineCount(threshold),
@@ -661,7 +665,15 @@ func (h *Handler) Serve(addr string) error {
 				"beacon":    componentStatus("beacon"),
 				"dashboard": componentStatus("dashboard"),
 			},
-		})
+		}
+		if h.cb.BuildInfo != nil {
+			if bi := h.cb.BuildInfo(); len(bi) > 0 {
+				payload["build_info"] = bi
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 
 	// /api/stats — full rich payload (history, per-IP, etc.). Moved
@@ -1035,6 +1047,11 @@ header h1{font-size:20px;font-weight:600;color:var(--text2)}
 }
 
 footer{text-align:center;padding:24px 0;border-top:1px solid var(--border);margin-top:32px;font-size:12px;color:var(--muted2)}
+.build-info{margin-top:10px;font-family:ui-monospace,Menlo,Monaco,monospace;font-size:10.5px;line-height:1.5;color:var(--muted2);word-break:break-all}
+.build-info .bi-row{display:inline-block;margin:0 8px}
+.build-info .bi-label{color:var(--muted2);opacity:0.7}
+.build-info .bi-val{color:var(--ink)}
+.build-info a{color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--muted2)}
 footer a{color:var(--muted2)}
 footer a:hover{color:var(--accent)}
 
@@ -1126,6 +1143,7 @@ footer a:hover{color:var(--accent)}
   Pilot Protocol &middot;
   <a href="https://pilotprotocol.network">pilotprotocol.network</a> &middot;
   <a href="https://github.com/TeoSlayer/pilotprotocol">GitHub</a>
+  <div id="build-info" class="build-info" style="display:none"></div>
 </footer>
 
 </div>
@@ -1147,6 +1165,27 @@ function renderBanner(b,maint){
   if(!html){stack.style.display='none';stack.innerHTML='';return}
   stack.innerHTML=html;
   stack.style.display='flex';
+}
+function renderBuildInfo(bi){
+  var el=document.getElementById('build-info');
+  if(!el||!bi){if(el){el.style.display='none';el.innerHTML=''}return}
+  var commit=bi.git_commit||'';
+  var commitHTML=commit?('<a href="https://github.com/TeoSlayer/pilotprotocol/commit/'+encodeURIComponent(commit)+'" title="View commit on GitHub" target="_blank" rel="noopener">'+escapeHtml(commit)+'</a>'):'(unset)';
+  var sha=bi.binary_sha256||'';
+  var shaShort=sha?sha.substring(0,12)+'…':'(unset)';
+  var shaTitle=sha?('Full SHA256: '+sha):'';
+  var html=''+
+    '<div class="bi-row"><span class="bi-label">version</span> <span class="bi-val">'+escapeHtml(bi.version||'(unset)')+'</span></div>'+
+    '<div class="bi-row"><span class="bi-label">commit</span> <span class="bi-val">'+commitHTML+'</span></div>'+
+    '<div class="bi-row" title="'+escapeHtml(shaTitle)+'"><span class="bi-label">sha256</span> <span class="bi-val">'+escapeHtml(shaShort)+'</span></div>';
+  if(bi.go_version){
+    html+='<div class="bi-row"><span class="bi-label">go</span> <span class="bi-val">'+escapeHtml(bi.go_version)+'</span></div>';
+  }
+  if(bi.build_time){
+    html+='<div class="bi-row"><span class="bi-label">built</span> <span class="bi-val">'+escapeHtml(bi.build_time)+'</span></div>';
+  }
+  el.innerHTML=html;
+  el.style.display='block';
 }
 function getToken(){return localStorage.getItem('pilot_dash_token')||''}
 function setToken(t){if(t)localStorage.setItem('pilot_dash_token',t);else localStorage.removeItem('pilot_dash_token')}
@@ -1312,6 +1351,7 @@ function update(){
     renderBanner(d.release_banner,d.maintenance_banner);
     if(d.hourly||d.daily)renderCharts(d.hourly,d.daily);
     if(d.networks)renderNetworks(d.networks);
+    renderBuildInfo(d.build_info);
   }).catch(function(){})
 }
 function renderServices(uptimeSecs,restartEvents,probes){

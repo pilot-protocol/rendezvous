@@ -41,6 +41,38 @@ func (s *Server) IsStandby() bool {
 	return s.walStore.IsStandby()
 }
 
+// SetBuildInfo records the build-time identity surfaced on
+// /api/public-stats for supply-chain verification. Must be called
+// before Start; the resulting map is treated as immutable. Pass a copy
+// to defend against callers mutating their input.
+func (s *Server) SetBuildInfo(info map[string]string) {
+	if info == nil {
+		return
+	}
+	cp := make(map[string]string, len(info))
+	for k, v := range info {
+		cp[k] = v
+	}
+	s.mu.Lock()
+	s.buildInfo = cp
+	s.mu.Unlock()
+}
+
+// BuildInfo returns a copy of the recorded build identity, or nil if
+// none was registered. Safe to call concurrently.
+func (s *Server) BuildInfo() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.buildInfo) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(s.buildInfo))
+	for k, v := range s.buildInfo {
+		cp[k] = v
+	}
+	return cp
+}
+
 // SetAdminToken sets the token required for network creation.
 // Empty string disables network creation entirely.
 func (s *Server) SetAdminToken(token string) {
@@ -749,6 +781,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			}
 			return int64(s.nextNode - 1)
 		},
+		BuildInfo: s.BuildInfo,
 		StaleThreshold:  s.StaleNodeThreshold,
 		TriggerSnapshot: s.TriggerSnapshot,
 		UpdateGauges:    func() { s.updateGauges(s.metrics) },

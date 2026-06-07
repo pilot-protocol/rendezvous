@@ -66,7 +66,13 @@ func main() {
 		runtime.SetBlockProfileRate(*blockProfileRate)
 	}
 
-	slog.Info("starting rendezvous server", "version", version)
+	buildInfo := collectBuildInfo()
+	slog.Info("starting rendezvous server",
+		"version", version,
+		"git_commit", buildInfo["git_commit"],
+		"build_time", buildInfo["build_time"],
+		"binary_sha256", buildInfo["binary_sha256"],
+		"go_version", buildInfo["go_version"])
 
 	// Construct beacon (don't Serve yet — we wire WSS after the
 	// registry exists so the WSS pubkey lookup can read from the
@@ -75,6 +81,7 @@ func main() {
 
 	// Start registry
 	r := registry.NewWithStore(*beaconAddr, *storePath)
+	r.SetBuildInfo(buildInfo)
 	r.SetStaleNodeThreshold(*staleThreshold)
 	r.SetBeaconStats(b)
 	if *adminToken != "" {

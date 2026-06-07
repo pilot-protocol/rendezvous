@@ -84,6 +84,13 @@ type Server struct {
 	lastHeartbeatMs   atomic.Int64 // updated each heartbeat tick, persisted
 	requestCount      atomic.Int64
 
+	// buildInfo carries the build-time identity surfaced on
+	// /api/public-stats for code-verification (version, git commit, ISO
+	// build time, SHA256 of /proc/self/exe, Go runtime version). Set
+	// once via SetBuildInfo before Start(); never mutated afterwards,
+	// so a plain map suffices.
+	buildInfo map[string]string
+
 	// dashboard owns probe state, pulse ring, maintenance banner, and the HTTP mux.
 	// Extracted to pkg/registry/server/dashboard (R5.1).
 	dashboard *dashpkg.Handler
