@@ -10,4 +10,4 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 )
 
-require github.com/pilot-protocol/beacon v0.2.5
+require github.com/pilot-protocol/beacon v0.2.6

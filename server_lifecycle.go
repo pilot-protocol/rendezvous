@@ -167,6 +167,23 @@ func (s *Server) BreakerManager() *breakerspkg.Manager {
 	return s.breakers
 }
 
+// BreakerAllow is a convenience adapter matching the
+// func(name) (allowed, reason) shape that out-of-package call sites
+// (the in-process beacon, the WSS bridge) want when consulting the
+// breakers. Returning the reason here lets sites surface it in any
+// log line or error response without taking a second lookup.
+// Unknown names default to allow (matches Manager.Allow semantic).
+func (s *Server) BreakerAllow(name string) (bool, string) {
+	if s.breakers == nil {
+		return true, ""
+	}
+	allow, _ := s.breakers.Allow(name)
+	if allow {
+		return true, ""
+	}
+	return false, s.breakers.Reason(name)
+}
+
 // SetMaxConnections overrides the default connection limit. Used in tests to prevent port exhaustion.
 func (s *Server) SetMaxConnections(max int64) {
 	s.accept.SetMaxConnections(max)
