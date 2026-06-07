@@ -73,12 +73,33 @@ prepare_snapshot() {
     # new binary loads on bare data and writes a fresh checksum on the
     # first snapshot save. Idempotent: if no checksum field is present
     # (already migrated), sed does nothing.
+    #
+    # MUST run AFTER stop_service. The first deploy attempt ran this
+    # before stop_service while the old binary was still active; the
+    # old binary's shutdown-sync re-persisted the snapshot with a fresh
+    # checksum between sed completing (09:59:42) and the service
+    # actually stopping (09:59:54), undoing the strip. New binary saw
+    # the re-checksummed file, refused it, started fresh with ~60 nodes
+    # (rapidly growing via live re-registrations). Auto-rollback fired
+    # correctly on the >=100000 gate — but the deploy didn't land.
     if [ ! -f "$REGISTRY_JSON" ]; then
         log "No snapshot at $REGISTRY_JSON — skipping prepare_snapshot"
         return 0
     fi
+    # Defensive sanity: refuse to proceed if the service is still active
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        log "ERROR: prepare_snapshot called while $SERVICE_NAME is still active — refusing to race the writer"
+        exit 1
+    fi
     log "Stripping stored snapshot checksum (migration safety)..."
     sudo sed -i 's/,"checksum":"[a-f0-9]*"}/}/' "$REGISTRY_JSON"
+    # Verify the strip actually took effect — if the file still ends
+    # with a checksum field, abort cleanly rather than start the new
+    # binary against an unmigrated snapshot.
+    if sudo tail -c 2048 "$REGISTRY_JSON" | grep -q '"checksum":"[a-f0-9]'; then
+        log "ERROR: snapshot still contains a checksum field after strip — aborting deploy"
+        exit 1
+    fi
     log "Snapshot prepared"
 }
 
@@ -186,8 +207,9 @@ deploy() {
     log "=== Starting deployment ==="
     preflight
     backup
-    prepare_snapshot
     stop_service
+    prepare_snapshot   # must run after stop_service to avoid racing
+                       # the old binary's shutdown-sync re-persist
     swap_binary
     start_service
 
