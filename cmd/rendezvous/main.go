@@ -18,6 +18,7 @@ import (
 	"github.com/pilot-protocol/common/config"
 	"github.com/pilot-protocol/common/logging"
 	registry "github.com/pilot-protocol/rendezvous"
+	"github.com/pilot-protocol/rendezvous/breakers"
 )
 
 var version = "dev"
@@ -157,6 +158,22 @@ func main() {
 			whitelistPath, 2*time.Second, r.SetRateLimitWhitelist, nil,
 		)
 		slog.Info("rate-limit whitelist watcher started", "path", whitelistPath, "interval", "2s")
+	}
+
+	// Breakers watcher. Picks up changes to <store-dir>/breakers.json
+	// every 2 s and atomically reloads named on/off switches into the
+	// Server's BreakerManager. Same operational contract as the
+	// rate-limit whitelist watcher: own goroutine, fail-open, never
+	// blocks. Initially no call sites consult the manager — the
+	// package ships as infrastructure; gates are wired into specific
+	// request paths in follow-up PRs. The Manager is created
+	// unconditionally so test/admin paths can inspect breaker state
+	// even before any breaker is registered.
+	bm := r.BreakerManager()
+	if *storePath != "" && bm != nil {
+		breakersPath := filepath.Join(filepath.Dir(*storePath), "breakers.json")
+		go breakers.Watch(bm, breakersPath, 2*time.Second, nil)
+		slog.Info("breakers watcher started", "path", breakersPath, "interval", "2s")
 	}
 
 	mode := "primary"

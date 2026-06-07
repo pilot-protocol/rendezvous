@@ -10,6 +10,7 @@ import (
 	acceptpkg "github.com/pilot-protocol/rendezvous/accept"
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	authzpkg "github.com/pilot-protocol/rendezvous/authz"
+	breakerspkg "github.com/pilot-protocol/rendezvous/breakers"
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	dirpkg "github.com/pilot-protocol/rendezvous/directory"
 	"github.com/pilot-protocol/rendezvous/events"
@@ -98,6 +99,14 @@ type Server struct {
 	// accept manages the TCP accept loop, TLS config, rate limiting, and
 	// log sampling. Extracted to pkg/registry/server/accept (R3.2).
 	accept *acceptpkg.Acceptor
+
+	// breakers holds named on/off switches for individual functional
+	// surfaces (registry.register, beacon.punch, snapshot.write, etc.).
+	// Operators flip a switch by writing breakers.json next to
+	// registry.json; a watcher in cmd/rendezvous polls + reloads.
+	// Created unconditionally so the manager is queryable even before
+	// any breaker is registered or any call site consults it.
+	breakers *breakerspkg.Manager
 
 	// Beacon coordination
 	beaconAddr string
