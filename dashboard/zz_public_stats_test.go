@@ -25,9 +25,10 @@ func minimalCallbacks() Callbacks {
 		GetNodes:          func() []NodeSnapshot { return nil },
 		RequestCount:      func() int64 { return 0 },
 		StartTime:         func() time.Time { return startTime },
-		NodeCount:         func() int { return 242943 },
-		OnlineCount:       func(time.Time) int { return 219133 },
-		StaleThreshold:    func() time.Duration { return 30 * time.Minute },
+		NodeCount:           func() int { return 242943 },
+		OnlineCount:         func(time.Time) int { return 219133 },
+		TotalEverRegistered: func() int64 { return 391207 },
+		StaleThreshold:      func() time.Duration { return 30 * time.Minute },
 		TriggerSnapshot:   func() error { return nil },
 		UpdateGauges:      func() {},
 		WriteMetrics:      func(io.Writer) {},
@@ -91,11 +92,13 @@ func TestPublicStats_Shape(t *testing.T) {
 	// field without removing it from this whitelist the test fails —
 	// surface review forced before re-leaking data publicly.
 	allowed := map[string]bool{
-		"server_time":    true,
-		"uptime_seconds": true,
-		"active_nodes":   true,
-		"total_nodes":    true,
-		"components":     true,
+		"server_time":      true,
+		"uptime_seconds":   true,
+		"active_nodes":     true,
+		"total_nodes":      true,
+		"total_requests":   true,
+		"requests_per_sec": true,
+		"components":       true,
 	}
 	for k := range payload {
 		if !allowed[k] {
@@ -109,10 +112,13 @@ func TestPublicStats_Shape(t *testing.T) {
 	if _, ok := payload["total_nodes"]; !ok {
 		t.Errorf("missing total_nodes")
 	}
-	// Explicit non-leakage assertions for the things we removed.
+	// Explicit non-leakage assertions for the things we still suppress.
+	// total_requests + requests_per_sec moved BACK on the public surface
+	// (operator decision: aggregate throughput is fine to publish; only
+	// per-IP / history detail stays gated). Keep history + per-IP banned.
 	for _, banned := range []string{
 		"daily", "hourly", "growth", "growth_pct",
-		"total_requests", "request_rate", "pulse",
+		"request_rate", "pulse",
 		"trust_links", "total_trust_links",
 		"networks", "network_count",
 		"per_ip", "audit", "snapshot",
@@ -264,13 +270,26 @@ func publicStatsHandler(mux *http.ServeMux, h *Handler) {
 			}
 			return "up"
 		}
+		var totalNodes int64
+		if h.cb.TotalEverRegistered != nil {
+			totalNodes = h.cb.TotalEverRegistered()
+		} else {
+			totalNodes = int64(h.cb.NodeCount())
+		}
+		var totalRequests int64
+		if h.cb.RequestCount != nil {
+			totalRequests = h.cb.RequestCount()
+		}
+		throughput := h.RecentThroughput(10)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"server_time":    now.Unix(),
-			"uptime_seconds": int64(now.Sub(startTime).Seconds()),
-			"active_nodes":   h.cb.OnlineCount(threshold),
-			"total_nodes":    h.cb.NodeCount(),
+			"server_time":      now.Unix(),
+			"uptime_seconds":   int64(now.Sub(startTime).Seconds()),
+			"active_nodes":     h.cb.OnlineCount(threshold),
+			"total_nodes":      totalNodes,
+			"total_requests":   totalRequests,
+			"requests_per_sec": throughput,
 			"components": map[string]string{
 				"registry":  componentStatus("registry"),
 				"beacon":    componentStatus("beacon"),

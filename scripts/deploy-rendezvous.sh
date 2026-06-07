@@ -150,13 +150,15 @@ health_check() {
             continue
         fi
 
-        # 3. data-loaded probe: /api/stats.total_nodes >= MIN_NODES.
-        # The old gate also tested total_trust_links, but that field is
-        # `json:"-"` on the DashboardStats struct and never reaches the
-        # wire — the old jq // 0 fallback made the gate fail every
-        # deploy. Drop it; total_nodes alone is sufficient evidence the
-        # snapshot loaded.
-        NODES=$(curl -s -m 5 "$HEALTH_STATS_URL" | jq -r '.total_nodes // 0' 2>/dev/null || echo "0")
+        # 3. data-loaded probe: /api/public-stats.active_nodes >= MIN_NODES.
+        # Use active_nodes (currently-online), NOT total_nodes — as of
+        # the 2026-06-07 r2 payload, total_nodes is restored from the
+        # snapshot's next_node counter (cumulative ever-registered) and
+        # would pass this gate even on an empty load (the original
+        # rollback-cascade failure mode). active_nodes is computed from
+        # in-memory nodes whose last_seen > stale_threshold; only a real
+        # snapshot load makes it climb quickly post-start.
+        NODES=$(curl -s -m 5 "$HEALTH_STATS_URL" | jq -r '.active_nodes // 0' 2>/dev/null || echo "0")
         if [ "$NODES" -ge "$MIN_NODES" ]; then
             log "Health check PASSED — nodes=$NODES (${ELAPSED}s)"
             return 0
