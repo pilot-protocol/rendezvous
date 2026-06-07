@@ -9,20 +9,18 @@ default-allow: a missing breaker entry means "closed" (normal operation).
 Edit `<store-dir>/breakers.json` (sibling to `registry.json`). A file
 watcher polls every 2 s; changes take effect within that window.
 
+**File format — flat map of breaker name → entry:**
+
 ```json
 {
-  "breakers": [
-    {
-      "name": "registry.register",
-      "state": "open",
-      "reason": "incident #2061 — pause registrations while we rotate the audit log"
-    },
-    {
-      "name": "beacon.relay",
-      "state": "half_open",
-      "reason": "load shed test — log only, do not deny"
-    }
-  ]
+  "registry.register": {
+    "state": "open",
+    "reason": "incident #2061 — pause registrations while we rotate the audit log"
+  },
+  "beacon.relay": {
+    "state": "half_open",
+    "reason": "load shed test — log only, do not deny"
+  }
 }
 ```
 
@@ -34,7 +32,26 @@ Three states:
 | `half_open` | allow + log warning at debug level             |
 | `open`      | deny; caller receives error with the reason    |
 
-To re-enable: change `"state"` back to `"closed"` (or delete the entry).
+To re-enable: change `"state"` back to `"closed"`, delete the entry,
+or delete the file entirely (reverts to empty map = full default-allow).
+
+### Verifying a flip took effect
+
+The wire-level error returned to the caller is sanitised to a generic
+`"request failed"` by the accept layer (avoids leaking internal state
+to arbitrary callers). To see the breaker name + reason as the gate
+fires, watch the registry logs:
+
+```bash
+sudo journalctl -u pilot-rendezvous -f | grep -i breaker
+```
+
+A successful flip looks like:
+
+```
+INFO  msg="breakers reloaded" path=/var/lib/pilot/breakers.json count=1
+WARN  msg="registry handle error" remote=… type=heartbeat err="service unavailable: breaker \"registry.heartbeat\" is open (live-flip test)"
+```
 
 ## Available breakers
 
