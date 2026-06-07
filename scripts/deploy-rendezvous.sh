@@ -14,7 +14,12 @@ SERVICE_NAME="pilot-rendezvous"
 REGISTRY_JSON="/var/lib/pilot/registry.json"
 BACKUP_DIR="/var/lib/pilot/backups"
 HEALTH_LIVENESS_URL="http://127.0.0.1:3000/healthz"
-HEALTH_STATS_URL="http://127.0.0.1:3000/api/stats"
+# /api/public-stats (anonymous, curated payload) added by PR #50 as
+# part of the polo public-stats lockdown. Use it for the data-loaded
+# gate — /api/stats is now admin-gated and the deploy script has no
+# admin token to present. /api/public-stats carries total_nodes
+# unchanged, which is the only field the gate reads.
+HEALTH_STATS_URL="http://127.0.0.1:3000/api/public-stats"
 HEALTH_TIMEOUT=30
 HEALTH_INTERVAL=2
 # Production registry holds ~242k nodes (2026-06-07). A successful
