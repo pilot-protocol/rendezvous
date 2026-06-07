@@ -13,9 +13,14 @@ STAGED="$HOME/$BINARY_NAME-staged"
 SERVICE_NAME="pilot-rendezvous"
 REGISTRY_JSON="/var/lib/pilot/registry.json"
 BACKUP_DIR="/var/lib/pilot/backups"
-HEALTH_URL="http://127.0.0.1:3000/api/stats"
+HEALTH_LIVENESS_URL="http://127.0.0.1:3000/healthz"
+HEALTH_STATS_URL="http://127.0.0.1:3000/api/stats"
 HEALTH_TIMEOUT=30
 HEALTH_INTERVAL=2
+# Production registry holds ~242k nodes (2026-06-07). A successful
+# load should reach the bulk of that quickly. Tuned conservatively so
+# a partial-load freshly-started binary doesn't sneak past the gate.
+MIN_NODES=100000
 
 log() { echo "[deploy] $(date '+%H:%M:%S') $*"; }
 
@@ -55,6 +60,28 @@ backup() {
     fi
 }
 
+prepare_snapshot() {
+    # PILOT-78 (#6): HEAD's snapshot loader returns an error on stored
+    # checksum mismatch instead of silently zeroing the directory.
+    # Schema drift between the binary that wrote registry.json and the
+    # binary about to load it produces a re-marshal mismatch, so the
+    # new binary would refuse the file and start fresh with zero nodes
+    # — then overwrite the on-disk snapshot with that empty state
+    # before the deploy script could rollback.
+    #
+    # Strip the trailing `,"checksum":"<hex>"` from the snapshot so the
+    # new binary loads on bare data and writes a fresh checksum on the
+    # first snapshot save. Idempotent: if no checksum field is present
+    # (already migrated), sed does nothing.
+    if [ ! -f "$REGISTRY_JSON" ]; then
+        log "No snapshot at $REGISTRY_JSON — skipping prepare_snapshot"
+        return 0
+    fi
+    log "Stripping stored snapshot checksum (migration safety)..."
+    sudo sed -i 's/,"checksum":"[a-f0-9]*"}/}/' "$REGISTRY_JSON"
+    log "Snapshot prepared"
+}
+
 stop_service() {
     log "Stopping $SERVICE_NAME..."
     sudo systemctl stop "$SERVICE_NAME"
@@ -79,39 +106,39 @@ start_service() {
 
 health_check() {
     log "Running health checks (${HEALTH_TIMEOUT}s timeout, every ${HEALTH_INTERVAL}s)..."
-    HEALTH_FILE=$(mktemp -t pilot-health.XXXXXX)
     ELAPSED=0
     while [ "$ELAPSED" -lt "$HEALTH_TIMEOUT" ]; do
         sleep "$HEALTH_INTERVAL"
         ELAPSED=$((ELAPSED + HEALTH_INTERVAL))
 
-        # Check systemd unit is active
+        # 1. systemd unit active
         if ! systemctl is-active --quiet "$SERVICE_NAME"; then
             log "Health: service not active (${ELAPSED}s)"
             continue
         fi
 
-        # Check HTTP endpoint
-        HTTP_CODE=$(curl -s -o "$HEALTH_FILE" -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
-        if [ "$HTTP_CODE" != "200" ]; then
-            log "Health: HTTP $HTTP_CODE (${ELAPSED}s)"
+        # 2. liveness probe: /healthz returns {"status":"ok",...}
+        STATUS=$(curl -s -m 5 "$HEALTH_LIVENESS_URL" | jq -r '.status // "down"' 2>/dev/null || echo "down")
+        if [ "$STATUS" != "ok" ]; then
+            log "Health: /healthz status=$STATUS (${ELAPSED}s)"
             continue
         fi
 
-        # Check node and trust counts
-        NODES=$(jq -r '.total_nodes // 0' "$HEALTH_FILE" 2>/dev/null || echo "0")
-        TRUSTS=$(jq -r '.total_trust_links // 0' "$HEALTH_FILE" 2>/dev/null || echo "0")
-
-        if [ "$NODES" -ge 10000 ] && [ "$TRUSTS" -ge 10000 ]; then
-            log "Health check PASSED — nodes=$NODES trusts=$TRUSTS (${ELAPSED}s)"
-            rm -f "$HEALTH_FILE"
+        # 3. data-loaded probe: /api/stats.total_nodes >= MIN_NODES.
+        # The old gate also tested total_trust_links, but that field is
+        # `json:"-"` on the DashboardStats struct and never reaches the
+        # wire — the old jq // 0 fallback made the gate fail every
+        # deploy. Drop it; total_nodes alone is sufficient evidence the
+        # snapshot loaded.
+        NODES=$(curl -s -m 5 "$HEALTH_STATS_URL" | jq -r '.total_nodes // 0' 2>/dev/null || echo "0")
+        if [ "$NODES" -ge "$MIN_NODES" ]; then
+            log "Health check PASSED — nodes=$NODES (${ELAPSED}s)"
             return 0
         fi
-        log "Health: nodes=$NODES trusts=$TRUSTS — waiting (${ELAPSED}s)"
+        log "Health: nodes=$NODES (need >=$MIN_NODES) — waiting (${ELAPSED}s)"
     done
 
     log "Health check FAILED after ${HEALTH_TIMEOUT}s"
-    rm -f "$HEALTH_FILE"
     return 1
 }
 
@@ -125,6 +152,24 @@ rollback() {
     sudo systemctl stop "$SERVICE_NAME" || true
     sleep 1
     sudo cp "$PREV" "$CURRENT"
+
+    # Restore the most recent pre-deploy snapshot. The new binary may
+    # have started fresh on a checksum mismatch (mitigated by
+    # prepare_snapshot but kept as defense-in-depth) and overwritten
+    # the on-disk snapshot with empty state before the health check
+    # failed. Loading the old binary against an empty snapshot would
+    # serve correctly-formed responses for nothing — strictly worse
+    # than serving nothing at all. Backup() runs immediately before
+    # the swap, so the freshest backup is exactly the pre-deploy
+    # state.
+    LATEST_BACKUP=$(ls -1t "$BACKUP_DIR"/registry-*.json 2>/dev/null | head -1 || true)
+    if [ -n "$LATEST_BACKUP" ]; then
+        sudo cp "$LATEST_BACKUP" "$REGISTRY_JSON"
+        log "Restored snapshot from $(basename "$LATEST_BACKUP")"
+    else
+        log "WARNING: no pre-deploy snapshot backup found — keeping current $REGISTRY_JSON"
+    fi
+
     sudo systemctl start "$SERVICE_NAME"
     sleep 3
 
@@ -141,6 +186,7 @@ deploy() {
     log "=== Starting deployment ==="
     preflight
     backup
+    prepare_snapshot
     stop_service
     swap_binary
     start_service
