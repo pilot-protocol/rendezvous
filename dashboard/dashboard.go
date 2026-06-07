@@ -69,10 +69,18 @@ type Callbacks struct {
 	RequestCount func() int64
 	// StartTime returns when the server started.
 	StartTime func() time.Time
-	// NodeCount returns the number of registered nodes.
+	// NodeCount returns the number of registered nodes currently in the
+	// in-memory map. Decays toward OnlineCount as the reaper deletes
+	// stale entries (see server_lifecycle.reapStaleNodes).
 	NodeCount func() int
 	// OnlineCount returns the number of nodes online at or after threshold.
 	OnlineCount func(threshold time.Time) int
+	// TotalEverRegistered returns the cumulative count of node IDs ever
+	// allocated by this registry (monotonic across reaps, persisted
+	// across restarts via the snapshot's next_node counter). Surfaced on
+	// /api/public-stats as total_nodes so it stays distinct from
+	// active_nodes (which post-reap is identical to NodeCount).
+	TotalEverRegistered func() int64
 	// StaleThreshold returns the configured stale-node threshold.
 	StaleThreshold func() time.Duration
 	// TriggerSnapshot triggers a snapshot save.
@@ -370,6 +378,33 @@ func (h *Handler) ProbeLoop() {
 // Pulse ring
 // --------------------------------------------------------------------------
 
+// RecentThroughput returns smoothed requests-per-second over the last
+// `window` pulse samples (1 sample/sec). Returns 0 when there aren't yet
+// two samples to differentiate or the span is zero.
+func (h *Handler) RecentThroughput(window int) float64 {
+	if window < 2 {
+		window = 2
+	}
+	samples := h.GetPulseSamples()
+	if len(samples) < 2 {
+		return 0
+	}
+	if len(samples) < window {
+		window = len(samples)
+	}
+	first := samples[len(samples)-window]
+	last := samples[len(samples)-1]
+	dtMs := last.Ts - first.Ts
+	if dtMs <= 0 {
+		return 0
+	}
+	dr := last.Total - first.Total
+	if dr < 0 {
+		return 0
+	}
+	return float64(dr) * 1000.0 / float64(dtMs)
+}
+
 // GetPulseSamples returns the ordered pulse samples from the ring buffer.
 func (h *Handler) GetPulseSamples() []PulseSample {
 	h.pulseMu.Lock()
@@ -591,13 +626,36 @@ func (h *Handler) Serve(addr string) error {
 			return "up"
 		}
 
+		// total_nodes deliberately uses the cumulative ever-registered
+		// counter (TotalEverRegistered, == next_node-1), not NodeCount.
+		// The reaper deletes stale entries from the in-memory map, so
+		// NodeCount converges to OnlineCount within the stale-threshold
+		// window — exposing both would mean reporting the same number
+		// under two names.
+		var totalNodes int64
+		if h.cb.TotalEverRegistered != nil {
+			totalNodes = h.cb.TotalEverRegistered()
+		} else {
+			totalNodes = int64(h.cb.NodeCount())
+		}
+		var totalRequests int64
+		if h.cb.RequestCount != nil {
+			totalRequests = h.cb.RequestCount()
+		}
+		// 10-sample (~10s) smoothed throughput. Two-sample noise is too
+		// jumpy for a public dashboard; one minute is too slow to feel
+		// "live."
+		throughput := h.RecentThroughput(10)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"server_time":    now.Unix(),
-			"uptime_seconds": int64(now.Sub(startTime).Seconds()),
-			"active_nodes":   h.cb.OnlineCount(threshold),
-			"total_nodes":    h.cb.NodeCount(),
+			"server_time":      now.Unix(),
+			"uptime_seconds":   int64(now.Sub(startTime).Seconds()),
+			"active_nodes":     h.cb.OnlineCount(threshold),
+			"total_nodes":      totalNodes,
+			"total_requests":   totalRequests,
+			"requests_per_sec": throughput,
 			"components": map[string]string{
 				"registry":  componentStatus("registry"),
 				"beacon":    componentStatus("beacon"),
@@ -1375,18 +1433,28 @@ function renderPulse(){
   document.getElementById('pulse-peak').textContent=fmt(Math.round(_pulsePeak));
 }
 function pulseTick(){
-  // /api/pulse is now admin-gated. Without a dashboard token an
-  // anonymous request returns 401; skip the fetch entirely so we don't
-  // spam the server's WARN log. Operators with a dashboard token can
-  // still view the pulse strip via the existing token query param.
-  // (Falls through to /api/stats?token=X for now — there is no
-  // /api/pulse?token=X variant, so we just hide the strip in the
-  // public view.)
+  // Two paths:
+  //   - Operators (with a dashboard token): hit /api/pulse for the full
+  //     2-min server-side ring buffer.
+  //   - Anonymous viewers: /api/pulse is admin-gated, but /api/public-stats
+  //     exposes total_requests + requests_per_sec. Push one sample per
+  //     tick so renderPulse() can compute its own diff rate; this gives
+  //     a live but lower-resolution strip without leaking history.
   var t=getToken();
   if(!t){
-    // public view: hide the pulse strip rather than leave it empty
-    var strip=document.getElementById('pulse-strip');
-    if(strip&&!strip.dataset.hidden){strip.style.display='none';strip.dataset.hidden='1';}
+    fetch('/api/public-stats').then(function(r){
+      if(!r.ok)return null;
+      return r.json();
+    }).then(function(d){
+      if(!d||d.total_requests==null)return;
+      _pulseSamples.push({ts:Date.now(),total:d.total_requests});
+      if(d.requests_per_sec!=null){
+        document.getElementById('pulse-now').textContent=fmt(Math.round(d.requests_per_sec));
+        if(d.requests_per_sec>_pulsePeak)_pulsePeak=d.requests_per_sec;
+        document.getElementById('pulse-peak').textContent=fmt(Math.round(_pulsePeak));
+      }
+      renderPulse();
+    }).catch(function(){});
     return;
   }
   fetch('/api/pulse?admin_token='+encodeURIComponent(t)).then(function(r){

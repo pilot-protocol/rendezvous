@@ -741,6 +741,14 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		StartTime:       func() time.Time { return s.startTime },
 		NodeCount:       func() int { s.mu.RLock(); n := len(s.nodes); s.mu.RUnlock(); return n },
 		OnlineCount:     s.onlineCount,
+		TotalEverRegistered: func() int64 {
+			s.mu.RLock()
+			defer s.mu.RUnlock()
+			if s.nextNode == 0 {
+				return 0
+			}
+			return int64(s.nextNode - 1)
+		},
 		StaleThreshold:  s.StaleNodeThreshold,
 		TriggerSnapshot: s.TriggerSnapshot,
 		UpdateGauges:    func() { s.updateGauges(s.metrics) },
