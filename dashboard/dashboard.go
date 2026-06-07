@@ -131,6 +131,11 @@ type Callbacks struct {
 	// preserved so post-incident review still shows traffic that
 	// flowed through the gate. Persists the change to breakers.json.
 	BreakerDelete func(name string) error
+	// HealthSnapshot returns a flat map of operator-facing health
+	// signals: snapshot save telemetry, WAL size, snapshot.write
+	// breaker state, replica subscriber count. Backs /api/health.
+	// Optional — when nil, /api/health 503s.
+	HealthSnapshot func() map[string]any
 	// AuditRecent returns the most recent N audit-log entries from the
 	// in-memory ring buffer (caller-supplied bound, server-clamped to a
 	// safe maximum). Optional — when nil, /api/admin/audit/recent
@@ -1069,6 +1074,35 @@ func (h *Handler) Serve(addr string) error {
 	mux.HandleFunc("/api/runtime", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(collectRuntimeMetrics())
+	}))
+
+	// /api/health (admin) — single curl-able operator health snapshot.
+	// Aggregates the persistence + WAL + replication signals that today
+	// require scraping the rich /api/stats or reading journald. Output
+	// is a flat map so future fields can be added without versioning
+	// the response shape.
+	//
+	// Fields surfaced (typical values, all optional — present only when
+	// the Server has the corresponding subsystem):
+	//
+	//   snapshots_total              monotonic count of successful saves
+	//   snapshots_failed             monotonic count of failed saves
+	//   last_snapshot_at             unix-ms of last successful save
+	//   last_snapshot_duration_ms    duration of last successful save
+	//   last_snapshot_size_bytes     bytes written by last save
+	//   last_snapshot_rlock_ms       s.mu.RLock hold time in phase 1
+	//   max_snapshot_duration_ms     worst-ever save (process lifetime)
+	//   wal_size_bytes               current WAL size (0 if not in use)
+	//   wal_size_cap_bytes           configured WAL cap
+	//   snapshot_write_breaker       "closed" | "half_open" | "open"
+	//   replication_subscribers      live standby count
+	mux.HandleFunc("/api/health", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if h.cb.HealthSnapshot == nil {
+			http.Error(w, "health snapshot not wired", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(h.cb.HealthSnapshot())
 	}))
 
 	// /api/pulse — live request-count ring. Moved behind admin auth as
