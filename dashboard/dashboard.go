@@ -113,6 +113,20 @@ type Callbacks struct {
 	// implicitly allowed (default-Closed semantics, same as a missing
 	// breakers.json).
 	BreakerAllow func(name string) (allowed bool, reason string)
+	// BreakerList returns the live snapshot for /api/breakers — one
+	// entry per known name with state, reason, counters, last-denied
+	// timestamp. Required for the read endpoint; nil disables it.
+	BreakerList func() []BreakerListEntry
+	// BreakerSet upserts one breaker by name, returning an error when
+	// the state value is malformed. Reason is operator free-text. Used
+	// by PUT /api/breakers/<name>. Writes to breakers.json on disk so
+	// the change survives restart; the file watcher's next poll is a
+	// no-op due to the matching mtime.
+	BreakerSet func(name, state, reason string) error
+	// BreakerDelete removes one breaker by name. Counters are
+	// preserved so post-incident review still shows traffic that
+	// flowed through the gate. Persists the change to breakers.json.
+	BreakerDelete func(name string) error
 }
 
 // NodeSnapshot is a minimal node record for the /api/nodes endpoint.
@@ -120,6 +134,20 @@ type NodeSnapshot struct {
 	ID       uint32
 	Hostname string
 	LastSeen time.Time
+}
+
+// BreakerListEntry is one row in the /api/breakers response. Marshalled
+// as-is to JSON, so field tags pin the public wire format. Counters are
+// monotonic since process start; LastDeniedAt is nil when DeniedTotal
+// is 0.
+type BreakerListEntry struct {
+	Name         string     `json:"name"`
+	State        string     `json:"state"`
+	Reason       string     `json:"reason,omitempty"`
+	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
+	AllowedTotal int64      `json:"allowed_total"`
+	DeniedTotal  int64      `json:"denied_total"`
+	LastDeniedAt *time.Time `json:"last_denied_at,omitempty"`
 }
 
 // --------------------------------------------------------------------------
@@ -757,6 +785,126 @@ func (h *Handler) Serve(addr string) error {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+
+	// /api/breakers (admin) — list + control circuit breakers live.
+	//
+	// GET /api/breakers
+	//   -> 200 {"breakers": [BreakerListEntry, ...]}
+	//   Each entry has state/reason/updated_at + allowed_total /
+	//   denied_total / last_denied_at since process start.
+	//
+	// PUT /api/breakers/<name>
+	//   body: {"state": "closed|half_open|open", "reason": "..."}
+	//   -> 200 {"ok": true, "breaker": BreakerListEntry}
+	//   Persists to breakers.json so the change survives restart; the
+	//   file watcher's next poll is a no-op via matching mtime.
+	//
+	// DELETE /api/breakers/<name>
+	//   -> 200 {"ok": true}
+	//   Removes the override; the gate reverts to default-closed
+	//   (allow). Counters are preserved.
+	//
+	// Auth: requireAdminToken — same surface as /api/banner. PUT/DELETE
+	// require X-Admin-Token header (no query-param fallback) so a leaked
+	// referer can't flip a switch.
+	mux.HandleFunc("/api/breakers", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.BreakerList == nil {
+			http.Error(w, "breaker manager not wired", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"breakers": h.cb.BreakerList(),
+		})
+	}))
+	mux.HandleFunc("/api/breakers/", func(w http.ResponseWriter, r *http.Request) {
+		// requireAdminToken's behaviour: GET accepts header OR
+		// admin_token query param; PUT/DELETE force header to dodge
+		// CSRF + referer leaks. Replicate that policy here directly
+		// rather than over-wrap so the rule lives next to the code.
+		token := r.Header.Get("X-Admin-Token")
+		if token == "" && r.Method == http.MethodGet {
+			token = r.URL.Query().Get("admin_token")
+		}
+		adminToken := h.cb.GetAdminToken()
+		if adminToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/api/breakers/")
+		if name == "" || strings.Contains(name, "/") {
+			http.Error(w, "missing or invalid breaker name", http.StatusBadRequest)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPost:
+			if h.cb.BreakerSet == nil {
+				http.Error(w, "breaker manager not wired", http.StatusServiceUnavailable)
+				return
+			}
+			body, err := readSmallBody(r, 8192)
+			if err != nil {
+				http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			var payload struct {
+				State  string `json:"state"`
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal([]byte(body), &payload); err != nil {
+				http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := h.cb.BreakerSet(name, payload.State, payload.Reason); err != nil {
+				http.Error(w, "breaker set: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":   true,
+				"name": name,
+			})
+		case http.MethodDelete:
+			if h.cb.BreakerDelete == nil {
+				http.Error(w, "breaker manager not wired", http.StatusServiceUnavailable)
+				return
+			}
+			if err := h.cb.BreakerDelete(name); err != nil {
+				http.Error(w, "breaker delete: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":   true,
+				"name": name,
+			})
+		default:
+			w.Header().Set("Allow", "PUT, POST, DELETE")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// /api/runtime (admin) — process-level health + lock contention.
+	// Reads Go's runtime/metrics package which is zero-overhead (sampled
+	// by the runtime itself, no instrumentation needed). Surfaces the
+	// signals operators actually care about:
+	//   - goroutines: current count + GOMAXPROCS
+	//   - memory:     heap_alloc, heap_objects, gc_cycles_total
+	//   - locks:      mutex_wait_total (cumulative blocked time), sched
+	//                 latency p50/p99 (goroutine scheduling delay; a
+	//                 climbing p99 means the runtime is congested even
+	//                 when CPU looks idle)
+	//   - gc_pause:   p50/p99/max of stop-the-world pauses (last cycle)
+	//   - fd_count:   from /proc/self/fd (Linux only; omitted elsewhere)
+	mux.HandleFunc("/api/runtime", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(collectRuntimeMetrics())
+	}))
 
 	// /api/pulse — live request-count ring. Moved behind admin auth as
 	// part of the polo public-stats lockdown; polo's public website

@@ -114,6 +114,11 @@ type Server struct {
 	// Created unconditionally so the manager is queryable even before
 	// any breaker is registered or any call site consults it.
 	breakers *breakerspkg.Manager
+	// breakersPath is the on-disk JSON file the watcher reads. Set by
+	// cmd/rendezvous after computing it from -store. Empty means the
+	// admin control API can still flip in-memory state but the change
+	// is lost on restart. Read under s.mu.
+	breakersPath string
 
 	// Beacon coordination
 	beaconAddr string

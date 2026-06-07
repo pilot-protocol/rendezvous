@@ -3,10 +3,12 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -182,6 +184,126 @@ func (s *Server) BreakerAllow(name string) (bool, string) {
 		return true, ""
 	}
 	return false, s.breakers.Reason(name)
+}
+
+// SetBreakersPath registers the on-disk breakers.json path so the
+// admin control API can persist its changes there. Setting it after
+// the file watcher has started is safe: the watcher polls by mtime so
+// the next tick picks up our atomic write as a no-op (we apply the
+// same map in-process before writing).
+func (s *Server) SetBreakersPath(path string) {
+	s.mu.Lock()
+	s.breakersPath = path
+	s.mu.Unlock()
+}
+
+// BreakerList returns the live per-name snapshot for /api/breakers
+// (state + reason + counters + last-denied timestamp). Adapter to the
+// shape dashboard.Callbacks expects. Never panics; an empty manager
+// returns an empty slice.
+func (s *Server) BreakerList() []dashpkg.BreakerListEntry {
+	if s.breakers == nil {
+		return nil
+	}
+	rows := s.breakers.StatsSnapshot()
+	out := make([]dashpkg.BreakerListEntry, len(rows))
+	for i, r := range rows {
+		out[i] = dashpkg.BreakerListEntry{
+			Name:         r.Name,
+			State:        r.State,
+			Reason:       r.Reason,
+			UpdatedAt:    r.UpdatedAt,
+			AllowedTotal: r.AllowedTotal,
+			DeniedTotal:  r.DeniedTotal,
+			LastDeniedAt: r.LastDeniedAt,
+		}
+	}
+	return out
+}
+
+// BreakerSet upserts one breaker by name + state + operator reason.
+// Returns an error when state is unrecognised so the API caller gets
+// a clean 400 rather than silently treating a typo as Closed. Applies
+// the change in-memory immediately, then persists the full breaker
+// map to breakersPath (if set) so the change survives restart.
+// Emits an audit-log entry for the change.
+func (s *Server) BreakerSet(name, state, reason string) error {
+	if s.breakers == nil {
+		return fmt.Errorf("breakers manager not configured")
+	}
+	st, err := breakerspkg.ParseState(state)
+	if err != nil {
+		return err
+	}
+	prev := "closed"
+	if cur := s.breakers.StatsSnapshot(); cur != nil {
+		for _, c := range cur {
+			if c.Name == name {
+				prev = c.State
+				break
+			}
+		}
+	}
+	s.breakers.Set(name, st, reason)
+	if err := s.persistBreakers(); err != nil {
+		slog.Warn("breaker change applied in memory but failed to persist", "name", name, "err", err)
+	}
+	s.audit("breaker.set",
+		"name", name,
+		"from", prev,
+		"to", st.String(),
+		"reason", reason)
+	slog.Info("breaker state changed",
+		"name", name, "from", prev, "to", st.String(), "reason", reason)
+	return nil
+}
+
+// BreakerDelete removes one breaker. Counters are preserved so
+// post-incident review still shows what flowed through the gate.
+// Emits an audit-log entry. Persists the new (smaller) map to disk.
+func (s *Server) BreakerDelete(name string) error {
+	if s.breakers == nil {
+		return fmt.Errorf("breakers manager not configured")
+	}
+	s.breakers.Delete(name)
+	if err := s.persistBreakers(); err != nil {
+		slog.Warn("breaker delete applied in memory but failed to persist", "name", name, "err", err)
+	}
+	s.audit("breaker.delete", "name", name)
+	slog.Info("breaker removed", "name", name)
+	return nil
+}
+
+// persistBreakers atomically writes the current breaker map to
+// s.breakersPath in the shape the file watcher expects (flat map of
+// name -> {state, reason}). Returns nil when no path is configured —
+// the in-memory change still took effect; only durability is
+// affected. Format matches breakers/watcher.go's fileEntry struct.
+func (s *Server) persistBreakers() error {
+	s.mu.RLock()
+	path := s.breakersPath
+	s.mu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	rows := s.breakers.Snapshot()
+	out := make(map[string]map[string]string, len(rows))
+	for _, b := range rows {
+		entry := map[string]string{"state": b.StateString}
+		if b.Reason != "" {
+			entry["reason"] = b.Reason
+		}
+		out[b.Name] = entry
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // SetMaxConnections overrides the default connection limit. Used in tests to prevent port exhaustion.
@@ -820,6 +942,9 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			allow, _ := s.breakers.Allow(name)
 			return allow, s.breakers.Reason(name)
 		},
+		BreakerList:   s.BreakerList,
+		BreakerSet:    s.BreakerSet,
+		BreakerDelete: s.BreakerDelete,
 	})
 
 	s.releasePoller = newReleasePoller("TeoSlayer/pilotprotocol")
