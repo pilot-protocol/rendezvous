@@ -755,6 +755,13 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		ReadyCh:    func() <-chan struct{} { return s.readyCh },
 		Done:       func() <-chan struct{} { return s.done },
 		Save:       s.save,
+		BreakerAllow: func(name string) (bool, string) {
+			if s.breakers == nil {
+				return true, ""
+			}
+			allow, _ := s.breakers.Allow(name)
+			return allow, s.breakers.Reason(name)
+		},
 	})
 
 	s.releasePoller = newReleasePoller("TeoSlayer/pilotprotocol")
