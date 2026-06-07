@@ -411,10 +411,29 @@ func TestServe_BindsAndHandlesEndpoints(t *testing.T) {
 		}
 	}
 	check("/", 2)
-	check("/api/stats", 2)
 	check("/api/nodes", 2)
-	check("/api/pulse", 2)
 	check("/healthz", 2)
+	// Public, curated stats — no auth required (polo's public website
+	// consumes this).
+	check("/api/public-stats", 2)
+	// Locked-down endpoints — anonymous requests now get 401.
+	check("/api/stats", 4)
+	check("/api/pulse", 4)
+	// ... and pass with the admin token.
+	checkWithAdmin := func(path string, wantPrefix int) {
+		t.Helper()
+		resp, err := client.Get("http://" + addr + path + "?admin_token=admin")
+		if err != nil {
+			t.Errorf("GET %s (admin): %v", path, err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode/100 != wantPrefix {
+			t.Errorf("GET %s (admin): status %d (want %dxx)", path, resp.StatusCode, wantPrefix)
+		}
+	}
+	checkWithAdmin("/api/stats", 2)
+	checkWithAdmin("/api/pulse", 2)
 
 	// banner: unauthorized without token, ok with token.
 	check("/api/banner", 4)

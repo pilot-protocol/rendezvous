@@ -92,6 +92,13 @@ type Callbacks struct {
 	Done func() <-chan struct{}
 	// Save triggers a debounced snapshot after probe state changes.
 	Save func()
+	// BreakerAllow consults the Server's breaker manager for the named
+	// switch. Returns (allow, reason). Allowed=true means the gated path
+	// should proceed; allowed=false means it should return 503 to the
+	// caller with reason surfaced. Optional — when nil, every name is
+	// implicitly allowed (default-Closed semantics, same as a missing
+	// breakers.json).
+	BreakerAllow func(name string) (allowed bool, reason string)
 }
 
 // NodeSnapshot is a minimal node record for the /api/nodes endpoint.
@@ -490,6 +497,36 @@ func (l *ipRateLimiter) middleware(maxReqs int, window time.Duration, next http.
 }
 
 // localhostOnly rejects requests not originating from loopback.
+// requireAdminToken wraps next so it returns 401 Unauthorized to anyone
+// that doesn't present the operator-configured admin token. The token
+// may be supplied via X-Admin-Token header (preferred for write paths)
+// or admin_token=... query parameter (read-only convenience). When no
+// admin token is configured on the server the wrapped path is locked
+// shut entirely — operators must set -admin-token to enable access.
+//
+// Used to lock down the previously-public stats / pulse / badge /
+// snapshot endpoints so polo.pilotprotocol.network can expose only the
+// curated /api/public-stats payload to anonymous visitors while
+// operators retain access to the full picture via the dashboard token.
+func (h *Handler) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("X-Admin-Token")
+		if token == "" {
+			token = r.URL.Query().Get("admin_token")
+		}
+		adminToken := h.cb.GetAdminToken()
+		if adminToken == "" {
+			http.Error(w, "admin token not configured", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -518,7 +555,63 @@ func (h *Handler) Serve(addr string) error {
 		_, _ = w.Write([]byte(dashboardHTML))
 	})
 
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+	// /api/public-stats — anonymous, deliberately minimal payload for the
+	// public website (polo.pilotprotocol.network). Curated to leak nothing
+	// beyond aggregate node counts + uptime + per-component health. No
+	// history, no per-IP, no badge counters, no traffic rate, no trust
+	// links. Operator can hide the endpoint entirely by flipping the
+	// `dashboard.public_stats` breaker open — useful during incidents
+	// when even the headline numbers shouldn't go out publicly.
+	mux.HandleFunc("/api/public-stats", func(w http.ResponseWriter, r *http.Request) {
+		if h.cb.BreakerAllow != nil {
+			if ok, reason := h.cb.BreakerAllow("dashboard.public_stats"); !ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				body := map[string]string{"status": "unavailable"}
+				if reason != "" {
+					body["reason"] = reason
+				}
+				_ = json.NewEncoder(w).Encode(body)
+				return
+			}
+		}
+		now := time.Now()
+		startTime := h.cb.StartTime()
+		threshold := now.Add(-h.cb.StaleThreshold())
+
+		probes := h.GetProbeStates()
+		componentStatus := func(name string) string {
+			p := probes[name]
+			if p == nil {
+				return "unknown"
+			}
+			if p.CurrentDownStart != 0 {
+				return "down"
+			}
+			return "up"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"server_time":    now.Unix(),
+			"uptime_seconds": int64(now.Sub(startTime).Seconds()),
+			"active_nodes":   h.cb.OnlineCount(threshold),
+			"total_nodes":    h.cb.NodeCount(),
+			"components": map[string]string{
+				"registry":  componentStatus("registry"),
+				"beacon":    componentStatus("beacon"),
+				"dashboard": componentStatus("dashboard"),
+			},
+		})
+	})
+
+	// /api/stats — full rich payload (history, per-IP, etc.). Moved
+	// behind admin auth so polo's public view only consumes
+	// /api/public-stats. The dashboard-token branch is preserved so
+	// authenticated operator views (network-tagged stats etc.) still
+	// work via that token alongside the admin gate.
+	mux.HandleFunc("/api/stats", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		authenticated := false
@@ -529,7 +622,7 @@ func (h *Handler) Serve(addr string) error {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(h.buildStatsResponse(authenticated))
-	})
+	}))
 
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -595,14 +688,18 @@ func (h *Handler) Serve(addr string) error {
 		}
 	})
 
-	mux.HandleFunc("/api/pulse", func(w http.ResponseWriter, r *http.Request) {
+	// /api/pulse — live request-count ring. Moved behind admin auth as
+	// part of the polo public-stats lockdown; polo's public website
+	// renders only /api/public-stats, which does not expose request
+	// rate or any other operationally-revealing telemetry.
+	mux.HandleFunc("/api/pulse", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"ts":             time.Now().UnixMilli(),
 			"total_requests": h.cb.RequestCount(),
 			"samples":        h.GetPulseSamples(),
 		})
-	})
+	}))
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		nodeCount := h.cb.NodeCount()
@@ -679,7 +776,12 @@ func (h *Handler) Serve(addr string) error {
 		}
 	}
 
-	mux.HandleFunc("/api/badge/nodes", h.badgeLimiter.middleware(30, time.Minute, func(w http.ResponseWriter, r *http.Request) {
+	// Badge endpoints — moved behind admin auth as part of the polo
+	// public-stats lockdown. Anyone embedding a badge in external docs
+	// must now use a URL that includes ?admin_token=... or proxy the
+	// fetch through an operator-controlled cache. Per-IP rate limit
+	// kept in case the admin token leaks publicly.
+	mux.HandleFunc("/api/badge/nodes", h.requireAdminToken(h.badgeLimiter.middleware(30, time.Minute, func(w http.ResponseWriter, r *http.Request) {
 		payload := h.cb.BuildStatsPayload(false)
 		activeNodes, _ := payload["active_nodes"].(int)
 		c := "#4c1"
@@ -687,13 +789,13 @@ func (h *Handler) Serve(addr string) error {
 			c = "#9f9f9f"
 		}
 		serveBadge(w, "online nodes", fmtCount(activeNodes), c)
-	}))
+	})))
 
-	mux.HandleFunc("/api/badge/requests", h.badgeLimiter.middleware(30, time.Minute, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/badge/requests", h.requireAdminToken(h.badgeLimiter.middleware(30, time.Minute, func(w http.ResponseWriter, r *http.Request) {
 		payload := h.cb.BuildStatsPayload(false)
 		totalReqs, _ := payload["total_requests"].(int64)
 		serveBadge(w, "requests", fmtCount(int(totalReqs)), "#a855f7")
-	}))
+	})))
 
 	// Snapshot trigger endpoint (POST only, localhost only).
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, r *http.Request) {
