@@ -99,6 +99,7 @@ func TestPublicStats_Shape(t *testing.T) {
 		"total_requests":   true,
 		"requests_per_sec": true,
 		"components":       true,
+		"build_info":       true,
 	}
 	for k := range payload {
 		if !allowed[k] {
@@ -134,6 +135,75 @@ func TestPublicStats_Shape(t *testing.T) {
 		if !knownComps[name] {
 			t.Errorf("public-stats components leaked %q — not a curated component name", name)
 		}
+	}
+}
+
+// TestPublicStats_BuildInfoSurfaces pins that when the BuildInfo
+// callback is wired, the resulting fields land under "build_info" in
+// the public payload. Anyone verifying the running code does so via
+// this exact key — surface drift here breaks third-party verifiers.
+func TestPublicStats_BuildInfoSurfaces(t *testing.T) {
+	t.Parallel()
+	cb := minimalCallbacks()
+	cb.BuildInfo = func() map[string]string {
+		return map[string]string{
+			"version":       "1.10.8",
+			"git_commit":    "abc1234",
+			"build_time":    "2026-06-07T14:00:00Z",
+			"binary_sha256": "6a9fe1297083002da1d15dd3320ad852de5c76ef53ec24f5585f4dcc96ff2de4",
+			"go_version":    "go1.23.0",
+		}
+	}
+	h := NewHandler(cb)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		publicStatsHandler(mux, h)
+		mux.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/public-stats")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, body)
+	}
+	bi, ok := payload["build_info"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("build_info missing or wrong type: %v", payload["build_info"])
+	}
+	for _, k := range []string{"version", "git_commit", "build_time", "binary_sha256", "go_version"} {
+		if bi[k] == nil || bi[k] == "" {
+			t.Errorf("build_info.%s missing", k)
+		}
+	}
+	if bi["binary_sha256"] != "6a9fe1297083002da1d15dd3320ad852de5c76ef53ec24f5585f4dcc96ff2de4" {
+		t.Errorf("build_info.binary_sha256 = %q, want pinned value", bi["binary_sha256"])
+	}
+}
+
+// TestPublicStats_BuildInfoOmittedWhenAbsent confirms the field is
+// dropped entirely when no callback is registered — keeps the payload
+// honest. A populated-but-empty map would be misleading.
+func TestPublicStats_BuildInfoOmittedWhenAbsent(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(minimalCallbacks()) // no BuildInfo set
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		publicStatsHandler(mux, h)
+		mux.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/api/public-stats")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var payload map[string]interface{}
+	_ = json.Unmarshal(body, &payload)
+	if _, present := payload["build_info"]; present {
+		t.Errorf("build_info present without callback: %v", payload["build_info"])
 	}
 }
 
@@ -281,9 +351,7 @@ func publicStatsHandler(mux *http.ServeMux, h *Handler) {
 			totalRequests = h.cb.RequestCount()
 		}
 		throughput := h.RecentThroughput(10)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		payload := map[string]interface{}{
 			"server_time":      now.Unix(),
 			"uptime_seconds":   int64(now.Sub(startTime).Seconds()),
 			"active_nodes":     h.cb.OnlineCount(threshold),
@@ -295,6 +363,14 @@ func publicStatsHandler(mux *http.ServeMux, h *Handler) {
 				"beacon":    componentStatus("beacon"),
 				"dashboard": componentStatus("dashboard"),
 			},
-		})
+		}
+		if h.cb.BuildInfo != nil {
+			if bi := h.cb.BuildInfo(); len(bi) > 0 {
+				payload["build_info"] = bi
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 }
