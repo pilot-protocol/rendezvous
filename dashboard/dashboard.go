@@ -1216,17 +1216,44 @@ function renderCharts(hourly,daily){
   },'accent','online',true);
 }
 function update(){
-  var url='/api/stats';
-  var t=getToken();if(t)url+='?token='+encodeURIComponent(t);
-  fetch(url).then(function(r){return r.json()}).then(function(d){
-    document.getElementById('total-requests').textContent=fmt(d.total_requests);
+  // Polo public-stats lockdown (PR #50): /api/stats moved behind admin
+  // token. This embedded dashboard now drives off /api/public-stats,
+  // which carries server_time, uptime_seconds, active_nodes, total_nodes,
+  // and components{}. Anything the old payload supplied that isn't in
+  // /api/public-stats (total_requests, hourly/daily history, networks,
+  // restart_events, release_banner, dashboard-token-gated per-network
+  // counts) is intentionally absent from the public view — operators
+  // who need the full picture can curl /api/stats?admin_token=...
+  // directly. Token-aware dashboard-token path retained for operators
+  // who set one in localStorage.
+  var t=getToken();
+  var url=t?('/api/stats?token='+encodeURIComponent(t)):'/api/public-stats';
+  fetch(url).then(function(r){
+    if(!r.ok)return null;
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
+    if(d.total_requests!=null)document.getElementById('total-requests').textContent=fmt(d.total_requests);
     document.getElementById('total-nodes').textContent=fmt(d.total_nodes||0);
     document.getElementById('active-nodes').textContent=fmt(d.active_nodes||0);
-    document.getElementById('uptime').textContent=uptimeStr(d.uptime_secs);
-    renderServices(d.uptime_secs,d.restart_events,d.probes||{});
+    document.getElementById('uptime').textContent=uptimeStr(d.uptime_seconds||d.uptime_secs||0);
+    // /api/public-stats reports components{registry,beacon,dashboard}
+    // with status strings; the old /api/stats path uses probes{} with
+    // last_success timestamps. renderServices handles either via the
+    // components mapping below.
+    var probes=d.probes||{};
+    if(d.components){
+      Object.keys(d.components).forEach(function(name){
+        probes[name]=probes[name]||{};
+        // synthesise a fresh last_success so renderServices treats
+        // "up" components as healthy regardless of probe ring state
+        if(d.components[name]==='up')probes[name].last_success=Date.now();
+      });
+    }
+    renderServices(d.uptime_seconds||d.uptime_secs||0,d.restart_events,probes);
     renderBanner(d.release_banner,d.maintenance_banner);
-    renderCharts(d.hourly,d.daily);
-    renderNetworks(d.networks);
+    if(d.hourly||d.daily)renderCharts(d.hourly,d.daily);
+    if(d.networks)renderNetworks(d.networks);
   }).catch(function(){})
 }
 function renderServices(uptimeSecs,restartEvents,probes){
@@ -1348,7 +1375,25 @@ function renderPulse(){
   document.getElementById('pulse-peak').textContent=fmt(Math.round(_pulsePeak));
 }
 function pulseTick(){
-  fetch('/api/pulse').then(function(r){return r.json()}).then(function(d){
+  // /api/pulse is now admin-gated. Without a dashboard token an
+  // anonymous request returns 401; skip the fetch entirely so we don't
+  // spam the server's WARN log. Operators with a dashboard token can
+  // still view the pulse strip via the existing token query param.
+  // (Falls through to /api/stats?token=X for now — there is no
+  // /api/pulse?token=X variant, so we just hide the strip in the
+  // public view.)
+  var t=getToken();
+  if(!t){
+    // public view: hide the pulse strip rather than leave it empty
+    var strip=document.getElementById('pulse-strip');
+    if(strip&&!strip.dataset.hidden){strip.style.display='none';strip.dataset.hidden='1';}
+    return;
+  }
+  fetch('/api/pulse?admin_token='+encodeURIComponent(t)).then(function(r){
+    if(!r.ok)return null;
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
     if(d.samples&&d.samples.length){
       _pulseSamples=d.samples.map(function(s){return {ts:s.ts,total:s.total}});
     }else{
