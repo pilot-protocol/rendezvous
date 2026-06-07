@@ -183,6 +183,7 @@ func main() {
 	bm := r.BreakerManager()
 	if *storePath != "" && bm != nil {
 		breakersPath := filepath.Join(filepath.Dir(*storePath), "breakers.json")
+		r.SetBreakersPath(breakersPath)
 		go breakers.Watch(bm, breakersPath, 2*time.Second, nil)
 		slog.Info("breakers watcher started", "path", breakersPath, "interval", "2s")
 	}

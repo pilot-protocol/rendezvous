@@ -28,8 +28,10 @@ package breakers
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,11 +90,26 @@ type Breaker struct {
 	UpdatedAt   time.Time `json:"updated_at,omitempty"`
 }
 
+// counter holds the per-name traffic counters. Carved out as its own
+// struct so the hot path (Allow) does a single sync.Map lookup +
+// atomic increment, without touching the breaker RWMutex.
+type counter struct {
+	allowed        atomic.Int64
+	denied         atomic.Int64
+	lastDeniedUnix atomic.Int64 // unix nanos; 0 if never denied
+}
+
 // Manager holds the live breaker map. Safe for concurrent use.
 type Manager struct {
 	mu       sync.RWMutex
 	breakers map[string]*Breaker
 	clock    func() time.Time
+	// counters is name -> *counter. Populated lazily by Allow so the
+	// dispatch hot path never blocks on a global lock. Names that
+	// appear in counters but NOT in breakers are real traffic on
+	// ungated paths — useful for operators picking which surface to
+	// add a switch for next.
+	counters sync.Map
 }
 
 // New returns an empty Manager. No breakers are pre-registered;
@@ -104,6 +121,18 @@ func New() *Manager {
 		breakers: make(map[string]*Breaker),
 		clock:    time.Now,
 	}
+}
+
+// counterFor returns the named counter, allocating it on first call.
+// LoadOrStore avoids the lost-update race when two goroutines hit a
+// fresh name simultaneously.
+func (m *Manager) counterFor(name string) *counter {
+	if v, ok := m.counters.Load(name); ok {
+		return v.(*counter)
+	}
+	c := &counter{}
+	v, _ := m.counters.LoadOrStore(name, c)
+	return v.(*counter)
 }
 
 // SetClock overrides the time source (tests).
@@ -125,19 +154,32 @@ func (m *Manager) SetClock(fn func() time.Time) {
 // lookup.
 func (m *Manager) Allow(name string) (bool, State) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	b, ok := m.breakers[name]
-	if !ok {
-		return true, Closed
+	m.mu.RUnlock()
+
+	allowed := true
+	state := Closed
+	if ok {
+		switch b.State {
+		case Open:
+			allowed, state = false, Open
+		case HalfOpen:
+			state = HalfOpen
+		}
 	}
-	switch b.State {
-	case Open:
-		return false, Open
-	case HalfOpen:
-		return true, HalfOpen
-	default:
-		return true, Closed
+
+	// Count after deciding so the hot path is one RLock+one atomic. We
+	// deliberately count even when no breaker is registered — that's
+	// the signal "this gate is seeing traffic" which operators need
+	// before flipping a switch.
+	c := m.counterFor(name)
+	if allowed {
+		c.allowed.Add(1)
+	} else {
+		c.denied.Add(1)
+		c.lastDeniedUnix.Store(m.clock().UnixNano())
 	}
+	return allowed, state
 }
 
 // Reason returns the operator-supplied reason for the named breaker's
@@ -211,4 +253,69 @@ func (m *Manager) Size() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.breakers)
+}
+
+// Stats is the per-breaker live snapshot returned via /api/breakers.
+// Allowed + Denied are monotonic since process start (so a Prom/Grafana
+// scraper can rate() them). LastDeniedAt is nil when Denied == 0.
+type Stats struct {
+	Name         string     `json:"name"`
+	State        string     `json:"state"`
+	Reason       string     `json:"reason,omitempty"`
+	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
+	AllowedTotal int64      `json:"allowed_total"`
+	DeniedTotal  int64      `json:"denied_total"`
+	LastDeniedAt *time.Time `json:"last_denied_at,omitempty"`
+}
+
+// StatsSnapshot returns one Stats entry per known name — union of
+// registered breakers and seen-counters. Sorted by name for stable
+// output. A name with counters but no registered breaker reports
+// state="closed" since that's its effective behaviour (the default).
+func (m *Manager) StatsSnapshot() []Stats {
+	m.mu.RLock()
+	names := make(map[string]struct{}, len(m.breakers))
+	for k := range m.breakers {
+		names[k] = struct{}{}
+	}
+	m.counters.Range(func(k, _ any) bool {
+		names[k.(string)] = struct{}{}
+		return true
+	})
+	out := make([]Stats, 0, len(names))
+	for name := range names {
+		s := Stats{Name: name, State: Closed.String()}
+		if b, ok := m.breakers[name]; ok {
+			s.State = b.StateString
+			s.Reason = b.Reason
+			if !b.UpdatedAt.IsZero() {
+				t := b.UpdatedAt
+				s.UpdatedAt = &t
+			}
+		}
+		if v, ok := m.counters.Load(name); ok {
+			c := v.(*counter)
+			s.AllowedTotal = c.allowed.Load()
+			s.DeniedTotal = c.denied.Load()
+			if ns := c.lastDeniedUnix.Load(); ns > 0 {
+				t := time.Unix(0, ns)
+				s.LastDeniedAt = &t
+			}
+		}
+		out = append(out, s)
+	}
+	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// Delete removes a single named breaker. No-op when the name is not
+// registered. Counters are preserved so post-incident review still
+// shows traffic that flowed through the path. UpdatedAt of the file
+// watcher will revert any change on the next reload, so callers that
+// want durability should persist their intent to breakers.json too.
+func (m *Manager) Delete(name string) {
+	m.mu.Lock()
+	delete(m.breakers, name)
+	m.mu.Unlock()
 }

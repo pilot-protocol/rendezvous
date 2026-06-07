@@ -35,6 +35,82 @@ Three states:
 To re-enable: change `"state"` back to `"closed"`, delete the entry,
 or delete the file entirely (reverts to empty map = full default-allow).
 
+### Flipping via API (no SSH needed)
+
+Same in-memory effect as editing `breakers.json`, but accessible from
+anywhere with the admin token. The API also persists the change to the
+file so it survives restart, and emits an audit-log entry.
+
+```bash
+# List every gate + its live counters
+curl -H "X-Admin-Token: $TOKEN" https://polo.pilotprotocol.network/api/breakers
+
+# Open one
+curl -X PUT -H "X-Admin-Token: $TOKEN" -H "Content-Type: application/json" \
+     -d '{"state":"open","reason":"incident #2061 — pause registrations"}' \
+     https://polo.pilotprotocol.network/api/breakers/registry.register
+
+# Revert
+curl -X DELETE -H "X-Admin-Token: $TOKEN" \
+     https://polo.pilotprotocol.network/api/breakers/registry.register
+```
+
+PUT and DELETE **require** the `X-Admin-Token` header (no query-param
+fallback) — dodges CSRF via referer leaks. GET also accepts
+`?admin_token=…` for convenience.
+
+The list payload shape:
+
+```json
+{
+  "breakers": [
+    {
+      "name": "registry.register",
+      "state": "closed",
+      "allowed_total": 1234567,
+      "denied_total": 0
+    },
+    {
+      "name": "registry.heartbeat",
+      "state": "open",
+      "reason": "incident #2061",
+      "updated_at": "2026-06-08T09:12:33Z",
+      "allowed_total": 4521,
+      "denied_total": 17,
+      "last_denied_at": "2026-06-08T09:12:34Z"
+    }
+  ]
+}
+```
+
+Counters are monotonic since process start and survive `DELETE` — post-
+incident review keeps seeing exactly how much traffic flowed through
+the gate. Names that appear in `counters` but never had a registered
+breaker are real traffic on ungated paths; useful for picking which
+surface to gate next.
+
+### Process health (`/api/runtime`)
+
+Admin-only sibling endpoint surfacing Go runtime data that Prometheus
+scrapers don't expose by default:
+
+```bash
+curl -H "X-Admin-Token: $TOKEN" https://polo.pilotprotocol.network/api/runtime
+```
+
+Returns goroutine count, heap stats, GC cycle count + pause percentiles
+(p50/p99/max in seconds), scheduler latency percentiles, cumulative
+mutex wait time, and (on Linux) open file-descriptor count. Useful for
+spotting:
+
+- **Goroutine leaks**: monotonic climb over hours.
+- **Lock contention**: `mutex_wait_seconds` rate climbing without a
+  matching workload increase.
+- **Scheduler congestion**: `sched_latency_p99_seconds` climbing even
+  with idle CPU — too many ready goroutines for `GOMAXPROCS`.
+- **GC pressure**: `gc_pause_p99_seconds` > 10 ms on a registry doing
+  20k rps queues thousands of in-flight requests behind one STW.
+
 ### Verifying a flip took effect
 
 The wire-level error returned to the caller is sanitised to a generic
