@@ -145,6 +145,20 @@ func main() {
 		slog.Info("dashboard running", "http", *httpAddr)
 	}
 
+	// Rate-limit whitelist watcher. Picks up changes to
+	// <store-dir>/rate-limit-whitelist.json every 2 s and atomically
+	// reloads. Runs in its own goroutine; never blocks startup, the
+	// registry, the beacon, or the dashboard. Fail-open on every error
+	// (missing file, parse failure, apply failure) — the whitelist is
+	// purely additive.
+	if *storePath != "" {
+		whitelistPath := filepath.Join(filepath.Dir(*storePath), "rate-limit-whitelist.json")
+		go watchRateLimitWhitelist(
+			whitelistPath, 2*time.Second, r.SetRateLimitWhitelist, nil,
+		)
+		slog.Info("rate-limit whitelist watcher started", "path", whitelistPath, "interval", "2s")
+	}
+
 	mode := "primary"
 	if *standbyPrimary != "" {
 		mode = "standby"
