@@ -15,6 +15,7 @@ import (
 	acceptpkg "github.com/pilot-protocol/rendezvous/accept"
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	authzpkg "github.com/pilot-protocol/rendezvous/authz"
+	breakerspkg "github.com/pilot-protocol/rendezvous/breakers"
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	dirpkg "github.com/pilot-protocol/rendezvous/directory"
 	"github.com/pilot-protocol/rendezvous/events"
@@ -122,6 +123,16 @@ func (s *Server) SetRateLimitWhitelist(entries []acceptpkg.WhitelistEntry) error
 // RateLimitWhitelistSize returns the number of installed whitelist rules.
 func (s *Server) RateLimitWhitelistSize() int {
 	return s.accept.RateLimitWhitelistSize()
+}
+
+// BreakerManager returns the Server's named-breaker manager. Call sites
+// inside the rendezvous binary consult breakers via this manager
+// (e.g. s.breakers.Allow("registry.register")); cmd/rendezvous wires
+// the file watcher against it so operator edits to breakers.json hot-
+// reload without restart. Never returns nil for a properly-constructed
+// Server.
+func (s *Server) BreakerManager() *breakerspkg.Manager {
+	return s.breakers
 }
 
 // SetMaxConnections overrides the default connection limit. Used in tests to prevent port exhaustion.
@@ -334,6 +345,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 	}
 	s.staleNodeThresholdNs.Store(int64(defaultStaleNodeThreshold))
 	s.accept = acceptpkg.NewAcceptor(defaultMaxConnections, s) // R3.2: accept/TLS/rate-limit layer
+	s.breakers = breakerspkg.New()                             // operator-controllable on/off switches; gated paths consult via Server.Breakers().Allow()
 	s.authz = authzpkg.NewChecker("", "")                      // tokens set later via SetAdminToken / SetDashboardToken
 	s.listNodesCache.Cond = sync.NewCond(&s.listNodesCache.Mu)
 	s.routing = routing.NewStore(s)                    // R1.4: beacon/punch routing sub-package
