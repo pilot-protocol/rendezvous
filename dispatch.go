@@ -11,6 +11,47 @@ package server
 // related files); this layer only routes msgType -> handler.
 type Handler func(s *Server, msg map[string]interface{}, remoteAddr string) (map[string]interface{}, error)
 
+// breakerForType maps a wire msgType to the breaker name that gates
+// it. The dispatcher (handleMessage) consults breakers.Allow with the
+// mapped name before invoking the handler; if the breaker is Open the
+// caller receives an error with the operator-supplied reason and the
+// handler never runs. Types not present in this map are ungated —
+// the default-allow semantic means a missing breaker is treated as
+// "closed" (allow). Naming convention: <component>.<action>.
+//
+// Multiple msgTypes can share one breaker (e.g. all read-paths share
+// "registry.resolve"). That lets an operator shed load on an entire
+// surface with a single flip — "registry.resolve: open" halts lookup,
+// resolve, resolve_hostname, list_networks, list_nodes in one shot,
+// while heartbeat, register, etc. keep flowing.
+var breakerForType = map[string]string{
+	"register":            "registry.register",
+	"heartbeat":           "registry.heartbeat",
+	"lookup":              "registry.resolve",
+	"resolve":             "registry.resolve",
+	"resolve_hostname":    "registry.resolve",
+	"list_networks":       "registry.resolve",
+	"list_nodes":          "registry.resolve",
+	"punch":               "registry.punch",
+	"deregister":          "registry.deregister",
+	"report_trust":        "registry.trust",
+	"revoke_trust":        "registry.trust",
+	"check_trust":         "registry.trust",
+	"request_handshake":   "registry.handshake",
+	"poll_handshakes":     "registry.handshake",
+	"respond_handshake":   "registry.handshake",
+	"invite_to_network":   "registry.invite",
+	"poll_invites":        "registry.invite",
+	"respond_invite":      "registry.invite",
+	"create_network":      "registry.network_admin",
+	"delete_network":      "registry.network_admin",
+	"join_network":        "registry.network_admin",
+	"leave_network":       "registry.network_admin",
+	"rename_network":      "registry.network_admin",
+	"beacon_register":     "registry.beacon_register",
+	"beacon_list":         "registry.beacon_register",
+}
+
 // handlers is the dispatch table consulted by Server.handleMessage.
 // Adding a new handler means adding an entry here; never editing a
 // 200-line switch (per R3 invariant 5: "R3 dispatch is a lookup, not a

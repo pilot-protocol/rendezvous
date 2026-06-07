@@ -170,6 +170,28 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 		return nil, fmt.Errorf("unknown message type: %q", msgType)
 	}
 
+	// Breaker gate: consult the named breaker for this msgType (if any
+	// is mapped). Open returns an error to the caller and skips the
+	// handler entirely so the gated surface stays cold for as long as
+	// the breaker holds. Closed / HalfOpen / unmapped types all pass
+	// through. HalfOpen surfaces as a debug log only (don't spam at
+	// info — half_open is meant to ride on operator observation, not
+	// produce noise per request).
+	if bname, gated := breakerForType[msgType]; gated && s.breakers != nil {
+		allow, state := s.breakers.Allow(bname)
+		if !allow {
+			reason := s.breakers.Reason(bname)
+			s.metrics.ErrorsTotal.WithLabel(msgType + ":breaker_open").Inc()
+			if reason != "" {
+				return nil, fmt.Errorf("service unavailable: breaker %q is open (%s)", bname, reason)
+			}
+			return nil, fmt.Errorf("service unavailable: breaker %q is open", bname)
+		}
+		if state.String() == "half_open" {
+			slog.Debug("registry breaker half_open", "breaker", bname, "type", msgType, "remote_addr", remoteAddr)
+		}
+	}
+
 	// Per-request panic boundary: a panicking handler must not crash
 	// the registry process — registries serve the entire fleet, so
 	// "one bad request" cannot be a DoS vector. Convert the panic to

@@ -84,6 +84,10 @@ func main() {
 	r.SetBuildInfo(buildInfo)
 	r.SetStaleNodeThreshold(*staleThreshold)
 	r.SetBeaconStats(b)
+	// Plumb the breaker manager into the in-process beacon so
+	// beacon.punch / beacon.relay / beacon.discover can be flipped from
+	// the same breakers.json file as the registry-side switches.
+	b.SetBreakerAllow(r.BreakerAllow)
 	if *adminToken != "" {
 		r.SetAdminToken(*adminToken)
 	}

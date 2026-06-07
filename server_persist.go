@@ -73,6 +73,18 @@ func (s *Server) save() {
 // Phase 1 (RLock): copy raw values only — no encoding.
 // Phase 2 (no lock): base64, time.Format, JSON marshal.
 func (s *Server) flushSave() error {
+	// Breaker gate: snapshot.write opens during incidents where the
+	// in-memory state is suspect (post-crash recovery, mid-load) and an
+	// emergency save would freeze the bad state to disk. Open the
+	// breaker, fix the issue in memory, then close to resume saves.
+	// flushSave returns nil (not an error) so the periodic saveLoop
+	// keeps ticking without ratcheting up the error metric.
+	if s.breakers != nil {
+		if allow, _ := s.breakers.Allow("snapshot.write"); !allow {
+			s.metrics.ErrorsTotal.WithLabel("snapshot.write:breaker_open").Inc()
+			return nil
+		}
+	}
 	// Phase 1: RLock — copy raw values (pointer copies, integer copies only)
 	s.mu.RLock()
 	nextNode := s.nextNode
