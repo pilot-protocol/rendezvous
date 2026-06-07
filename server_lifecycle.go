@@ -104,6 +104,26 @@ func (s *Server) SetClock(fn func() time.Time) {
 	s.routing.SetClock(fn)
 }
 
+// SetRateLimitWhitelist installs (or replaces) the rate-limit whitelist
+// on the underlying Acceptor. Whitelisted CIDRs bypass the per-IP token
+// bucket, the per-connection abusive-rate close (>500 req/s/conn), AND
+// the process-wide global rate cap (~1000 req/s default). Use for
+// operator-trusted internal infrastructure that legitimately drives
+// high sustained load (presence simulators, traffic generators, the
+// service-agents host running specialist agents, etc.).
+//
+// Pass nil or empty slice to clear the whitelist. Fail-closed: returns
+// an error on any malformed CIDR; the previous whitelist remains in
+// place on error.
+func (s *Server) SetRateLimitWhitelist(entries []acceptpkg.WhitelistEntry) error {
+	return s.accept.SetRateLimitWhitelist(entries)
+}
+
+// RateLimitWhitelistSize returns the number of installed whitelist rules.
+func (s *Server) RateLimitWhitelistSize() int {
+	return s.accept.RateLimitWhitelistSize()
+}
+
 // SetMaxConnections overrides the default connection limit. Used in tests to prevent port exhaustion.
 func (s *Server) SetMaxConnections(max int64) {
 	s.accept.SetMaxConnections(max)

@@ -262,6 +262,18 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	return true
 }
 
+// IsWhitelisted reports whether ip matches any whitelist CIDR. Exposed
+// for use outside the per-IP token bucket path (e.g. to bypass the
+// per-connection request-rate cap and the process-wide global bucket
+// in handleBinaryConn / handleTextConn for operator-trusted internal
+// infrastructure). Safe for concurrent use.
+func (rl *RateLimiter) IsWhitelisted(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	_, ok := rl.whitelistRateLocked(ip)
+	return ok
+}
+
 // whitelistRateLocked returns the elevated rate for ip if any whitelist
 // CIDR contains it, else (0, false). Caller must hold rl.mu.
 func (rl *RateLimiter) whitelistRateLocked(ip string) (int, bool) {
@@ -833,28 +845,33 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 		}
 
 		// Per-connection rate check with 5 s grace period.
-		connReqCount++
-		if elapsed := time.Since(connStart).Seconds(); elapsed >= 5 {
-			// Process-level global rate cap: reject when total request
-			// rate across all connections exceeds the global ceiling.
-			if !a.globalBucket.allow(time.Now()) {
-				slog.Warn("global rate limit exceeded, closing connection",
-					"remote", conn.RemoteAddr())
-				return
-			}
-
-			rate := float64(connReqCount) / elapsed
-			if rate > 500 {
-				slog.Warn("closing abusive connection", "remote", conn.RemoteAddr(), "rate", rate)
-				return
-			}
-			if rate > 100 {
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-
 		remoteAddr := conn.RemoteAddr().String()
 		host, _, _ := net.SplitHostPort(remoteAddr)
+		connReqCount++
+		if elapsed := time.Since(connStart).Seconds(); elapsed >= 5 {
+			// Operator-trusted infrastructure (whitelisted CIDRs)
+			// bypasses both the global cap and the per-connection
+			// abusive-rate throttle. See handleBinaryConn comment.
+			if !a.rateLimiter.IsWhitelisted(host) {
+				// Process-level global rate cap: reject when total
+				// request rate across all connections exceeds the
+				// global ceiling.
+				if !a.globalBucket.allow(time.Now()) {
+					slog.Warn("global rate limit exceeded, closing connection",
+						"remote", conn.RemoteAddr())
+					return
+				}
+
+				rate := float64(connReqCount) / elapsed
+				if rate > 500 {
+					slog.Warn("closing abusive connection", "remote", conn.RemoteAddr(), "rate", rate)
+					return
+				}
+				if rate > 100 {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}
 		msgType, _ := msg["type"].(string)
 
 		resp, err := a.dispatcher.HandleMessage(msg, remoteAddr)
@@ -924,21 +941,30 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 
 		connReqCount++
 		if elapsed := time.Since(connStart).Seconds(); elapsed >= 5 {
-			// Process-level global rate cap: reject when total request
-			// rate across all connections exceeds the global ceiling.
-			if !a.globalBucket.allow(time.Now()) {
-				slog.Warn("global rate limit exceeded, closing binary connection",
-					"remote", conn.RemoteAddr())
-				return
-			}
+			// Operator-trusted infrastructure (whitelisted CIDRs) bypasses
+			// both the global cap and the per-connection abusive-rate
+			// throttle. Verified safe: the whitelist is loaded from
+			// rate-limit-whitelist.json next to the registry snapshot,
+			// reloaded atomically on file change, and only ever contains
+			// IPs the operator has explicitly added.
+			if !a.rateLimiter.IsWhitelisted(host) {
+				// Process-level global rate cap: reject when total
+				// request rate across all connections exceeds the
+				// global ceiling.
+				if !a.globalBucket.allow(time.Now()) {
+					slog.Warn("global rate limit exceeded, closing binary connection",
+						"remote", conn.RemoteAddr())
+					return
+				}
 
-			rate := float64(connReqCount) / elapsed
-			if rate > 500 {
-				slog.Warn("closing abusive binary connection", "remote", conn.RemoteAddr(), "rate", rate)
-				return
-			}
-			if rate > 100 {
-				time.Sleep(10 * time.Millisecond)
+				rate := float64(connReqCount) / elapsed
+				if rate > 500 {
+					slog.Warn("closing abusive binary connection", "remote", conn.RemoteAddr(), "rate", rate)
+					return
+				}
+				if rate > 100 {
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
 		}
 
