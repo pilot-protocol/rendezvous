@@ -191,7 +191,17 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 		}
 	}()
 
-	return h(s, msg, remoteAddr)
+	resp, err = h(s, msg, remoteAddr)
+	// common@v0.4.7 (PILOT-132): registry client rejects non-empty
+	// responses missing a "type" envelope field. Echo the request type
+	// back so every handler doesn't have to remember to set it. A
+	// handler that explicitly sets "type" still wins.
+	if err == nil && len(resp) > 0 {
+		if _, hasType := resp["type"]; !hasType {
+			resp["type"] = msgType
+		}
+	}
+	return resp, err
 }
 
 // --- routing.PunchBackend implementation ---
