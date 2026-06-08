@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
+	"github.com/pilot-protocol/rendezvous/locks"
 )
 
 // --------------------------------------------------------------------------
@@ -1050,6 +1051,13 @@ func (h *Handler) Serve(addr string) error {
 	mux.HandleFunc("/debug/pprof/profile", localhostOnly(pprof.Profile))
 	mux.HandleFunc("/debug/pprof/symbol", localhostOnly(pprof.Symbol))
 	mux.HandleFunc("/debug/pprof/trace", localhostOnly(pprof.Trace))
+
+	// /debug/locks: JSON snapshot of mutex/block contention, live lock waiters,
+	// and runtime state. Pure stdlib, no instrumentation overhead — reads
+	// what the runtime's existing sampling already collects. Useful for
+	// alerting (cumulative mutex_wait_total_seconds, sched_latency_p99) and
+	// for incident response (live_lock_waiters by call site).
+	mux.HandleFunc("/debug/locks", localhostOnly(locks.Handler().ServeHTTP))
 
 	slog.Info("dashboard listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
