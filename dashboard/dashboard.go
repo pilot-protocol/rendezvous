@@ -1326,7 +1326,7 @@ function renderBuildInfo(bi){
   var el=document.getElementById('build-info');
   if(!el||!bi){if(el){el.style.display='none';el.innerHTML=''}return}
   var commit=bi.git_commit||'';
-  var commitHTML=commit?('<a href="https://github.com/TeoSlayer/pilotprotocol/commit/'+encodeURIComponent(commit)+'" title="View commit on GitHub" target="_blank" rel="noopener">'+escapeHtml(commit)+'</a>'):'(unset)';
+  var commitHTML=commit?('<a href="https://github.com/pilot-protocol/rendezvous/commit/'+encodeURIComponent(commit)+'" title="View commit on GitHub" target="_blank" rel="noopener">'+escapeHtml(commit)+'</a>'):'(unset)';
   var sha=bi.binary_sha256||'';
   var shaShort=sha?sha.substring(0,12)+'…':'(unset)';
   var shaTitle=sha?('Full SHA256: '+sha):'';
