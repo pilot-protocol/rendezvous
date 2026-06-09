@@ -13,6 +13,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/crypto"
@@ -212,28 +213,46 @@ func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interf
 	if err != nil {
 		return fmt.Errorf("invalid signature encoding: %w", err)
 	}
-	if !crypto.Verify(pubKey, []byte(challenge), sig) {
-		if OnSignatureVerify != nil {
-			OnSignatureVerify(false)
-		}
-		return fmt.Errorf("signature verification failed")
+	ok := crypto.Verify(pubKey, []byte(challenge), sig)
+	if fn := loadSigVerifyHook(); fn != nil {
+		fn(ok)
 	}
-	if OnSignatureVerify != nil {
-		OnSignatureVerify(true)
+	if !ok {
+		return fmt.Errorf("signature verification failed")
 	}
 	return nil
 }
 
-// OnSignatureVerify, when non-nil, is invoked once per
-// VerifyNodeSignature call (and therefore VerifyHeartbeatSignature)
-// that actually exercises crypto.Verify. The admin-token fallback path
-// is intentionally not counted — the metric tracks signature-verify
-// success rate, not "did the caller authenticate by any means."
+// onSigVerify is an atomic.Pointer holding the optional metrics hook
+// invoked once per crypto.Verify call. atomic.Pointer makes the
+// publish-once / read-many pattern race-free without a mutex on the
+// hot path. The admin-token fallback path is intentionally not
+// counted — the metric tracks signature-verify success rate, not
+// "did the caller authenticate by any means."
+var onSigVerify atomic.Pointer[func(bool)]
+
+// SetOnSignatureVerify installs the package-level hook fired by every
+// VerifyNodeSignature / VerifyHeartbeatSignature call that exercises
+// crypto.Verify. Pass nil to clear. Safe to call concurrently from
+// multiple Server instances in test (atomic-stored pointer).
 //
-// Set from package server (server_lifecycle.go) to increment the
-// pilot_signature_verify_total{result=...} counter. Left as a
+// Wired from package server (server_lifecycle.go) to increment the
+// pilot_signature_verify_total{result=...} counter. Kept as a
 // package-level hook so authz/ stays free of a metrics import.
-var OnSignatureVerify func(ok bool)
+func SetOnSignatureVerify(fn func(bool)) {
+	if fn == nil {
+		onSigVerify.Store(nil)
+		return
+	}
+	onSigVerify.Store(&fn)
+}
+
+func loadSigVerifyHook() func(bool) {
+	if p := onSigVerify.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
 
 // VerifyHeartbeatSignature is an alias for VerifyNodeSignature with a
 // caller-supplied adminToken (copied before releasing a read lock).
