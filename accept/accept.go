@@ -205,6 +205,39 @@ func (rl *RateLimiter) SetClock(fn func() time.Time) {
 	rl.now = fn
 }
 
+// onDenyHook holds the optional metrics callback fired on every
+// rate-limit / connection-level deny. atomic.Pointer makes the
+// publish-once / read-many pattern race-free without a mutex on the
+// hot path; the per-call cost is a single atomic load.
+var onDenyHook atomic.Pointer[func(string)]
+
+// SetOnDeny installs the package-level hook fired by every deny site.
+// kind is one of:
+//   - "ip"             — per-IP token bucket exhausted
+//   - "bucket_table"   — process-wide per-IP table is at maxBuckets
+//   - "global"         — process-wide global request cap exceeded
+//   - "connection"     — single connection sustained >500 req/s ("abusive")
+//
+// Pass nil to clear. Safe to call concurrently from multiple Server
+// instances in test.
+//
+// Wired from package server (server_lifecycle.go) to increment the
+// pilot_ratelimit_denied_total{kind="..."} counter. Kept as a
+// package-level hook so accept/ stays free of a metrics import.
+func SetOnDeny(fn func(string)) {
+	if fn == nil {
+		onDenyHook.Store(nil)
+		return
+	}
+	onDenyHook.Store(&fn)
+}
+
+func fireOnDeny(kind string) {
+	if p := onDenyHook.Load(); p != nil {
+		(*p)(kind)
+	}
+}
+
 // Allow checks if a request from the given IP is allowed.
 func (rl *RateLimiter) Allow(ip string) bool {
 	if os.Getenv("PILOT_REGISTRY_NORATELIMIT") == "1" {
@@ -230,6 +263,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 					}
 				}
 				if len(rl.buckets) >= rl.maxBuckets {
+					fireOnDeny("bucket_table")
 					return false
 				}
 			}
@@ -256,6 +290,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	b.lastFill = now
 
 	if b.tokens < 1 {
+		fireOnDeny("ip")
 		return false
 	}
 	b.tokens--
@@ -857,6 +892,7 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 				// request rate across all connections exceeds the
 				// global ceiling.
 				if !a.globalBucket.allow(time.Now()) {
+					fireOnDeny("global")
 					slog.Warn("global rate limit exceeded, closing connection",
 						"remote", conn.RemoteAddr())
 					return
@@ -864,6 +900,7 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 
 				rate := float64(connReqCount) / elapsed
 				if rate > 500 {
+					fireOnDeny("connection")
 					slog.Warn("closing abusive connection", "remote", conn.RemoteAddr(), "rate", rate)
 					return
 				}
@@ -952,6 +989,7 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 				// request rate across all connections exceeds the
 				// global ceiling.
 				if !a.globalBucket.allow(time.Now()) {
+					fireOnDeny("global")
 					slog.Warn("global rate limit exceeded, closing binary connection",
 						"remote", conn.RemoteAddr())
 					return
@@ -959,6 +997,7 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 
 				rate := float64(connReqCount) / elapsed
 				if rate > 500 {
+					fireOnDeny("connection")
 					slog.Warn("closing abusive binary connection", "remote", conn.RemoteAddr(), "rate", rate)
 					return
 				}
