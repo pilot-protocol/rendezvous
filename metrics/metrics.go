@@ -267,6 +267,12 @@ type Store struct {
 	// case so a registry without a beacon doesn't read as 0 traffic.
 	BeaconStatsFn func() (forwarded, dropped, notFound uint64, ok bool)
 
+	// RegistryInternalsFn surfaces server-internal state that's not part of
+	// the request path (pubkey index size, WAL bytes, replication epoch +
+	// role). The closure is invoked at scrape time so the values are always
+	// fresh. nil → the metrics are omitted from the scrape output.
+	RegistryInternalsFn func() (pubkeys uint64, walSize uint64, term uint64, isStandby bool, ok bool)
+
 	// Per-network metrics (computed on scrape, for Grafana dashboards)
 	networkMetricsMu sync.Mutex
 	NetworkMetrics   []NetworkMetricSnapshot
@@ -522,6 +528,31 @@ func (st *Store) WriteTo(w io.Writer) (int64, error) {
 			writeHelp(&b, "pilot_beacon_relay_not_found_total", "UDP relay packets addressed to a node the beacon has no route for. High rate suggests stale client routing tables or aggressive node reaping.")
 			writeType(&b, "pilot_beacon_relay_not_found_total", "counter")
 			writeMetric(&b, "pilot_beacon_relay_not_found_total", float64(nfd))
+		}
+	}
+
+	// --- Registry internals (pubkey index size, WAL bytes, replication) ---
+	if st.RegistryInternalsFn != nil {
+		if pk, wal, term, standby, ok := st.RegistryInternalsFn(); ok {
+			writeHelp(&b, "pilot_pubkeys_total", "Distinct Ed25519 public keys present in the registry's identity index. Differs from pilot_nodes_total when a node has re-registered with a fresh key.")
+			writeType(&b, "pilot_pubkeys_total", "gauge")
+			writeMetric(&b, "pilot_pubkeys_total", float64(pk))
+
+			writeHelp(&b, "pilot_wal_size_bytes", "Current write-ahead log size in bytes. Truncated to zero on every successful flushSave; sustained non-zero size during steady state indicates flushSave isn't keeping up.")
+			writeType(&b, "pilot_wal_size_bytes", "gauge")
+			writeMetric(&b, "pilot_wal_size_bytes", float64(wal))
+
+			writeHelp(&b, "pilot_replication_term", "Monotonic replication epoch (PILOT-328). Incremented on primary promotion; standbys reject snapshots from a stale primary.")
+			writeType(&b, "pilot_replication_term", "gauge")
+			writeMetric(&b, "pilot_replication_term", float64(term))
+
+			role := 0.0
+			if standby {
+				role = 1.0
+			}
+			writeHelp(&b, "pilot_replication_is_standby", "1 if this instance is currently a replication standby, 0 if it's the active primary.")
+			writeType(&b, "pilot_replication_is_standby", "gauge")
+			writeMetric(&b, "pilot_replication_is_standby", role)
 		}
 	}
 
