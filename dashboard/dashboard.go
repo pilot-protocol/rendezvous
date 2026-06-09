@@ -181,6 +181,14 @@ type Callbacks struct {
 	// Errors are returned to the client as 500; protocol.ErrNetworkNotFound
 	// surfaces as 404.
 	MembersList func(netID uint16) ([]MemberSnapshot, error)
+	// NetworksList returns a snapshot of every known network with both
+	// the numeric ID and the human-readable name, plus per-role counts
+	// and the enterprise / policy-set flags. Powers the dashboard's
+	// network picker — without this the per-metric rollup (keyed by
+	// label = name) doesn't know which numeric ID the management
+	// endpoints (kick / set-role) need.
+	// Backs GET /api/admin/networks. Optional; nil → endpoint 404.
+	NetworksList func() []NetworkSnapshot
 	// MemberKick removes the given node from the network's member list
 	// and role map. The reason string is the operator's audit note (why
 	// the action was taken) and is required — endpoints reject empty
@@ -246,6 +254,21 @@ type MemberSnapshot struct {
 	Role         string `json:"role"`
 	Hostname     string `json:"hostname,omitempty"`
 	LastSeenUnix int64  `json:"last_seen_unix,omitempty"`
+}
+
+// NetworkSnapshot is one row in the GET /api/admin/networks response.
+// Powers the dashboard's network picker: the labeled /metrics rollup is
+// keyed by network NAME but the management endpoints (kick / set role)
+// take numeric IDs, so this endpoint surfaces both alongside the
+// per-network role counts and the enterprise / policy-set flags.
+type NetworkSnapshot struct {
+	ID           uint16 `json:"id"`
+	Name         string `json:"name"`
+	MembersCount int    `json:"members_count"`
+	AdminsCount  int    `json:"admins_count"`
+	OwnersCount  int    `json:"owners_count"`
+	Enterprise   bool   `json:"enterprise"`
+	PolicySet    bool   `json:"policy_set"`
 }
 
 // BreakerListEntry is one row in the /api/breakers response. Marshalled
@@ -1453,6 +1476,28 @@ func (h *Handler) Serve(addr string) error {
 			"count":            len(entries),
 			"total_size_bytes": total,
 			"entries":          entries,
+		})
+	}))
+
+	// /api/admin/networks (no trailing slash) — list all networks with
+	// numeric ID + name + role counts. Powers the dashboard's network
+	// picker so the per-network management endpoints (which take numeric
+	// IDs) have a discoverable source.
+	mux.HandleFunc("/api/admin/networks", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.NetworksList == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		list := h.cb.NetworksList()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":    len(list),
+			"networks": list,
 		})
 	}))
 
