@@ -527,9 +527,22 @@ func (s *Server) load() error {
 	if snap.Checksum != "" {
 		savedChecksum := snap.Checksum
 		snap.Checksum = ""
-		verifyData, verifyErr := json.Marshal(snap)
-		if verifyErr != nil {
-			return fmt.Errorf("snapshot checksum verification failed (re-marshal): %w", verifyErr)
+		// Re-marshal MUST mirror the save path's encoder settings, otherwise
+		// any HTML-escapable byte ('<', '>', '&') in the data — common in
+		// audit details, hostnames containing URL fragments, attrs etc. —
+		// yields a different recomputed hash and the file is rejected as
+		// "corrupt" when it isn't. Use json.Encoder with SetEscapeHTML(false)
+		// to match flushSave (server_persist.go:444-446).
+		var verifyBuf bytes.Buffer
+		verifyEnc := json.NewEncoder(&verifyBuf)
+		verifyEnc.SetEscapeHTML(false)
+		if err := verifyEnc.Encode(snap); err != nil {
+			return fmt.Errorf("snapshot checksum verification failed (re-marshal): %w", err)
+		}
+		verifyData := verifyBuf.Bytes()
+		// json.Encoder.Encode appends a newline; drop it to match the save path.
+		if len(verifyData) > 0 && verifyData[len(verifyData)-1] == '\n' {
+			verifyData = verifyData[:len(verifyData)-1]
 		}
 		hash := sha256.Sum256(verifyData)
 		computed := hex.EncodeToString(hash[:])
