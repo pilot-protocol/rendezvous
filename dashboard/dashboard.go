@@ -18,6 +18,8 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +130,23 @@ type Callbacks struct {
 	// preserved so post-incident review still shows traffic that
 	// flowed through the gate. Persists the change to breakers.json.
 	BreakerDelete func(name string) error
+	// AuditRecent returns the most recent N audit-log entries from the
+	// in-memory ring buffer (caller-supplied bound, server-clamped to a
+	// safe maximum). Optional — when nil, /api/admin/audit/recent
+	// returns an empty list.
+	AuditRecent func(n int) []AuditEntrySnapshot
+}
+
+// AuditEntrySnapshot is the JSON-friendly shape returned by /api/admin/audit/recent.
+// Lifted out of the server package so the dashboard doesn't import it directly.
+// Fields mirror audit.Entry so the wire format is stable across releases.
+type AuditEntrySnapshot struct {
+	Timestamp string `json:"timestamp"`
+	Action    string `json:"action"`
+	NetworkID uint16 `json:"network_id,omitempty"`
+	NodeID    uint32 `json:"node_id,omitempty"`
+	Details   string `json:"details,omitempty"`
+	Hash      string `json:"hash,omitempty"`
 }
 
 // NodeSnapshot is a minimal node record for the /api/nodes endpoint.
@@ -1058,6 +1077,96 @@ func (h *Handler) Serve(addr string) error {
 	// alerting (cumulative mutex_wait_total_seconds, sched_latency_p99) and
 	// for incident response (live_lock_waiters by call site).
 	mux.HandleFunc("/debug/locks", localhostOnly(locks.Handler().ServeHTTP))
+
+	// /api/admin/audit/recent: return the last N audit events from the in-memory
+	// ring. Default N=100, max 1000.
+	//   GET /api/admin/audit/recent?n=200
+	//   -> {"count":N, "events":[{timestamp, action, network_id, node_id, details, hash}, ...]}
+	// Admin token required (X-Admin-Token header or admin_token=… query for GET).
+	mux.HandleFunc("/api/admin/audit/recent", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		n := 100
+		if raw := r.URL.Query().Get("n"); raw != "" {
+			if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+				n = v
+			}
+		}
+		if n > 1000 {
+			n = 1000
+		}
+		var events []AuditEntrySnapshot
+		if h.cb.AuditRecent != nil {
+			events = h.cb.AuditRecent(n)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":  len(events),
+			"events": events,
+		})
+	}))
+
+	// /api/admin/runtime/gc: force a synchronous garbage-collection cycle.
+	//   POST /api/admin/runtime/gc
+	//   -> {"ok": true, "duration_ms": N}
+	// Useful during incidents to confirm whether heap pressure is from
+	// retention vs. allocation rate. Synchronous (blocks the request) so
+	// the operator sees the wall time it took.
+	mux.HandleFunc("/api/admin/runtime/gc", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		start := time.Now()
+		runtime.GC()
+		dur := time.Since(start)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":          true,
+			"duration_ms": dur.Milliseconds(),
+		})
+	}))
+
+	// /api/admin/runtime/profile-rates: tune mutex / block sampling at runtime.
+	//   PUT /api/admin/runtime/profile-rates
+	//     body: {"mutex_fraction": 100, "block_rate_ns": 1000}
+	//   -> {"ok": true, "mutex_fraction": 100, "block_rate_ns": 1000}
+	// mutex_fraction=0 disables mutex sampling; block_rate_ns=0 disables
+	// block sampling. Default at boot is mutex_fraction=1000, block_rate_ns=10000.
+	mux.HandleFunc("/api/admin/runtime/profile-rates", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "PUT, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			MutexFraction *int   `json:"mutex_fraction"`
+			BlockRateNs   *int64 `json:"block_rate_ns"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		// runtime.SetMutexProfileFraction(-1) reads current; runtime.SetBlockProfileRate has no read.
+		mf := runtime.SetMutexProfileFraction(-1)
+		if body.MutexFraction != nil {
+			mf = runtime.SetMutexProfileFraction(*body.MutexFraction)
+			mf = *body.MutexFraction
+		}
+		if body.BlockRateNs != nil {
+			runtime.SetBlockProfileRate(int(*body.BlockRateNs))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		out := map[string]interface{}{"ok": true, "mutex_fraction": mf}
+		if body.BlockRateNs != nil {
+			out["block_rate_ns"] = *body.BlockRateNs
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}))
 
 	slog.Info("dashboard listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)

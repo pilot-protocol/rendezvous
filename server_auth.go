@@ -100,6 +100,9 @@ func (r *serverNetworkReader) IsEnterpriseNetwork(netID uint16) (bool, bool) {
 func (s *Server) audit(action string, attrs ...any) {
 	slog.Info("audit", append([]any{"audit_action", action}, attrs...)...)
 	s.metrics.AuditEventsTotal.Inc()
+	if s.metrics.AuditActions != nil {
+		s.metrics.AuditActions.WithLabel(action).Inc()
+	}
 
 	// Synchronous ring-buffer write (tested by white-box tests in this package).
 	entry := s.appendAudit(action, 0, 0, attrs...)

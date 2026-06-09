@@ -119,11 +119,26 @@ type BeaconStatsProvider = dashpkg.BeaconStatsProvider
 type DashboardStats = dashpkg.DashboardStats
 
 // SetBeaconStats wires a BeaconStatsProvider into the registry so
-// /api/stats can return relay-forward counts.
+// /api/stats can return relay-forward counts. Also installs the metrics-side
+// adapter so pilot_beacon_relay_forwarded_total / _dropped_total /
+// _not_found_total appear on /metrics. The adapter returns (0,0,0,false)
+// when no beacon is wired so the scrape omits the metrics entirely instead
+// of lying about traffic.
 func (s *Server) SetBeaconStats(b BeaconStatsProvider) {
 	s.mu.Lock()
 	s.beaconStats = b
 	s.mu.Unlock()
+	if s.metrics != nil {
+		s.metrics.BeaconStatsFn = func() (uint64, uint64, uint64, bool) {
+			s.mu.RLock()
+			bs := s.beaconStats
+			s.mu.RUnlock()
+			if bs == nil {
+				return 0, 0, 0, false
+			}
+			return bs.RelayForwarded(), bs.RelayDropped(), bs.RelayNotFound(), true
+		}
+	}
 }
 
 // GetDashboardStats returns aggregate statistics for the dashboard.
