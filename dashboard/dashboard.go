@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -169,6 +170,36 @@ type Callbacks struct {
 	// the dashboard's backup browser. Optional — when nil,
 	// GET /api/admin/backups returns 404.
 	BackupsList func() ([]BackupEntry, error)
+
+	// MembersList returns a snapshot of the membership for the given
+	// network — one entry per node with role, hostname (if registered),
+	// and last-seen unix timestamp. Backs the GET
+	// /api/admin/networks/{id}/members endpoint, which the dashboard's
+	// operator-facing member browser consumes. Optional — when nil, the
+	// endpoint returns 404 so a registry running without membership
+	// admin wiring still serves the rest of the dashboard cleanly.
+	// Errors are returned to the client as 500; protocol.ErrNetworkNotFound
+	// surfaces as 404.
+	MembersList func(netID uint16) ([]MemberSnapshot, error)
+	// MemberKick removes the given node from the network's member list
+	// and role map. The reason string is the operator's audit note (why
+	// the action was taken) and is required — endpoints reject empty
+	// reasons with 400 so post-incident review always has a paper trail.
+	// Backs DELETE /api/admin/networks/{id}/members/{nodeID}?reason=...
+	// Optional — when nil, the endpoint returns 404. Errors surface as
+	// 400 (cannot kick owner, unknown member) or 500 (generic failures);
+	// protocol.ErrNetworkNotFound surfaces as 404.
+	MemberKick func(netID uint16, nodeID uint32, reason string) error
+	// MemberRole updates the per-network role for the given node. Role
+	// must be "admin" or "member" (case-insensitive); anything else
+	// returns 400. Cannot demote the network owner — returns an error
+	// the handler surfaces as 400. Reason is the operator's audit note.
+	// Backs PUT /api/admin/networks/{id}/members/{nodeID}/role.
+	// Optional — when nil, the endpoint returns 404. The role-validation
+	// step is split between the dashboard handler (string accept set)
+	// and the server callback (owner-demotion check) so the wire format
+	// is policed at the edge.
+	MemberRole func(netID uint16, nodeID uint32, role, reason string) error
 }
 
 // ReplicationSnapshot is the wire shape returned by /api/admin/replication-status.
@@ -204,6 +235,17 @@ type NodeSnapshot struct {
 	ID       uint32
 	Hostname string
 	LastSeen time.Time
+}
+
+// MemberSnapshot is one row in the GET /api/admin/networks/{id}/members
+// response. Hostname and LastSeenUnix are omitted when zero so the wire
+// payload stays compact for members that have never registered a
+// hostname or whose last_seen is unknown.
+type MemberSnapshot struct {
+	NodeID       uint32 `json:"node_id"`
+	Role         string `json:"role"`
+	Hostname     string `json:"hostname,omitempty"`
+	LastSeenUnix int64  `json:"last_seen_unix,omitempty"`
 }
 
 // BreakerListEntry is one row in the /api/breakers response. Marshalled
@@ -1414,8 +1456,165 @@ func (h *Handler) Serve(addr string) error {
 		})
 	}))
 
+	// /api/admin/networks/{id}/members[/<nodeID>[/role]]
+	//
+	// Three operator-only endpoints that bypass the protocol's network-role
+	// RBAC: the admin token holder IS the registry operator, so they are
+	// implicitly the highest authority over every network. This is the
+	// path we route to when the network's own owner is unreachable or has
+	// to be force-replaced.
+	//
+	//   GET    /api/admin/networks/{id}/members
+	//   DELETE /api/admin/networks/{id}/members/{nodeID}?reason=...
+	//   PUT    /api/admin/networks/{id}/members/{nodeID}/role  body {"role":"admin|member"}
+	//
+	// Path parsing is done inline (strings.Split on the trimmed tail)
+	// because adding a router dependency for three routes isn't worth it.
+	mux.HandleFunc("/api/admin/networks/", h.requireAdminToken(h.serveMembershipAdmin))
+
 	slog.Info("dashboard listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
+}
+
+// serveMembershipAdmin dispatches the three /api/admin/networks/{id}/members*
+// endpoints. Path parsing is intentionally tolerant — trailing slashes are
+// trimmed, the trailing "role" segment is recognised only for PUT — so a
+// stray slash from a curl invocation doesn't 404.
+func (h *Handler) serveMembershipAdmin(w http.ResponseWriter, r *http.Request) {
+	tail := strings.TrimPrefix(r.URL.Path, "/api/admin/networks/")
+	tail = strings.TrimSuffix(tail, "/")
+	parts := strings.Split(tail, "/")
+	// Expected shapes:
+	//   {id}/members                          → GET list
+	//   {id}/members/{nodeID}                 → DELETE kick
+	//   {id}/members/{nodeID}/role            → PUT set-role
+	if len(parts) < 2 || parts[1] != "members" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	netID64, err := strconv.ParseUint(parts[0], 10, 16)
+	if err != nil {
+		http.Error(w, "bad request: network id must be uint16", http.StatusBadRequest)
+		return
+	}
+	netID := uint16(netID64)
+
+	switch len(parts) {
+	case 2:
+		// GET /api/admin/networks/{id}/members
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.MembersList == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		members, err := h.cb.MembersList(netID)
+		if err != nil {
+			if errors.Is(err, protocol.ErrNetworkNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"network_id": netID,
+			"count":      len(members),
+			"members":    members,
+		})
+
+	case 3:
+		// DELETE /api/admin/networks/{id}/members/{nodeID}
+		if r.Method != http.MethodDelete {
+			w.Header().Set("Allow", "DELETE")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.MemberKick == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		nodeID64, err := strconv.ParseUint(parts[2], 10, 32)
+		if err != nil {
+			http.Error(w, "bad request: node id must be uint32", http.StatusBadRequest)
+			return
+		}
+		reason := strings.TrimSpace(r.URL.Query().Get("reason"))
+		if reason == "" {
+			http.Error(w, "bad request: reason is required", http.StatusBadRequest)
+			return
+		}
+		if err := h.cb.MemberKick(netID, uint32(nodeID64), reason); err != nil {
+			if errors.Is(err, protocol.ErrNetworkNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":         true,
+			"network_id": netID,
+			"node_id":    uint32(nodeID64),
+		})
+
+	case 4:
+		// PUT /api/admin/networks/{id}/members/{nodeID}/role
+		if parts[3] != "role" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodPut && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "PUT")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.MemberRole == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		nodeID64, err := strconv.ParseUint(parts[2], 10, 32)
+		if err != nil {
+			http.Error(w, "bad request: node id must be uint32", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			Role   string `json:"role"`
+			Reason string `json:"reason"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		role := strings.ToLower(strings.TrimSpace(body.Role))
+		if role != "admin" && role != "member" {
+			http.Error(w, "bad request: role must be \"admin\" or \"member\"", http.StatusBadRequest)
+			return
+		}
+		if err := h.cb.MemberRole(netID, uint32(nodeID64), role, body.Reason); err != nil {
+			if errors.Is(err, protocol.ErrNetworkNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":         true,
+			"network_id": netID,
+			"node_id":    uint32(nodeID64),
+			"role":       role,
+		})
+
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
 }
 
 // --------------------------------------------------------------------------
