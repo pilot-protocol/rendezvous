@@ -213,10 +213,27 @@ func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interf
 		return fmt.Errorf("invalid signature encoding: %w", err)
 	}
 	if !crypto.Verify(pubKey, []byte(challenge), sig) {
+		if OnSignatureVerify != nil {
+			OnSignatureVerify(false)
+		}
 		return fmt.Errorf("signature verification failed")
+	}
+	if OnSignatureVerify != nil {
+		OnSignatureVerify(true)
 	}
 	return nil
 }
+
+// OnSignatureVerify, when non-nil, is invoked once per
+// VerifyNodeSignature call (and therefore VerifyHeartbeatSignature)
+// that actually exercises crypto.Verify. The admin-token fallback path
+// is intentionally not counted — the metric tracks signature-verify
+// success rate, not "did the caller authenticate by any means."
+//
+// Set from package server (server_lifecycle.go) to increment the
+// pilot_signature_verify_total{result=...} counter. Left as a
+// package-level hook so authz/ stays free of a metrics import.
+var OnSignatureVerify func(ok bool)
 
 // VerifyHeartbeatSignature is an alias for VerifyNodeSignature with a
 // caller-supplied adminToken (copied before releasing a read lock).

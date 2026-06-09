@@ -915,6 +915,21 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		ws.Start()
 	}
 
+	// Wire the package-level hooks that turn signature-verify outcomes
+	// and rate-limit deny events into Prometheus counter increments.
+	// The hooks are set once at boot; authz/ and accept/ stay free of
+	// any metrics-package import.
+	authzpkg.OnSignatureVerify = func(ok bool) {
+		if ok {
+			s.metrics.SignatureVerify.WithLabel("ok").Inc()
+		} else {
+			s.metrics.SignatureVerify.WithLabel("fail").Inc()
+		}
+	}
+	acceptpkg.OnDeny = func(kind string) {
+		s.metrics.RateLimitDenied.WithLabel(kind).Inc()
+	}
+
 	// Hook registry internals into /metrics so pilot_pubkeys_total,
 	// pilot_wal_size_bytes, pilot_replication_term and
 	// pilot_replication_is_standby render on each scrape. The closure

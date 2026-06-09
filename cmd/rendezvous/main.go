@@ -78,6 +78,8 @@ func main() {
 	mutexProfileFraction := flag.Int("mutex-profile-fraction", 1000, "rate for runtime mutex contention profiling (1/N events sampled; 0 = off). Always-on at low overhead so profile data is available without runtime reconfiguration.")
 	blockProfileRate := flag.Int("block-profile-rate", 10000, "rate for runtime blocking profile in nanoseconds (0 = off). Captures goroutines blocked on chan/select/Cond — same rationale as -mutex-profile-fraction.")
 	wssAddr := flag.String("wss-addr", "", "compat-mode WSS bridge bind address (e.g. ':8443' or '127.0.0.1:8443'). Empty disables. Production deploys put Caddy in front for TLS termination on :443; the Go binary speaks plain WS upstream on this addr.")
+	backupsMaxAge := flag.Duration("backups-max-age", 14*24*time.Hour, "delete auto-generated 'registry-*.json' files under <store-dir>/backups/ older than this. 0 disables age-based pruning.")
+	backupsMaxCount := flag.Int("backups-max-count", 50, "keep at most this many auto-generated 'registry-*.json' backups. 0 disables count-based pruning. Hand-curated files (PRISTINE, RECOVERY, anything not matching 'registry-*.json') are never touched.")
 	flag.Parse()
 
 	if *configPath != "" {
@@ -251,6 +253,19 @@ func main() {
 			}
 			return out, nil
 		})
+
+		// Backup retention sweeper. Default policy: keep 50 most recent
+		// snapshots OR up to 14 days, whichever is more restrictive. The
+		// 2.2 GB of accumulated backups observed on 2026-06-09 in
+		// production is exactly what this prevents going forward.
+		if *backupsMaxAge > 0 || *backupsMaxCount > 0 {
+			go watchBackupsRetention(backupsDir, *backupsMaxAge, *backupsMaxCount, 1*time.Hour, nil)
+			slog.Info("backup retention sweeper started",
+				"path", backupsDir,
+				"max_age", *backupsMaxAge,
+				"max_count", *backupsMaxCount,
+				"interval", "1h")
+		}
 	}
 
 	// Dynamic log-level endpoint: re-installs the default slog handler on
