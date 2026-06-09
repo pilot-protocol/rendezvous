@@ -1546,7 +1546,10 @@ func (h *Handler) serveMembershipAdmin(w http.ResponseWriter, r *http.Request) {
 
 	switch len(parts) {
 	case 2:
-		// GET /api/admin/networks/{id}/members
+		// GET /api/admin/networks/{id}/members[?limit=N&offset=N&q=substring]
+		// Pagination + name search added because the backbone network can
+		// be 200k+ members on a production registry; returning the whole
+		// list would be ~30 MB JSON.
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1565,11 +1568,58 @@ func (h *Handler) serveMembershipAdmin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		total := len(members)
+
+		// Optional substring filter against hostname OR stringified node ID.
+		// Case-insensitive; an empty q is a no-op so the cheap path stays cheap.
+		if q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q"))); q != "" {
+			filtered := make([]MemberSnapshot, 0, len(members))
+			for _, m := range members {
+				if strings.Contains(strings.ToLower(m.Hostname), q) ||
+					strings.Contains(strconv.FormatUint(uint64(m.NodeID), 10), q) {
+					filtered = append(filtered, m)
+				}
+			}
+			members = filtered
+		}
+		filtered := len(members)
+
+		// Limit defaults to 200 (small enough to render fast, large enough
+		// to be useful). Hard-cap at 5000 so a single bad request can't
+		// pull 30 MB.
+		limit := 200
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			if v, perr := strconv.Atoi(raw); perr == nil && v > 0 {
+				limit = v
+			}
+		}
+		if limit > 5000 {
+			limit = 5000
+		}
+		offset := 0
+		if raw := r.URL.Query().Get("offset"); raw != "" {
+			if v, perr := strconv.Atoi(raw); perr == nil && v >= 0 {
+				offset = v
+			}
+		}
+		if offset > len(members) {
+			offset = len(members)
+		}
+		end := offset + limit
+		if end > len(members) {
+			end = len(members)
+		}
+		page := members[offset:end]
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"network_id": netID,
-			"count":      len(members),
-			"members":    members,
+			"network_id":     netID,
+			"count":          len(page),
+			"total":          total,
+			"filtered_total": filtered,
+			"offset":         offset,
+			"limit":          limit,
+			"members":        page,
 		})
 
 	case 3:
