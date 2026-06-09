@@ -5,12 +5,14 @@ package main
 import (
 	"crypto/ed25519"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,7 +21,39 @@ import (
 	"github.com/pilot-protocol/common/logging"
 	registry "github.com/pilot-protocol/rendezvous"
 	"github.com/pilot-protocol/rendezvous/breakers"
+	dashpkgPub "github.com/pilot-protocol/rendezvous/dashboard"
 )
+
+// writeFileAtomic writes data to path via a temp+rename so a concurrent
+// reader (the whitelist watcher) never sees a half-written file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
 
 var version = "dev"
 
@@ -169,7 +203,73 @@ func main() {
 			whitelistPath, 2*time.Second, r.SetRateLimitWhitelist, nil,
 		)
 		slog.Info("rate-limit whitelist watcher started", "path", whitelistPath, "interval", "2s")
+
+		// Wire the dashboard whitelist endpoints onto the same on-disk file
+		// the watcher is polling. The watcher picks up the rewrite on its
+		// next tick (≤2 s), so the limiter is updated without a restart.
+		r.SetWhitelistCallbacks(
+			func() ([]byte, error) {
+				b, err := os.ReadFile(whitelistPath)
+				if err != nil && os.IsNotExist(err) {
+					return []byte("[]"), nil
+				}
+				return b, err
+			},
+			func(data []byte) error {
+				return writeFileAtomic(whitelistPath, data, 0o644)
+			},
+		)
 	}
+
+	// Backups listing — enumerate <store-dir>/backups/*.json so the
+	// dashboard's backup browser can render. Read-only; the endpoint
+	// never opens, downloads, or deletes the files.
+	if *storePath != "" {
+		backupsDir := filepath.Join(filepath.Dir(*storePath), "backups")
+		r.SetBackupsCallback(func() ([]dashpkgPub.BackupEntry, error) {
+			ents, err := os.ReadDir(backupsDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return []dashpkgPub.BackupEntry{}, nil
+				}
+				return nil, err
+			}
+			out := make([]dashpkgPub.BackupEntry, 0, len(ents))
+			for _, e := range ents {
+				if e.IsDir() {
+					continue
+				}
+				info, ierr := e.Info()
+				if ierr != nil {
+					continue
+				}
+				out = append(out, dashpkgPub.BackupEntry{
+					Name:      e.Name(),
+					SizeBytes: info.Size(),
+					ModUnix:   info.ModTime().Unix(),
+				})
+			}
+			return out, nil
+		})
+	}
+
+	// Dynamic log-level endpoint: re-installs the default slog handler on
+	// each write. Reads from currentLogLevel so GET reflects the live value.
+	currentLogLevel := *logLevel
+	r.SetLogLevelCallbacks(
+		func() string { return currentLogLevel },
+		func(level string) error {
+			switch strings.ToLower(level) {
+			case "debug", "info", "warn", "warning", "error":
+				logging.Setup(level, *logFormat)
+				currentLogLevel = strings.ToLower(level)
+				slog.Info("log level changed", "level", currentLogLevel)
+				return nil
+			default:
+				return fmt.Errorf("invalid level %q: must be debug|info|warn|error", level)
+			}
+		},
+	)
 
 	// Breakers watcher. Picks up changes to <store-dir>/breakers.json
 	// every 2 s and atomically reloads named on/off switches into the

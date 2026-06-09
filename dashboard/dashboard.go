@@ -135,6 +135,56 @@ type Callbacks struct {
 	// safe maximum). Optional — when nil, /api/admin/audit/recent
 	// returns an empty list.
 	AuditRecent func(n int) []AuditEntrySnapshot
+
+	// WhitelistGet returns the on-disk rate-limit whitelist as raw JSON
+	// bytes (the exact contents of /var/lib/pilot/rate-limit-whitelist.json).
+	// Optional — when nil, GET /api/admin/whitelist returns 404. When the
+	// file does not exist on disk, the callback should return ([]byte("[]"),
+	// nil) so the editor sees an empty list rather than an error.
+	WhitelistGet func() ([]byte, error)
+	// WhitelistSet atomically replaces the whitelist file with the given
+	// JSON bytes. The on-disk watcher (cmd/rendezvous/whitelist_watcher.go)
+	// picks the change up on its next 2 s poll, so the limiter is updated
+	// without a restart. Optional — when nil, PUT /api/admin/whitelist
+	// returns 405.
+	WhitelistSet func(data []byte) error
+
+	// GetLogLevel returns the current slog level ("debug", "info", "warn",
+	// "error"). Optional — when nil, GET /api/admin/runtime/log-level
+	// returns the static string "unknown".
+	GetLogLevel func() string
+	// SetLogLevel re-installs the default slog handler at the requested
+	// level. The level string must be one of debug/info/warn/error
+	// (case-insensitive); anything else returns an error and the previous
+	// handler is left in place. Optional — when nil, PUT
+	// /api/admin/runtime/log-level returns 405.
+	SetLogLevel func(level string) error
+
+	// ReplicationStatus returns a snapshot of the registry's replication
+	// state — current term, standby flag, replica subscriber count, and
+	// last replica push timestamp. Optional — when nil,
+	// GET /api/admin/replication-status returns 404.
+	ReplicationStatus func() ReplicationSnapshot
+	// BackupsList returns metadata for snapshot backup files. Used to power
+	// the dashboard's backup browser. Optional — when nil,
+	// GET /api/admin/backups returns 404.
+	BackupsList func() ([]BackupEntry, error)
+}
+
+// ReplicationSnapshot is the wire shape returned by /api/admin/replication-status.
+type ReplicationSnapshot struct {
+	Term            uint64 `json:"term"`
+	IsStandby       bool   `json:"is_standby"`
+	Subscribers     int    `json:"subscribers"`
+	LastPushUnix    int64  `json:"last_push_unix,omitempty"`
+	LastPushAgeSecs int64  `json:"last_push_age_secs,omitempty"`
+}
+
+// BackupEntry is the wire shape returned per file by /api/admin/backups.
+type BackupEntry struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
+	ModUnix   int64  `json:"mod_unix"`
 }
 
 // AuditEntrySnapshot is the JSON-friendly shape returned by /api/admin/audit/recent.
@@ -202,6 +252,36 @@ type Handler struct {
 // NewHandler creates a ready-to-use dashboard Handler backed by cb.
 func NewHandler(cb Callbacks) *Handler {
 	return &Handler{cb: cb, badgeLimiter: newIPRateLimiter()}
+}
+
+// SetWhitelistCallbacks wires the GET/PUT /api/admin/whitelist endpoints
+// after construction. The Handler is created early in NewWithStore (before
+// main.go knows the whitelist path), so the cmd-level package installs the
+// callbacks once both pieces exist. Either argument may be nil to leave
+// that direction disabled.
+func (h *Handler) SetWhitelistCallbacks(get func() ([]byte, error), set func([]byte) error) {
+	h.cb.WhitelistGet = get
+	h.cb.WhitelistSet = set
+}
+
+// SetLogLevelCallbacks wires the GET/PUT /api/admin/runtime/log-level
+// endpoints after construction. The level lives in cmd/rendezvous/main.go
+// (alongside logging.Setup) so cannot be set inside NewWithStore.
+func (h *Handler) SetLogLevelCallbacks(get func() string, set func(string) error) {
+	h.cb.GetLogLevel = get
+	h.cb.SetLogLevel = set
+}
+
+// SetReplicationStatus wires the GET /api/admin/replication-status endpoint.
+func (h *Handler) SetReplicationStatus(fn func() ReplicationSnapshot) {
+	h.cb.ReplicationStatus = fn
+}
+
+// SetBackupsList wires the GET /api/admin/backups endpoint. The closure
+// owns the directory path; the dashboard package only enumerates what it
+// returns.
+func (h *Handler) SetBackupsList(fn func() ([]BackupEntry, error)) {
+	h.cb.BackupsList = fn
 }
 
 // --------------------------------------------------------------------------
@@ -1166,6 +1246,172 @@ func (h *Handler) Serve(addr string) error {
 			out["block_rate_ns"] = *body.BlockRateNs
 		}
 		_ = json.NewEncoder(w).Encode(out)
+	}))
+
+	// /api/admin/runtime/log-level: get / set the slog level on the fly.
+	//   GET  /api/admin/runtime/log-level -> {"level":"info"}
+	//   PUT  /api/admin/runtime/log-level body {"level":"debug"} -> {"ok":true,"level":"debug"}
+	// Set is gated on Callbacks.SetLogLevel (nil → 405); get falls back to
+	// "unknown" if GetLogLevel is nil so the UI can still render without
+	// requiring both callbacks.
+	mux.HandleFunc("/api/admin/runtime/log-level", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			lvl := "unknown"
+			if h.cb.GetLogLevel != nil {
+				lvl = h.cb.GetLogLevel()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"level": lvl})
+		case http.MethodPut, http.MethodPost:
+			if h.cb.SetLogLevel == nil {
+				http.Error(w, "log-level setter not configured", http.StatusMethodNotAllowed)
+				return
+			}
+			var body struct {
+				Level string `json:"level"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 256)).Decode(&body); err != nil {
+				http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := h.cb.SetLogLevel(body.Level); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "level": body.Level})
+		default:
+			w.Header().Set("Allow", "GET, PUT")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// /api/admin/whitelist: read / replace the rate-limit whitelist file.
+	//   GET /api/admin/whitelist
+	//     -> raw JSON contents of /var/lib/pilot/rate-limit-whitelist.json
+	//        (the file watcher's on-disk schema: [{"cidr":...,"rate":...}]).
+	//        If the file does not exist, the callback returns []. Either
+	//        way the body is structured as {"entries":[…]} for client
+	//        ergonomics.
+	//   PUT /api/admin/whitelist body {"entries":[…]} or [{"cidr":…,"rate":…}]
+	//     -> {"ok":true,"count":N}
+	//        The body is written atomically (tmp + rename); the existing
+	//        2 s watcher poll picks up the new state without restart.
+	mux.HandleFunc("/api/admin/whitelist", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if h.cb.WhitelistGet == nil {
+				http.Error(w, "whitelist getter not configured", http.StatusNotFound)
+				return
+			}
+			data, err := h.cb.WhitelistGet()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			// Pass-through the array as `entries`. If decode fails (e.g. file
+			// is malformed) return raw with empty entries so the editor can
+			// still recover; the parse error is visible in the body.
+			var entries []map[string]any
+			parseErr := ""
+			if err := json.Unmarshal(data, &entries); err != nil {
+				parseErr = err.Error()
+				entries = []map[string]any{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			out := map[string]interface{}{"entries": entries, "count": len(entries)}
+			if parseErr != "" {
+				out["parse_error"] = parseErr
+				out["raw"] = string(data)
+			}
+			_ = json.NewEncoder(w).Encode(out)
+		case http.MethodPut, http.MethodPost:
+			if h.cb.WhitelistSet == nil {
+				http.Error(w, "whitelist setter not configured", http.StatusMethodNotAllowed)
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if err != nil {
+				http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			// Accept either {"entries":[…]} or a bare array. Re-serialise
+			// to the file watcher's canonical shape (an array of objects)
+			// so the on-disk format is consistent regardless of input shape.
+			var asObj struct {
+				Entries []map[string]any `json:"entries"`
+			}
+			var arr []map[string]any
+			if err := json.Unmarshal(body, &asObj); err == nil && asObj.Entries != nil {
+				arr = asObj.Entries
+			} else if err := json.Unmarshal(body, &arr); err != nil {
+				http.Error(w, "bad request: body must be {entries:[…]} or [{cidr,rate}…]: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			canonical, err := json.MarshalIndent(arr, "", "  ")
+			if err != nil {
+				http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := h.cb.WhitelistSet(canonical); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "count": len(arr)})
+		default:
+			w.Header().Set("Allow", "GET, PUT")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// /api/admin/replication-status: term, role (primary/standby), subscriber
+	// count, last replica push timestamp. Read-only — primary/standby
+	// transitions happen through the existing /api/standby/promote path.
+	mux.HandleFunc("/api/admin/replication-status", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.ReplicationStatus == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		snap := h.cb.ReplicationStatus()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(snap)
+	}))
+
+	// /api/admin/backups: list snapshot backup files (name, size, mtime).
+	// Path is fixed by the operator at boot (typically /var/lib/pilot/backups/);
+	// the endpoint only enumerates — never reads, downloads, or deletes.
+	mux.HandleFunc("/api/admin/backups", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if h.cb.BackupsList == nil {
+			http.Error(w, "not configured", http.StatusNotFound)
+			return
+		}
+		entries, err := h.cb.BackupsList()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var total int64
+		for _, e := range entries {
+			total += e.SizeBytes
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":            len(entries),
+			"total_size_bytes": total,
+			"entries":          entries,
+		})
 	}))
 
 	slog.Info("dashboard listening", "addr", addr)

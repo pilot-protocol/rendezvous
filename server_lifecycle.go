@@ -129,6 +129,26 @@ func (s *Server) SetBannerPath(path string) { s.dashboard.SetBannerPath(path) }
 
 func (s *Server) SetDashboardHTTPAddr(addr string) { s.dashboard.SetHTTPProbeAddr(addr) }
 
+// SetWhitelistCallbacks plugs operator-installable callbacks into the
+// dashboard handler that back GET/PUT /api/admin/whitelist. Called by
+// cmd/rendezvous/main.go once the on-disk whitelist path is known.
+func (s *Server) SetWhitelistCallbacks(get func() ([]byte, error), set func([]byte) error) {
+	s.dashboard.SetWhitelistCallbacks(get, set)
+}
+
+// SetLogLevelCallbacks plugs operator-installable callbacks into the
+// dashboard handler that back GET/PUT /api/admin/runtime/log-level.
+func (s *Server) SetLogLevelCallbacks(get func() string, set func(string) error) {
+	s.dashboard.SetLogLevelCallbacks(get, set)
+}
+
+// SetBackupsCallback plugs the backup-directory enumerator into the
+// dashboard. The closure owns the directory path; only the cmd-level
+// package knows it, so wiring happens after NewWithStore.
+func (s *Server) SetBackupsCallback(fn func() ([]dashpkg.BackupEntry, error)) {
+	s.dashboard.SetBackupsList(fn)
+}
+
 func (s *Server) ServeDashboard(addr string) error { return s.dashboard.Serve(addr) }
 
 // SetClock replaces the time source. Used in tests for deterministic time.
@@ -895,6 +915,41 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		ws.Start()
 	}
 
+	// Hook registry internals into /metrics so pilot_pubkeys_total,
+	// pilot_wal_size_bytes, pilot_replication_term and
+	// pilot_replication_is_standby render on each scrape. The closure
+	// captures s; reads are under s.mu.RLock to stay consistent with the
+	// rest of the API surface.
+	s.metrics.RegistryInternalsFn = func() (uint64, uint64, uint64, bool, bool) {
+		s.mu.RLock()
+		pk := uint64(len(s.pubKeyIdx))
+		term := s.term
+		s.mu.RUnlock()
+		var walSize uint64
+		if s.walStore != nil && s.walStore.WAL() != nil {
+			walSize = uint64(s.walStore.WAL().Size())
+		}
+		standby := s.walStore != nil && s.walStore.IsStandby()
+		return pk, walSize, term, standby, true
+	}
+	// Mirror the same state on the admin endpoint so the dashboard's
+	// replication panel doesn't have to grep the /metrics scrape.
+	replSnap := func() dashpkg.ReplicationSnapshot {
+		s.mu.RLock()
+		term := s.term
+		s.mu.RUnlock()
+		subs := 0
+		if s.replMgr != nil {
+			subs = s.replMgr.SubCount()
+		}
+		standby := s.walStore != nil && s.walStore.IsStandby()
+		return dashpkg.ReplicationSnapshot{
+			Term:        term,
+			IsStandby:   standby,
+			Subscribers: subs,
+		}
+	}
+
 	// Initialize dashboard Handler (R5.1): owns probe state, pulse ring,
 	// maintenance banner, and the HTTP mux. Wired via Callbacks to avoid
 	// circular imports between the server and dashboard packages.
@@ -949,9 +1004,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			allow, _ := s.breakers.Allow(name)
 			return allow, s.breakers.Reason(name)
 		},
-		BreakerList:   s.BreakerList,
-		BreakerSet:    s.BreakerSet,
-		BreakerDelete: s.BreakerDelete,
+		BreakerList:       s.BreakerList,
+		BreakerSet:        s.BreakerSet,
+		BreakerDelete:     s.BreakerDelete,
+		ReplicationStatus: replSnap,
 		AuditRecent: func(n int) []dashpkg.AuditEntrySnapshot {
 			s.auditMu.Lock()
 			ring := make([]AuditEntry, len(s.auditLog))
