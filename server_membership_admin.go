@@ -10,6 +10,39 @@ import (
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 )
 
+// AdminListNetworks returns a snapshot of every network the registry
+// knows about: numeric ID, name, member counts broken down by role, and
+// flags. Powers the dashboard's network picker — the per-metric
+// rollup keyed by label is name-only, but management endpoints need
+// numeric IDs.
+//
+// Read-only, RLock-only. Safe to call concurrently with any handler.
+func (s *Server) AdminListNetworks() []dashpkg.NetworkSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]dashpkg.NetworkSnapshot, 0, len(s.networks))
+	for id, net := range s.networks {
+		entry := dashpkg.NetworkSnapshot{
+			ID:           id,
+			Name:         net.Name,
+			MembersCount: len(net.Members),
+			Enterprise:   net.Enterprise,
+			PolicySet:    len(net.ExprPolicy) > 0,
+		}
+		for _, role := range net.MemberRoles {
+			switch string(role) {
+			case "owner":
+				entry.OwnersCount++
+			case "admin":
+				entry.AdminsCount++
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // AdminListMembers returns a snapshot of every member of the given network
 // along with their role, hostname (if registered), and last-seen unix time.
 // Bypasses the protocol's network-role RBAC: the caller has already been

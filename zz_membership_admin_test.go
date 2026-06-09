@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
+	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	dirpkg "github.com/pilot-protocol/rendezvous/directory"
 )
 
@@ -212,3 +213,37 @@ func TestAdminListMembers_UnknownNetwork(t *testing.T) {
 		t.Fatalf("expected ErrNetworkNotFound, got %v", err)
 	}
 }
+
+// AdminListNetworks surfaces every network with its numeric ID, name,
+// and per-role counts. Sorting is not guaranteed — assert by content.
+func TestAdminListNetworks_ReturnsRollup(t *testing.T) {
+	t.Parallel()
+	s := seedAdminMembershipServer(t)
+
+	out := s.AdminListNetworks()
+	// Find the one we seeded (ID 7); the backbone (ID 0) is created
+	// implicitly by the server and may or may not be present depending
+	// on test setup.
+	var n *NetworkSnapshotAlias
+	for i := range out {
+		if out[i].ID == 7 {
+			n = (*NetworkSnapshotAlias)(&out[i])
+			break
+		}
+	}
+	if n == nil {
+		t.Fatalf("network 7 not in list: %+v", out)
+	}
+	if n.MembersCount != 4 {
+		t.Fatalf("MembersCount = %d, want 4", n.MembersCount)
+	}
+	if n.OwnersCount != 1 {
+		t.Fatalf("OwnersCount = %d, want 1", n.OwnersCount)
+	}
+	if n.AdminsCount != 1 {
+		t.Fatalf("AdminsCount = %d, want 1", n.AdminsCount)
+	}
+}
+
+// Local alias so the test reads naturally without importing dashpkg here.
+type NetworkSnapshotAlias = dashpkg.NetworkSnapshot

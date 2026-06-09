@@ -1023,9 +1023,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		BreakerSet:        s.BreakerSet,
 		BreakerDelete:     s.BreakerDelete,
 		ReplicationStatus: replSnap,
-		MembersList: s.AdminListMembers,
-		MemberKick:  s.AdminKickMember,
-		MemberRole:  s.AdminSetMemberRole,
+		NetworksList: s.AdminListNetworks,
+		MembersList:  s.AdminListMembers,
+		MemberKick:   s.AdminKickMember,
+		MemberRole:   s.AdminSetMemberRole,
 		AuditRecent: func(n int) []dashpkg.AuditEntrySnapshot {
 			s.auditMu.Lock()
 			ring := make([]AuditEntry, len(s.auditLog))
