@@ -470,13 +470,13 @@ func (st *Store) WriteTo(w io.Writer) (int64, error) {
 		writeHelp(&b, "pilot_save_duration_seconds", "Histogram of flushSave wall time. Cliffs in the upper buckets indicate GC pressure or disk contention during snapshot encode.")
 		writeType(&b, "pilot_save_duration_seconds", "histogram")
 		buckets, counts, sum, count := st.SaveDuration.Snapshot()
-		// Cumulative-bucket form per Prometheus convention.
-		var cum uint64
+		// Histogram.Observe already stores cumulative counts in-place
+		// (counts[i] = samples <= buckets[i]). Emit each value directly;
+		// do NOT accumulate again — that double-counts and caused
+		// le="60" to read 59 against a true count of 27 in production.
 		for i, bound := range buckets {
-			cum += counts[i]
-			writeBucketMetricNoLabel(&b, "pilot_save_duration_seconds", bound, cum)
+			writeBucketMetricNoLabel(&b, "pilot_save_duration_seconds", bound, counts[i])
 		}
-		cum += counts[len(counts)-1] // +Inf bucket = total
 		fmt.Fprintf(&b, "pilot_save_duration_seconds_bucket{le=\"+Inf\"} %d\n", count)
 		fmt.Fprintf(&b, "pilot_save_duration_seconds_sum %s\n", FormatFloat(sum))
 		fmt.Fprintf(&b, "pilot_save_duration_seconds_count %d\n", count)
