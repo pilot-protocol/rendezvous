@@ -514,6 +514,13 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		listNodesPerNet: make(map[uint16]*listNodesCacheState),
 		bus:             events.NewInProcessBus(0),
 	}
+	// Bridge bus publishes into the Prometheus counter without having
+	// events/ import metrics/. The type-assert is checked because the
+	// Bus interface only requires Publish; only the in-process impl
+	// supports SetOnPublish.
+	if op, ok := s.bus.(interface{ SetOnPublish(func()) }); ok {
+		op.SetOnPublish(func() { s.metrics.EventBusPublish.Inc() })
+	}
 	s.staleNodeThresholdNs.Store(int64(defaultStaleNodeThreshold))
 	s.accept = acceptpkg.NewAcceptor(defaultMaxConnections, s) // R3.2: accept/TLS/rate-limit layer
 	s.breakers = breakerspkg.New()                             // operator-controllable on/off switches; gated paths consult via Server.Breakers().Allow()
@@ -945,6 +952,29 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		BreakerList:   s.BreakerList,
 		BreakerSet:    s.BreakerSet,
 		BreakerDelete: s.BreakerDelete,
+		AuditRecent: func(n int) []dashpkg.AuditEntrySnapshot {
+			s.auditMu.Lock()
+			ring := make([]AuditEntry, len(s.auditLog))
+			copy(ring, s.auditLog)
+			s.auditMu.Unlock()
+			if n > len(ring) {
+				n = len(ring)
+			}
+			out := make([]dashpkg.AuditEntrySnapshot, 0, n)
+			// Most recent first.
+			for i := len(ring) - 1; i >= 0 && len(out) < n; i-- {
+				e := ring[i]
+				out = append(out, dashpkg.AuditEntrySnapshot{
+					Timestamp: e.Timestamp,
+					Action:    e.Action,
+					NetworkID: e.NetworkID,
+					NodeID:    e.NodeID,
+					Details:   e.Details,
+					Hash:      e.Hash,
+				})
+			}
+			return out
+		},
 	})
 
 	s.releasePoller = newReleasePoller("TeoSlayer/pilotprotocol")

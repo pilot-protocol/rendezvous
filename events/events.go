@@ -65,6 +65,19 @@ type inProcessBus struct {
 	mu          sync.RWMutex
 	subscribers []*subscription
 	bufSize     int
+
+	// OnPublish, if set, is invoked once per Publish call (before fanout).
+	// Used to feed the pilot_event_bus_publish_total counter without
+	// pulling the metrics package into events/.
+	OnPublish func()
+}
+
+// SetOnPublish installs a no-arg callback fired on every Publish. Safe to
+// call before or after subscribers exist. Pass nil to clear.
+func (b *inProcessBus) SetOnPublish(fn func()) {
+	b.mu.Lock()
+	b.OnPublish = fn
+	b.mu.Unlock()
 }
 
 type subscription struct {
@@ -84,6 +97,9 @@ func (b *inProcessBus) Publish(evt Event) {
 	// and the select, causing a send-on-closed-channel panic.
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	if b.OnPublish != nil {
+		b.OnPublish()
+	}
 	for _, s := range b.subscribers {
 		if !matchPattern(s.pattern, evt.Type) {
 			continue

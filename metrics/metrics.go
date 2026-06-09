@@ -245,6 +245,28 @@ type Store struct {
 	WalErrors    Counter // pilot_wal_errors_total
 	SaveFailures Counter // pilot_save_failures_total
 
+	// Save lifecycle — one tick per flushSave call
+	SaveTotal           Counter    // pilot_save_total
+	SaveLastUnixSeconds Gauge      // pilot_save_last_unix_seconds — Unix s of last successful save
+	SaveDuration        *Histogram // pilot_save_duration_seconds — wall time per flushSave
+
+	// Per-action audit breakdown (label = action)
+	AuditActions *CounterVec // pilot_audit_action_total{action="..."}
+
+	// Signature verify outcomes (label = result: ok|fail)
+	SignatureVerify *CounterVec // pilot_signature_verify_total{result="..."}
+
+	// Event-bus publish total (single hot path, no labels)
+	EventBusPublish Counter // pilot_event_bus_publish_total
+
+	// Rate-limit denials by kind (label = kind: ip|punch|relay|discover)
+	RateLimitDenied *CounterVec // pilot_ratelimit_denied_total{kind="..."}
+
+	// BeaconStatsFn surfaces the beacon's atomic relay counters when wired.
+	// nil when no beacon is attached; the scrape omits the metrics in that
+	// case so a registry without a beacon doesn't read as 0 traffic.
+	BeaconStatsFn func() (forwarded, dropped, notFound uint64, ok bool)
+
 	// Per-network metrics (computed on scrape, for Grafana dashboards)
 	networkMetricsMu sync.Mutex
 	NetworkMetrics   []NetworkMetricSnapshot
@@ -285,6 +307,14 @@ func (st *Store) GetNetworkMetrics() []NetworkMetricSnapshot {
 	return st.NetworkMetrics
 }
 
+// SaveDurationBuckets bracket the typical flushSave wall time for a
+// production-sized snapshot. At 220k+ nodes we see ~1.5 s steady-state and
+// up to ~5 s under heavy concurrent load; the long buckets catch the
+// occasional cliff so an operator can spot it.
+var SaveDurationBuckets = []float64{
+	0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10, 30, 60,
+}
+
 // NewStore creates a new Store with all vecs initialized.
 func NewStore(panicCountFn func() uint64) *Store {
 	return &Store{
@@ -292,6 +322,10 @@ func NewStore(panicCountFn func() uint64) *Store {
 		RequestDuration: NewHistogramVec(DefaultDurationBuckets),
 		ErrorsTotal:     NewCounterVec(),
 		RbacOps:         NewCounterVec(),
+		AuditActions:    NewCounterVec(),
+		SignatureVerify: NewCounterVec(),
+		RateLimitDenied: NewCounterVec(),
+		SaveDuration:    NewHistogram(SaveDurationBuckets),
 		PanicCountFn:    panicCountFn,
 	}
 }
@@ -416,6 +450,80 @@ func (st *Store) WriteTo(w io.Writer) (int64, error) {
 		panicCount = float64(st.PanicCountFn())
 	}
 	writeMetric(&b, "pilot_recovered_panics_total", panicCount)
+
+	// --- Save lifecycle ---
+	writeHelp(&b, "pilot_save_total", "flushSave() invocations that completed (success). Pair with pilot_save_failures_total for total attempts.")
+	writeType(&b, "pilot_save_total", "counter")
+	writeMetric(&b, "pilot_save_total", st.SaveTotal.Get())
+
+	writeHelp(&b, "pilot_save_last_unix_seconds", "Unix timestamp of the most recent successful flushSave. (now - this) gives save age in seconds; alert if it exceeds 2× save_interval.")
+	writeType(&b, "pilot_save_last_unix_seconds", "gauge")
+	writeMetric(&b, "pilot_save_last_unix_seconds", st.SaveLastUnixSeconds.Get())
+
+	if st.SaveDuration != nil {
+		writeHelp(&b, "pilot_save_duration_seconds", "Histogram of flushSave wall time. Cliffs in the upper buckets indicate GC pressure or disk contention during snapshot encode.")
+		writeType(&b, "pilot_save_duration_seconds", "histogram")
+		buckets, counts, sum, count := st.SaveDuration.Snapshot()
+		// Cumulative-bucket form per Prometheus convention.
+		var cum uint64
+		for i, bound := range buckets {
+			cum += counts[i]
+			writeBucketMetricNoLabel(&b, "pilot_save_duration_seconds", bound, cum)
+		}
+		cum += counts[len(counts)-1] // +Inf bucket = total
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_bucket{le=\"+Inf\"} %d\n", count)
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_sum %s\n", FormatFloat(sum))
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_count %d\n", count)
+	}
+
+	// --- Per-action audit breakdown ---
+	if st.AuditActions != nil {
+		writeHelp(&b, "pilot_audit_action_total", "Audit events emitted, broken down by action name (e.g. node.re_registered, trust.created).")
+		writeType(&b, "pilot_audit_action_total", "counter")
+		for _, lv := range st.AuditActions.Snapshot() {
+			writeLabeledMetric(&b, "pilot_audit_action_total", "action", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Signature verify outcomes ---
+	if st.SignatureVerify != nil {
+		writeHelp(&b, "pilot_signature_verify_total", "Ed25519 signature verification outcomes (result=ok|fail). Non-zero fail rate indicates malformed clients, replay attempts, or version-mismatched signers.")
+		writeType(&b, "pilot_signature_verify_total", "counter")
+		for _, lv := range st.SignatureVerify.Snapshot() {
+			writeLabeledMetric(&b, "pilot_signature_verify_total", "result", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Event-bus publish total ---
+	writeHelp(&b, "pilot_event_bus_publish_total", "Total events published to the in-process event bus. Tracks fan-out load and helps correlate spikes with downstream subscriber latency.")
+	writeType(&b, "pilot_event_bus_publish_total", "counter")
+	writeMetric(&b, "pilot_event_bus_publish_total", st.EventBusPublish.Get())
+
+	// --- Rate-limit denied (labeled) ---
+	if st.RateLimitDenied != nil {
+		writeHelp(&b, "pilot_ratelimit_denied_total", "Requests rejected by a rate limiter, broken down by kind. Sustained non-zero rate from a single client IP suggests abuse; from many clients suggests the limit needs tuning.")
+		writeType(&b, "pilot_ratelimit_denied_total", "counter")
+		for _, lv := range st.RateLimitDenied.Snapshot() {
+			writeLabeledMetric(&b, "pilot_ratelimit_denied_total", "kind", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Beacon relay counters (only when a beacon is attached) ---
+	if st.BeaconStatsFn != nil {
+		if fwd, drp, nfd, ok := st.BeaconStatsFn(); ok {
+			writeHelp(&b, "pilot_beacon_relay_forwarded_total", "UDP relay packets delivered to their destination by the beacon.")
+			writeType(&b, "pilot_beacon_relay_forwarded_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_forwarded_total", float64(fwd))
+
+			writeHelp(&b, "pilot_beacon_relay_dropped_total", "UDP relay packets dropped because the relay queue was full (back-pressure).")
+			writeType(&b, "pilot_beacon_relay_dropped_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_dropped_total", float64(drp))
+
+			writeHelp(&b, "pilot_beacon_relay_not_found_total", "UDP relay packets addressed to a node the beacon has no route for. High rate suggests stale client routing tables or aggressive node reaping.")
+			writeType(&b, "pilot_beacon_relay_not_found_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_not_found_total", float64(nfd))
+		}
+	}
 
 	// --- Network gauges ---
 	writeHelp(&b, "pilot_networks_total", "Total number of networks (excluding backbone).")
@@ -569,6 +677,13 @@ func writeBucketMetric(b *strings.Builder, name, labelKey, labelVal string, le f
 
 func writeBucketInf(b *strings.Builder, name, labelKey, labelVal string, count uint64) {
 	fmt.Fprintf(b, "%s_bucket{%s=%q,le=\"+Inf\"} %d\n", name, labelKey, labelVal, count)
+}
+
+// writeBucketMetricNoLabel emits a histogram bucket for a metric with no
+// labels. Used by single-instance histograms like pilot_save_duration_seconds
+// where the only dimension is the bucket boundary.
+func writeBucketMetricNoLabel(b *strings.Builder, name string, le float64, count uint64) {
+	fmt.Fprintf(b, "%s_bucket{le=%q} %d\n", name, FormatFloat(le), count)
 }
 
 // FormatFloat formats a float64 for Prometheus output.
