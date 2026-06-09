@@ -45,9 +45,10 @@ type dispatcher struct {
 	closeOnce      sync.Once
 	closed         chan struct{}
 	nextID         atomic.Uint64
-	dropped        atomic.Uint64
-	failed         atomic.Uint64
-	delivered      atomic.Uint64
+	dropped         atomic.Uint64
+	failed          atomic.Uint64
+	delivered       atomic.Uint64
+	lastAttemptUnix atomic.Int64 // Unix seconds of the most recent post() — surfaced via Store.Stats()
 	initialBackoff time.Duration
 	secret         string // HMAC-SHA256 pre-shared secret (empty = no sig)
 
@@ -141,6 +142,9 @@ func (d *dispatcher) run() {
 }
 
 func (d *dispatcher) post(ev *Event) {
+	// Record the attempt timestamp BEFORE the marshal so a body-too-large
+	// or marshal-broken event still updates the freshness signal.
+	d.lastAttemptUnix.Store(time.Now().Unix())
 	body, err := json.Marshal(ev)
 	if err != nil {
 		slog.Warn("registry webhook marshal error", "action", ev.Action, "error", err)
@@ -286,6 +290,31 @@ func (st *Store) SetInitialBackoff(d time.Duration) {
 	if st.disp != nil {
 		st.disp.initialBackoff = d
 	}
+}
+
+// Stats returns the current delivery + failure + drop counters and the
+// Unix-seconds timestamp of the most recent delivery attempt. ok=false
+// when no dispatcher is currently configured (no URL set); the metrics
+// layer omits the per-webhook counters in that case so a registry
+// without a configured webhook doesn't render zeroes.
+//
+// All four atomic loads are independent — this is a snapshot, not a
+// transaction. Within a single scrape that is sufficient.
+func (st *Store) Stats() (delivered, failed, dropped uint64, lastUnix int64, ok bool) {
+	if st == nil {
+		return 0, 0, 0, 0, false
+	}
+	st.mu.RLock()
+	d := st.disp
+	st.mu.RUnlock()
+	if d == nil {
+		return 0, 0, 0, 0, false
+	}
+	return d.delivered.Load(),
+		d.failed.Load(),
+		d.dropped.Load(),
+		d.lastAttemptUnix.Load(),
+		true
 }
 
 // Emit is a no-op when no webhook URL is configured or the store is nil.
