@@ -541,6 +541,20 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 	if op, ok := s.bus.(interface{ SetOnPublish(func()) }); ok {
 		op.SetOnPublish(func() { s.metrics.EventBusPublish.Inc() })
 	}
+	// Per-source-type breakdown so operators can see what's actually
+	// flowing through the bus (membership.changed vs trust.created vs
+	// audit.entry). Source and Type both come from the publisher.
+	if op, ok := s.bus.(interface{ SetOnPublishEvent(func(events.Event)) }); ok {
+		op.SetOnPublishEvent(func(evt events.Event) {
+			label := evt.Source + "." + evt.Type
+			s.metrics.EventBusPublishByType.WithLabel(label).Inc()
+		})
+	}
+	// Webhook stats — polled at scrape time. Returns ok=false when no
+	// URL is configured so the metrics block is omitted entirely.
+	s.metrics.WebhookStatsFn = func() (delivered, failed, dropped uint64, lastUnix int64, ok bool) {
+		return s.webhook.Stats()
+	}
 	s.staleNodeThresholdNs.Store(int64(defaultStaleNodeThreshold))
 	s.accept = acceptpkg.NewAcceptor(defaultMaxConnections, s) // R3.2: accept/TLS/rate-limit layer
 	s.breakers = breakerspkg.New()                             // operator-controllable on/off switches; gated paths consult via Server.Breakers().Allow()

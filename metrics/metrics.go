@@ -259,6 +259,23 @@ type Store struct {
 	// Event-bus publish total (single hot path, no labels)
 	EventBusPublish Counter // pilot_event_bus_publish_total
 
+	// Event-bus publish broken down by "source.type" so operators can see
+	// what's actually flowing through the bus (membership.changed vs
+	// trust.created vs audit.entry vs ...). Label is the concatenated
+	// dot-namespaced event name from the publisher.
+	EventBusPublishByType *CounterVec // pilot_event_bus_publish_by_type_total{event="..."}
+
+	// Webhook delivery counters — per-outcome counter vec + last delivery
+	// timestamp. Lets operators see whether the configured webhook is
+	// actually firing and whether deliveries are succeeding.
+	WebhookDeliveries *CounterVec // pilot_webhook_deliveries_total{result="ok|error"} (declared, populated from WebhookStatsFn at scrape time)
+	WebhookLastUnix   Gauge       // pilot_webhook_last_delivery_unix_seconds
+
+	// WebhookStatsFn surfaces the webhook store's atomic counters at
+	// scrape time. ok=false (no URL configured) → the webhook block is
+	// omitted entirely, same as BeaconStatsFn. Source in webhook.Stats().
+	WebhookStatsFn func() (delivered, failed, dropped uint64, lastUnix int64, ok bool)
+
 	// Rate-limit denials by kind (label = kind: ip|punch|relay|discover)
 	RateLimitDenied *CounterVec // pilot_ratelimit_denied_total{kind="..."}
 
@@ -328,10 +345,12 @@ func NewStore(panicCountFn func() uint64) *Store {
 		RequestDuration: NewHistogramVec(DefaultDurationBuckets),
 		ErrorsTotal:     NewCounterVec(),
 		RbacOps:         NewCounterVec(),
-		AuditActions:    NewCounterVec(),
-		SignatureVerify: NewCounterVec(),
-		RateLimitDenied: NewCounterVec(),
-		SaveDuration:    NewHistogram(SaveDurationBuckets),
+		AuditActions:          NewCounterVec(),
+		SignatureVerify:       NewCounterVec(),
+		RateLimitDenied:       NewCounterVec(),
+		EventBusPublishByType: NewCounterVec(),
+		WebhookDeliveries:     NewCounterVec(),
+		SaveDuration:          NewHistogram(SaveDurationBuckets),
 		PanicCountFn:    panicCountFn,
 	}
 }
@@ -504,6 +523,30 @@ func (st *Store) WriteTo(w io.Writer) (int64, error) {
 	writeHelp(&b, "pilot_event_bus_publish_total", "Total events published to the in-process event bus. Tracks fan-out load and helps correlate spikes with downstream subscriber latency.")
 	writeType(&b, "pilot_event_bus_publish_total", "counter")
 	writeMetric(&b, "pilot_event_bus_publish_total", st.EventBusPublish.Get())
+
+	// --- Event-bus publish broken down by "source.type" ---
+	if st.EventBusPublishByType != nil {
+		writeHelp(&b, "pilot_event_bus_publish_by_type_total", "Event-bus publish counter broken down by 'source.type' label (e.g. membership.changed, trust.created, audit.entry). Lets operators see what kinds of events are flowing through the bus and at what rate.")
+		writeType(&b, "pilot_event_bus_publish_by_type_total", "counter")
+		for _, lv := range st.EventBusPublishByType.Snapshot() {
+			writeLabeledMetric(&b, "pilot_event_bus_publish_by_type_total", "event", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Webhook deliveries ---
+	if st.WebhookStatsFn != nil {
+		if delivered, failed, dropped, lastUnix, ok := st.WebhookStatsFn(); ok {
+			writeHelp(&b, "pilot_webhook_deliveries_total", "HTTP webhook delivery attempts, broken down by result (ok|error|dropped). Only present when a webhook URL is configured.")
+			writeType(&b, "pilot_webhook_deliveries_total", "counter")
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "ok", float64(delivered))
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "error", float64(failed))
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "dropped", float64(dropped))
+
+			writeHelp(&b, "pilot_webhook_last_delivery_unix_seconds", "Unix timestamp of the most recent webhook delivery attempt (success or failure). (now - this) gives the age; alert when this stops moving on a configured webhook.")
+			writeType(&b, "pilot_webhook_last_delivery_unix_seconds", "gauge")
+			writeMetric(&b, "pilot_webhook_last_delivery_unix_seconds", float64(lastUnix))
+		}
+	}
 
 	// --- Rate-limit denied (labeled) ---
 	if st.RateLimitDenied != nil {

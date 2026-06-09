@@ -68,8 +68,14 @@ type inProcessBus struct {
 
 	// OnPublish, if set, is invoked once per Publish call (before fanout).
 	// Used to feed the pilot_event_bus_publish_total counter without
-	// pulling the metrics package into events/.
+	// pulling the metrics package into events/. Kept for backward
+	// compatibility — prefer OnPublishEvent for new wiring.
 	OnPublish func()
+
+	// OnPublishEvent, if set, is invoked once per Publish call with the
+	// full event so subscribers can label per-counter writes by Source
+	// and Type. Fires alongside OnPublish — both run if both are set.
+	OnPublishEvent func(Event)
 }
 
 // SetOnPublish installs a no-arg callback fired on every Publish. Safe to
@@ -77,6 +83,15 @@ type inProcessBus struct {
 func (b *inProcessBus) SetOnPublish(fn func()) {
 	b.mu.Lock()
 	b.OnPublish = fn
+	b.mu.Unlock()
+}
+
+// SetOnPublishEvent installs the labeled-event variant. Same lock + nil
+// semantics as SetOnPublish. The two hooks are independent — installing
+// one does not clear the other.
+func (b *inProcessBus) SetOnPublishEvent(fn func(Event)) {
+	b.mu.Lock()
+	b.OnPublishEvent = fn
 	b.mu.Unlock()
 }
 
@@ -99,6 +114,9 @@ func (b *inProcessBus) Publish(evt Event) {
 	defer b.mu.RUnlock()
 	if b.OnPublish != nil {
 		b.OnPublish()
+	}
+	if b.OnPublishEvent != nil {
+		b.OnPublishEvent(evt)
 	}
 	for _, s := range b.subscribers {
 		if !matchPattern(s.pattern, evt.Type) {

@@ -449,6 +449,66 @@ func TestWriteToRendersEventBusPublish(t *testing.T) {
 	}
 }
 
+// EventBusPublishByType — the new CounterVec renders one labeled line
+// per "source.type" pair the publisher emitted.
+func TestWriteToRendersEventBusPublishByType(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.EventBusPublishByType.WithLabel("membership.changed").Inc()
+	st.EventBusPublishByType.WithLabel("membership.changed").Inc()
+	st.EventBusPublishByType.WithLabel("server.audit.entry").Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"# TYPE pilot_event_bus_publish_by_type_total counter",
+		`pilot_event_bus_publish_by_type_total{event="membership.changed"} 2`,
+		`pilot_event_bus_publish_by_type_total{event="server.audit.entry"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// WebhookStatsFn — when ok=false, the webhook block is omitted; when
+// ok=true, all three result labels + the last-delivery gauge render.
+func TestWriteToWebhookStatsFnGating(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.WebhookStatsFn = func() (uint64, uint64, uint64, int64, bool) { return 0, 0, 0, 0, false }
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(buf.String(), "pilot_webhook_deliveries_total") {
+		t.Fatalf("webhook block should be omitted when ok=false")
+	}
+
+	st2 := NewStore(nil)
+	st2.WebhookStatsFn = func() (uint64, uint64, uint64, int64, bool) {
+		return 42, 3, 1, 1700000000, true
+	}
+	buf.Reset()
+	if _, err := st2.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		`pilot_webhook_deliveries_total{result="ok"} 42`,
+		`pilot_webhook_deliveries_total{result="error"} 3`,
+		`pilot_webhook_deliveries_total{result="dropped"} 1`,
+		"pilot_webhook_last_delivery_unix_seconds 1700000000",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
 // BeaconStatsFn — when ok=false, the relay block is skipped; when ok=true,
 // all three relay counters render.
 func TestWriteToBeaconStatsFnGating(t *testing.T) {
