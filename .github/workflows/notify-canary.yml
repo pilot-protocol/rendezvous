@@ -1,5 +1,15 @@
 name: Notify Canary
 
+# Dispatches a component-changed event to pilot-canary so it rebuilds
+# itself with this repo's latest commit. Matches the canonical
+# DISPATCHER TEMPLATE used by other source-component repos
+# (handshake, beacon, policy, ...).
+#
+# Set repo secret CANARY_DISPATCH_TOKEN to a PAT with the
+# `repo` + `workflow` scopes to enable dispatching. Without the
+# secret the workflow logs a notice and exits 0 — it never fails
+# CI on a credential that's intentionally not committed.
+
 on:
   push:
     branches: [main]
@@ -7,23 +17,42 @@ on:
     workflows: [CI]
     types: [completed]
 
-# PILOT-113: explicit minimal permissions. Default GITHUB_TOKEN scope
-# is write-all; this workflow only needs to read the repo and dispatch
-# an external event using a PAT secret.
 permissions:
   contents: read
 
 jobs:
-  notify:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+  dispatch:
+    # Skip when this run is the workflow_run trigger and the upstream
+    # CI failed — there's nothing useful to dispatch in that case.
+    # On the direct push trigger event.workflow_run is null and the
+    # condition is true.
+    if: ${{ github.event.workflow_run == null || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v9
-        with:
-          script: |
-            await github.rest.repos.createDispatchEvent({
-              owner: 'pilot-protocol',
-              repo: 'pilot-canary',
-              event_type: 'canary-build',
-              client_payload: { repo: 'rendezvous', ref: context.sha }
-            });
+      - name: Check token presence
+        id: token_check
+        env:
+          TOKEN: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "::notice::CANARY_DISPATCH_TOKEN not set in repo secrets — skipping canary dispatch"
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch repository_dispatch to pilot-canary
+        if: steps.token_check.outputs.have_token == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CANARY_DISPATCH_TOKEN }}
+          COMPONENT: rendezvous
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching: component=$COMPONENT  ref=$REF"
+          gh api -X POST /repos/pilot-protocol/pilot-canary/dispatches \
+            -f event_type=component-changed \
+            -f client_payload[component]="$COMPONENT" \
+            -f client_payload[ref]="$REF" \
+            -f client_payload[source_repo]="${{ github.repository }}" \
+            -f client_payload[source_sha]="${{ github.sha }}"
