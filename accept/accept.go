@@ -118,7 +118,12 @@ func (ls *logSampler) Cleanup() {
 // ── Rate limiter ──────────────────────────────────────────────────────────────
 
 // globalRateBucket caps total requests per second process-wide.
+//
+// allow is called concurrently from every Acceptor connection-handler
+// goroutine, so the bucket's mutable state (tokens, lastFill) is guarded
+// by mu. Without it the token refill is a read-modify-write race.
 type globalRateBucket struct {
+	mu       sync.Mutex
 	tokens   float64
 	rate     float64
 	maxFill  float64
@@ -130,6 +135,8 @@ func newGlobalRateBucket(rate float64) *globalRateBucket {
 }
 
 func (gb *globalRateBucket) allow(now time.Time) bool {
+	gb.mu.Lock()
+	defer gb.mu.Unlock()
 	elapsed := now.Sub(gb.lastFill).Seconds()
 	gb.tokens += elapsed * gb.rate
 	if gb.tokens > gb.maxFill {
