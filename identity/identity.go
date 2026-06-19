@@ -25,10 +25,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pilot-protocol/common/protocol"
-	"github.com/pilot-protocol/rendezvous/events"
-	"github.com/pilot-protocol/common/registry/wire"
+	"github.com/pilot-protocol/common/badgeverify"
 	pilotcrypto "github.com/pilot-protocol/common/crypto"
+	"github.com/pilot-protocol/common/protocol"
+	"github.com/pilot-protocol/common/registry/wire"
+	"github.com/pilot-protocol/rendezvous/events"
 )
 
 // BlueprintIdentityProvider is a type alias so callers don't need to import wire.
@@ -107,6 +108,25 @@ type NodeView interface {
 	// Returns the old external ID. ok is false if the node does not exist.
 	UpdateNodeExternalID(id uint32, externalID string) (oldID string, ok bool)
 
+	// SubmitBadge stores a verified-address badge (and its signature) on a
+	// node so lookups can surface verified status. ok is false if the node
+	// does not exist.
+	SubmitBadge(id uint32, badge, badgeSig, provider string, verifiedAt time.Time) (ok bool)
+
+	// SetRecoveryEnrollment records the opaque identity commitment that a
+	// later recovery must match. ok is false if the node does not exist.
+	SetRecoveryEnrollment(id uint32, commitment, provider string) (ok bool)
+
+	// GetRecoveryEnrollment returns the stored recovery commitment for a
+	// node. ok is false if the node does not exist or is not enrolled.
+	GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool)
+
+	// ForceRotateKey swaps a node's public key WITHOUT requiring the old
+	// key — used only by identity recovery, whose authorization comes from a
+	// cold-key-signed recovery statement, not the old key. Returns the old
+	// public key (base64). Returns protocol.ErrNodeNotFound if absent.
+	ForceRotateKey(id uint32, newPubKey []byte, rotatedAt time.Time) (oldPubKeyB64 string, err error)
+
 	// NodeIsEnterprise returns true if the node belongs to at least one
 	// enterprise-flagged network.
 	NodeIsEnterprise(id uint32) bool
@@ -162,20 +182,39 @@ type Store struct {
 	nodes NodeView
 	cb    Callbacks
 
-	mu                  sync.RWMutex
-	identityWebhookURL  string
+	mu                    sync.RWMutex
+	identityWebhookURL    string
 	identityWebhookSecret string
-	idpConfig           *BlueprintIdentityProvider
+	idpConfig             *BlueprintIdentityProvider
 
 	jwksCache *JWKSCache
+
+	// consumedNonces tracks recovery-authorization nonces that have already
+	// been redeemed, keyed to their expiry, so a recovery statement cannot
+	// be replayed. Pruned lazily on each recovery. In-memory: recovery
+	// statements are minutes-lived, so a restart's replay window is bounded
+	// by the statement's own exp (hardening TODO: persist via snapshot).
+	nonceMu        sync.Mutex
+	consumedNonces map[string]time.Time
+
+	// Credential verifiers, indirected so tests can stub them (the real
+	// ones verify against badgeverify's compiled-in pinned keyrings, which
+	// hold all-zero placeholders outside a release build).
+	verifyBadge      func(badge, sig string, nodeID uint32) (badgeverify.Badge, error)
+	verifyEnrollment func(statement, sig string) (badgeverify.Enrollment, error)
+	verifyRecovery   func(statement, sig string) (badgeverify.Recovery, error)
 }
 
 // NewStore creates an empty, ready-to-use Store.
 func NewStore(nodes NodeView, cb Callbacks) *Store {
 	return &Store{
-		nodes:     nodes,
-		cb:        cb,
-		jwksCache: NewJWKSCache(),
+		nodes:            nodes,
+		cb:               cb,
+		jwksCache:        NewJWKSCache(),
+		consumedNonces:   make(map[string]time.Time),
+		verifyBadge:      badgeverify.VerifyForNode,
+		verifyEnrollment: badgeverify.VerifyEnrollment,
+		verifyRecovery:   badgeverify.VerifyRecovery,
 	}
 }
 

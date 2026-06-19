@@ -27,6 +27,12 @@ type fakeNode struct {
 	networks   []uint16
 	externalID string
 	owner      string
+	badge      string
+	badgeSig   string
+	provider   string
+	verifiedAt time.Time
+	recCommit  string
+	recProv    string
 }
 
 func (v *fakeNodeView) LookupNodeKey(id uint32) ([]byte, bool) {
@@ -61,6 +67,41 @@ func (v *fakeNodeView) VerifyHeartbeatSignature([]byte, string, map[string]inter
 	return nil
 }
 func (v *fakeNodeView) Now() time.Time { return time.Now() }
+func (v *fakeNodeView) SubmitBadge(id uint32, badge, badgeSig, provider string, at time.Time) bool {
+	n, ok := v.nodes[id]
+	if !ok {
+		return false
+	}
+	n.badge, n.badgeSig, n.provider, n.verifiedAt = badge, badgeSig, provider, at
+	v.nodes[id] = n
+	return true
+}
+func (v *fakeNodeView) SetRecoveryEnrollment(id uint32, commitment, provider string) bool {
+	n, ok := v.nodes[id]
+	if !ok {
+		return false
+	}
+	n.recCommit, n.recProv = commitment, provider
+	v.nodes[id] = n
+	return true
+}
+func (v *fakeNodeView) GetRecoveryEnrollment(id uint32) (string, string, bool) {
+	n, ok := v.nodes[id]
+	if !ok || n.recCommit == "" {
+		return "", "", false
+	}
+	return n.recCommit, n.recProv, true
+}
+func (v *fakeNodeView) ForceRotateKey(id uint32, newPubKey []byte, at time.Time) (string, error) {
+	n, ok := v.nodes[id]
+	if !ok {
+		return "", nil
+	}
+	old := string(n.pubKey)
+	n.pubKey = newPubKey
+	v.nodes[id] = n
+	return old, nil
+}
 
 func newTestStore() *Store {
 	return NewStore(&fakeNodeView{nodes: map[uint32]fakeNode{}}, Callbacks{
