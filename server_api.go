@@ -10,10 +10,10 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	identpkg "github.com/pilot-protocol/rendezvous/identity"
 	walpkg "github.com/pilot-protocol/rendezvous/wal"
-	"github.com/pilot-protocol/common/crypto"
 )
 
 // ConnCount returns the current number of active connections (for testing).
@@ -421,6 +421,73 @@ func (s *Server) UpdateNodeExternalID(id uint32, externalID string) (oldID strin
 	node.ExternalID = externalID
 	sh.Unlock()
 	return oldID, true
+}
+
+// SubmitBadge satisfies identpkg.NodeView. Stores a verified-address badge.
+func (s *Server) SubmitBadge(id uint32, badge, badgeSig, provider string, verifiedAt time.Time) (ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.Badge = badge
+	node.BadgeSig = badgeSig
+	node.VerificationProvider = provider
+	node.VerifiedAt = verifiedAt
+	sh.Unlock()
+	return true
+}
+
+// SetRecoveryEnrollment satisfies identpkg.NodeView. Records the opaque
+// identity commitment a future recovery must match.
+func (s *Server) SetRecoveryEnrollment(id uint32, commitment, provider string) (ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.RecoveryCommitment = commitment
+	node.RecoveryProvider = provider
+	sh.Unlock()
+	return true
+}
+
+// GetRecoveryEnrollment satisfies identpkg.NodeView.
+func (s *Server) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	node, exists := s.nodes[id]
+	if !exists || node.RecoveryCommitment == "" {
+		return "", "", false
+	}
+	return node.RecoveryCommitment, node.RecoveryProvider, true
+}
+
+// ForceRotateKey satisfies identpkg.NodeView. Swaps the public key WITHOUT
+// an old-key stale-check — used only by identity recovery, authorized by a
+// cold-key-signed recovery statement rather than the old key.
+func (s *Server) ForceRotateKey(id uint32, newPubKey []byte, rotatedAt time.Time) (oldPubKeyB64 string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, ok := s.nodes[id]
+	if !ok {
+		return "", fmt.Errorf("node %d: %w", id, protocol.ErrNodeNotFound)
+	}
+	oldPubKeyB64 = crypto.EncodePublicKey(node.PublicKey)
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.PublicKey = newPubKey
+	node.SetLastSeen(rotatedAt)
+	node.KeyMeta.RotatedAt = rotatedAt
+	node.KeyMeta.RotateCount++
+	sh.Unlock()
+	return oldPubKeyB64, nil
 }
 
 // NodeIsEnterprise satisfies identpkg.NodeView. Returns true if the node belongs

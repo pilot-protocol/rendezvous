@@ -21,9 +21,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/registry/wire"
-	"github.com/pilot-protocol/common/crypto"
 )
 
 // --------------------------------------------------------------------------
@@ -73,6 +73,17 @@ type NodeInfo struct {
 	ExternalID string
 	Version    string
 	RelayOnly  bool
+
+	// Verified-address badge (offline-verifiable; carries no raw identity).
+	Badge                string
+	BadgeSig             string
+	VerificationProvider string
+	VerifiedAt           time.Time
+
+	// Recovery enrollment: opaque commitment (HMAC of the external identity)
+	// that a cold-key-signed recovery must match. Raw identity never stored.
+	RecoveryCommitment string
+	RecoveryProvider   string
 
 	// LastSeenNano stores time.UnixNano() for lock-free heartbeat updates.
 	LastSeenNano atomic.Int64
@@ -448,8 +459,19 @@ func (st *Store) PerNetworkListNodesCached(netID uint16) ([]byte, error) {
 			if len(node.Tags) > 0 {
 				entry["tags"] = node.Tags
 			}
-			if node.ExternalID != "" {
-				entry["external_id"] = node.ExternalID
+			// Privacy: the raw external identity is NOT exposed on this open
+			// (per-network) listing. Surface only the offline-verifiable badge,
+			// which carries no identity.
+			if node.Badge != "" {
+				entry["verified"] = true
+				entry["badge"] = node.Badge
+				entry["badge_sig"] = node.BadgeSig
+				if node.VerificationProvider != "" {
+					entry["verification_provider"] = node.VerificationProvider
+				}
+				if !node.VerifiedAt.IsZero() {
+					entry["verified_at"] = node.VerifiedAt.UTC().Format(time.RFC3339)
+				}
 			}
 			if node.Version != "" {
 				entry["version"] = node.Version
@@ -1041,8 +1063,18 @@ func (st *Store) HandleLookup(msg map[string]interface{}) (map[string]interface{
 			resp["endpoint"] = node.RealAddr
 		}
 	}
-	if node.ExternalID != "" {
-		resp["external_id"] = node.ExternalID
+	// Privacy: lookup is unauthenticated, so the raw external identity is NOT
+	// returned. Surface only the offline-verifiable badge (no identity).
+	if node.Badge != "" {
+		resp["verified"] = true
+		resp["badge"] = node.Badge
+		resp["badge_sig"] = node.BadgeSig
+		if node.VerificationProvider != "" {
+			resp["verification_provider"] = node.VerificationProvider
+		}
+		if !node.VerifiedAt.IsZero() {
+			resp["verified_at"] = node.VerifiedAt.UTC().Format(time.RFC3339)
+		}
 	}
 	if node.Version != "" {
 		resp["version"] = node.Version

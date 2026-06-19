@@ -98,6 +98,15 @@ var handlers = map[string]Handler{
 	"rotate_key": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
 		return s.identity.HandleRotateKey(msg)
 	},
+	"submit_badge": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
+		return s.identity.HandleSubmitBadge(msg)
+	},
+	"enroll_recovery": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
+		return s.identity.HandleEnrollRecovery(msg)
+	},
+	"recover_identity": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
+		return s.identity.HandleRecoverIdentity(msg)
+	},
 	"deregister": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
 		return s.directory.HandleDeregister(msg)
 	},
