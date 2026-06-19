@@ -370,3 +370,217 @@ func TestPanicCountFnNilReturnsZero(t *testing.T) {
 		t.Fatalf("expected zero panic count when PanicCountFn is nil")
 	}
 }
+
+// --- Ops metrics added in feat/full-ops-metrics ---------------------------
+
+// Save lifecycle: SaveTotal counter, SaveLastUnixSeconds gauge, and the
+// SaveDuration histogram all render with the expected names and types.
+func TestWriteToRendersSaveLifecycle(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.SaveTotal.Inc()
+	st.SaveTotal.Inc()
+	st.SaveLastUnixSeconds.Set(1_700_000_000)
+	st.SaveDuration.Observe(0.05) // below first bucket -> first bucket only
+	st.SaveDuration.Observe(2.5)  // hits the 3s bucket
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"# TYPE pilot_save_total counter",
+		"pilot_save_total 2",
+		"# TYPE pilot_save_last_unix_seconds gauge",
+		"pilot_save_last_unix_seconds 1700000000",
+		"# TYPE pilot_save_duration_seconds histogram",
+		"pilot_save_duration_seconds_bucket{le=\"+Inf\"} 2",
+		"pilot_save_duration_seconds_count 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// AuditActions counter vec renders one line per action label.
+func TestWriteToRendersAuditActions(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.AuditActions.WithLabel("node.re_registered").Inc()
+	st.AuditActions.WithLabel("node.re_registered").Inc()
+	st.AuditActions.WithLabel("trust.created").Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"# TYPE pilot_audit_action_total counter",
+		`pilot_audit_action_total{action="node.re_registered"} 2`,
+		`pilot_audit_action_total{action="trust.created"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// EventBusPublish renders even when zero (always emitted, no gating).
+func TestWriteToRendersEventBusPublish(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.EventBusPublish.Inc()
+	st.EventBusPublish.Inc()
+	st.EventBusPublish.Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "# TYPE pilot_event_bus_publish_total counter") {
+		t.Fatalf("missing TYPE line: %s", out)
+	}
+	if !strings.Contains(out, "pilot_event_bus_publish_total 3") {
+		t.Fatalf("missing value line: %s", out)
+	}
+}
+
+// EventBusPublishByType — the new CounterVec renders one labeled line
+// per "source.type" pair the publisher emitted.
+func TestWriteToRendersEventBusPublishByType(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.EventBusPublishByType.WithLabel("membership.changed").Inc()
+	st.EventBusPublishByType.WithLabel("membership.changed").Inc()
+	st.EventBusPublishByType.WithLabel("server.audit.entry").Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"# TYPE pilot_event_bus_publish_by_type_total counter",
+		`pilot_event_bus_publish_by_type_total{event="membership.changed"} 2`,
+		`pilot_event_bus_publish_by_type_total{event="server.audit.entry"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// WebhookStatsFn — when ok=false, the webhook block is omitted; when
+// ok=true, all three result labels + the last-delivery gauge render.
+func TestWriteToWebhookStatsFnGating(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.WebhookStatsFn = func() (uint64, uint64, uint64, int64, bool) { return 0, 0, 0, 0, false }
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(buf.String(), "pilot_webhook_deliveries_total") {
+		t.Fatalf("webhook block should be omitted when ok=false")
+	}
+
+	st2 := NewStore(nil)
+	st2.WebhookStatsFn = func() (uint64, uint64, uint64, int64, bool) {
+		return 42, 3, 1, 1700000000, true
+	}
+	buf.Reset()
+	if _, err := st2.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		`pilot_webhook_deliveries_total{result="ok"} 42`,
+		`pilot_webhook_deliveries_total{result="error"} 3`,
+		`pilot_webhook_deliveries_total{result="dropped"} 1`,
+		"pilot_webhook_last_delivery_unix_seconds 1700000000",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// BeaconStatsFn — when ok=false, the relay block is skipped; when ok=true,
+// all three relay counters render.
+func TestWriteToBeaconStatsFnGating(t *testing.T) {
+	t.Parallel()
+	// ok=false: relay metrics absent.
+	st := NewStore(nil)
+	st.BeaconStatsFn = func() (uint64, uint64, uint64, bool) { return 0, 0, 0, false }
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if strings.Contains(buf.String(), "pilot_beacon_relay_forwarded_total") {
+		t.Fatalf("relay metrics should be absent when ok=false")
+	}
+
+	// ok=true: counters emit with the right values.
+	st2 := NewStore(nil)
+	st2.BeaconStatsFn = func() (uint64, uint64, uint64, bool) { return 100, 5, 2, true }
+	buf.Reset()
+	if _, err := st2.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"pilot_beacon_relay_forwarded_total 100",
+		"pilot_beacon_relay_dropped_total 5",
+		"pilot_beacon_relay_not_found_total 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+}
+
+// RateLimitDenied counter vec renders one line per kind label.
+func TestWriteToRendersRateLimitDenied(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.RateLimitDenied.WithLabel("accept").Inc()
+	st.RateLimitDenied.WithLabel("accept").Inc()
+	st.RateLimitDenied.WithLabel("handshake").Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `pilot_ratelimit_denied_total{kind="accept"} 2`) {
+		t.Fatalf("missing accept line: %s", out)
+	}
+	if !strings.Contains(out, `pilot_ratelimit_denied_total{kind="handshake"} 1`) {
+		t.Fatalf("missing handshake line: %s", out)
+	}
+}
+
+// SignatureVerify counter vec renders ok/fail labels independently.
+func TestWriteToRendersSignatureVerify(t *testing.T) {
+	t.Parallel()
+	st := NewStore(nil)
+	st.SignatureVerify.WithLabel("ok").Inc()
+	st.SignatureVerify.WithLabel("fail").Inc()
+	st.SignatureVerify.WithLabel("ok").Inc()
+
+	var buf bytes.Buffer
+	if _, err := st.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `pilot_signature_verify_total{result="fail"} 1`) {
+		t.Fatalf("missing fail line: %s", out)
+	}
+	if !strings.Contains(out, `pilot_signature_verify_total{result="ok"} 2`) {
+		t.Fatalf("missing ok line: %s", out)
+	}
+}

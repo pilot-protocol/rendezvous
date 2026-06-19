@@ -73,6 +73,12 @@ func (s *Server) save() {
 // Phase 1 (RLock): copy raw values only — no encoding.
 // Phase 2 (no lock): base64, time.Format, JSON marshal.
 func (s *Server) flushSave() error {
+	// Measure wall time end-to-end so operators can see save cliffs in
+	// pilot_save_duration_seconds. Recorded on success only (a save that
+	// returns an error bumps SaveFailures and isn't a meaningful timing
+	// sample). The deferred record fires last, after the WAL truncate and
+	// the success metrics below.
+	saveStart := time.Now()
 	// Breaker gate: snapshot.write opens during incidents where the
 	// in-memory state is suspect (post-crash recovery, mid-load) and an
 	// emergency save would freeze the bad state to disk. Open the
@@ -85,6 +91,14 @@ func (s *Server) flushSave() error {
 			return nil
 		}
 	}
+	// Record save success at the end of the function. We hook the success
+	// path explicitly (after fsync + atomic rename complete) so failures
+	// don't pollute the duration histogram or the last-save timestamp.
+	defer func() {
+		if s.metrics != nil && s.metrics.SaveDuration != nil {
+			s.metrics.SaveDuration.Observe(time.Since(saveStart).Seconds())
+		}
+	}()
 	// Phase 1: RLock — copy raw values (pointer copies, integer copies only)
 	s.mu.RLock()
 	nextNode := s.nextNode
@@ -475,6 +489,16 @@ func (s *Server) flushSave() error {
 	// flush no longer drives replication latency. Subscribers receive
 	// updates within replicaPushInterval of any mutation.
 
+	// Success path metrics — count the save and timestamp it. The
+	// SaveDuration observation fires from the deferred record at the top
+	// of this function regardless of which exit path we took, but these
+	// two only fire on a clean success so an alert on "save age" stays
+	// meaningful even when individual saves fail.
+	if s.metrics != nil {
+		s.metrics.SaveTotal.Inc()
+		s.metrics.SaveLastUnixSeconds.Set(float64(time.Now().Unix()))
+	}
+
 	slog.Debug("registry state saved", "nodes", nodeCount, "networks", netCount)
 	return nil
 }
@@ -503,9 +527,22 @@ func (s *Server) load() error {
 	if snap.Checksum != "" {
 		savedChecksum := snap.Checksum
 		snap.Checksum = ""
-		verifyData, verifyErr := json.Marshal(snap)
-		if verifyErr != nil {
-			return fmt.Errorf("snapshot checksum verification failed (re-marshal): %w", verifyErr)
+		// Re-marshal MUST mirror the save path's encoder settings, otherwise
+		// any HTML-escapable byte ('<', '>', '&') in the data — common in
+		// audit details, hostnames containing URL fragments, attrs etc. —
+		// yields a different recomputed hash and the file is rejected as
+		// "corrupt" when it isn't. Use json.Encoder with SetEscapeHTML(false)
+		// to match flushSave (server_persist.go:444-446).
+		var verifyBuf bytes.Buffer
+		verifyEnc := json.NewEncoder(&verifyBuf)
+		verifyEnc.SetEscapeHTML(false)
+		if err := verifyEnc.Encode(snap); err != nil {
+			return fmt.Errorf("snapshot checksum verification failed (re-marshal): %w", err)
+		}
+		verifyData := verifyBuf.Bytes()
+		// json.Encoder.Encode appends a newline; drop it to match the save path.
+		if len(verifyData) > 0 && verifyData[len(verifyData)-1] == '\n' {
+			verifyData = verifyData[:len(verifyData)-1]
 		}
 		hash := sha256.Sum256(verifyData)
 		computed := hex.EncodeToString(hash[:])

@@ -129,6 +129,26 @@ func (s *Server) SetBannerPath(path string) { s.dashboard.SetBannerPath(path) }
 
 func (s *Server) SetDashboardHTTPAddr(addr string) { s.dashboard.SetHTTPProbeAddr(addr) }
 
+// SetWhitelistCallbacks plugs operator-installable callbacks into the
+// dashboard handler that back GET/PUT /api/admin/whitelist. Called by
+// cmd/rendezvous/main.go once the on-disk whitelist path is known.
+func (s *Server) SetWhitelistCallbacks(get func() ([]byte, error), set func([]byte) error) {
+	s.dashboard.SetWhitelistCallbacks(get, set)
+}
+
+// SetLogLevelCallbacks plugs operator-installable callbacks into the
+// dashboard handler that back GET/PUT /api/admin/runtime/log-level.
+func (s *Server) SetLogLevelCallbacks(get func() string, set func(string) error) {
+	s.dashboard.SetLogLevelCallbacks(get, set)
+}
+
+// SetBackupsCallback plugs the backup-directory enumerator into the
+// dashboard. The closure owns the directory path; only the cmd-level
+// package knows it, so wiring happens after NewWithStore.
+func (s *Server) SetBackupsCallback(fn func() ([]dashpkg.BackupEntry, error)) {
+	s.dashboard.SetBackupsList(fn)
+}
+
 func (s *Server) ServeDashboard(addr string) error { return s.dashboard.Serve(addr) }
 
 // SetClock replaces the time source. Used in tests for deterministic time.
@@ -514,6 +534,27 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		listNodesPerNet: make(map[uint16]*listNodesCacheState),
 		bus:             events.NewInProcessBus(0),
 	}
+	// Bridge bus publishes into the Prometheus counter without having
+	// events/ import metrics/. The type-assert is checked because the
+	// Bus interface only requires Publish; only the in-process impl
+	// supports SetOnPublish.
+	if op, ok := s.bus.(interface{ SetOnPublish(func()) }); ok {
+		op.SetOnPublish(func() { s.metrics.EventBusPublish.Inc() })
+	}
+	// Per-source-type breakdown so operators can see what's actually
+	// flowing through the bus (membership.changed vs trust.created vs
+	// audit.entry). Source and Type both come from the publisher.
+	if op, ok := s.bus.(interface{ SetOnPublishEvent(func(events.Event)) }); ok {
+		op.SetOnPublishEvent(func(evt events.Event) {
+			label := evt.Source + "." + evt.Type
+			s.metrics.EventBusPublishByType.WithLabel(label).Inc()
+		})
+	}
+	// Webhook stats — polled at scrape time. Returns ok=false when no
+	// URL is configured so the metrics block is omitted entirely.
+	s.metrics.WebhookStatsFn = func() (delivered, failed, dropped uint64, lastUnix int64, ok bool) {
+		return s.webhook.Stats()
+	}
 	s.staleNodeThresholdNs.Store(int64(defaultStaleNodeThreshold))
 	s.accept = acceptpkg.NewAcceptor(defaultMaxConnections, s) // R3.2: accept/TLS/rate-limit layer
 	s.breakers = breakerspkg.New()                             // operator-controllable on/off switches; gated paths consult via Server.Breakers().Allow()
@@ -888,6 +929,56 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		ws.Start()
 	}
 
+	// Wire the package-level hooks that turn signature-verify outcomes
+	// and rate-limit deny events into Prometheus counter increments.
+	// The hooks are set once at boot; authz/ and accept/ stay free of
+	// any metrics-package import.
+	authzpkg.SetOnSignatureVerify(func(ok bool) {
+		if ok {
+			s.metrics.SignatureVerify.WithLabel("ok").Inc()
+		} else {
+			s.metrics.SignatureVerify.WithLabel("fail").Inc()
+		}
+	})
+	acceptpkg.SetOnDeny(func(kind string) {
+		s.metrics.RateLimitDenied.WithLabel(kind).Inc()
+	})
+
+	// Hook registry internals into /metrics so pilot_pubkeys_total,
+	// pilot_wal_size_bytes, pilot_replication_term and
+	// pilot_replication_is_standby render on each scrape. The closure
+	// captures s; reads are under s.mu.RLock to stay consistent with the
+	// rest of the API surface.
+	s.metrics.RegistryInternalsFn = func() (uint64, uint64, uint64, bool, bool) {
+		s.mu.RLock()
+		pk := uint64(len(s.pubKeyIdx))
+		term := s.term
+		s.mu.RUnlock()
+		var walSize uint64
+		if s.walStore != nil && s.walStore.WAL() != nil {
+			walSize = uint64(s.walStore.WAL().Size())
+		}
+		standby := s.walStore != nil && s.walStore.IsStandby()
+		return pk, walSize, term, standby, true
+	}
+	// Mirror the same state on the admin endpoint so the dashboard's
+	// replication panel doesn't have to grep the /metrics scrape.
+	replSnap := func() dashpkg.ReplicationSnapshot {
+		s.mu.RLock()
+		term := s.term
+		s.mu.RUnlock()
+		subs := 0
+		if s.replMgr != nil {
+			subs = s.replMgr.SubCount()
+		}
+		standby := s.walStore != nil && s.walStore.IsStandby()
+		return dashpkg.ReplicationSnapshot{
+			Term:        term,
+			IsStandby:   standby,
+			Subscribers: subs,
+		}
+	}
+
 	// Initialize dashboard Handler (R5.1): owns probe state, pulse ring,
 	// maintenance banner, and the HTTP mux. Wired via Callbacks to avoid
 	// circular imports between the server and dashboard packages.
@@ -942,12 +1033,40 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			allow, _ := s.breakers.Allow(name)
 			return allow, s.breakers.Reason(name)
 		},
-		BreakerList:   s.BreakerList,
-		BreakerSet:    s.BreakerSet,
-		BreakerDelete: s.BreakerDelete,
+		BreakerList:       s.BreakerList,
+		BreakerSet:        s.BreakerSet,
+		BreakerDelete:     s.BreakerDelete,
+		ReplicationStatus: replSnap,
+		NetworksList: s.AdminListNetworks,
+		MembersList:  s.AdminListMembers,
+		MemberKick:   s.AdminKickMember,
+		MemberRole:   s.AdminSetMemberRole,
+		AuditRecent: func(n int) []dashpkg.AuditEntrySnapshot {
+			s.auditMu.Lock()
+			ring := make([]AuditEntry, len(s.auditLog))
+			copy(ring, s.auditLog)
+			s.auditMu.Unlock()
+			if n > len(ring) {
+				n = len(ring)
+			}
+			out := make([]dashpkg.AuditEntrySnapshot, 0, n)
+			// Most recent first.
+			for i := len(ring) - 1; i >= 0 && len(out) < n; i-- {
+				e := ring[i]
+				out = append(out, dashpkg.AuditEntrySnapshot{
+					Timestamp: e.Timestamp,
+					Action:    e.Action,
+					NetworkID: e.NetworkID,
+					NodeID:    e.NodeID,
+					Details:   e.Details,
+					Hash:      e.Hash,
+				})
+			}
+			return out
+		},
 	})
 
-	s.releasePoller = newReleasePoller("TeoSlayer/pilotprotocol")
+	s.releasePoller = newReleasePoller("pilot-protocol/pilotprotocol")
 	go s.dashboard.StatsCollectorLoop(s.readyCh, s.done, s.sampleStats, s.recordSample)
 	go s.dashboard.PulseLoop()
 	go s.heartbeatLoop()

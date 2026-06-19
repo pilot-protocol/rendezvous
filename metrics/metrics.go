@@ -245,6 +245,51 @@ type Store struct {
 	WalErrors    Counter // pilot_wal_errors_total
 	SaveFailures Counter // pilot_save_failures_total
 
+	// Save lifecycle — one tick per flushSave call
+	SaveTotal           Counter    // pilot_save_total
+	SaveLastUnixSeconds Gauge      // pilot_save_last_unix_seconds — Unix s of last successful save
+	SaveDuration        *Histogram // pilot_save_duration_seconds — wall time per flushSave
+
+	// Per-action audit breakdown (label = action)
+	AuditActions *CounterVec // pilot_audit_action_total{action="..."}
+
+	// Signature verify outcomes (label = result: ok|fail)
+	SignatureVerify *CounterVec // pilot_signature_verify_total{result="..."}
+
+	// Event-bus publish total (single hot path, no labels)
+	EventBusPublish Counter // pilot_event_bus_publish_total
+
+	// Event-bus publish broken down by "source.type" so operators can see
+	// what's actually flowing through the bus (membership.changed vs
+	// trust.created vs audit.entry vs ...). Label is the concatenated
+	// dot-namespaced event name from the publisher.
+	EventBusPublishByType *CounterVec // pilot_event_bus_publish_by_type_total{event="..."}
+
+	// Webhook delivery counters — per-outcome counter vec + last delivery
+	// timestamp. Lets operators see whether the configured webhook is
+	// actually firing and whether deliveries are succeeding.
+	WebhookDeliveries *CounterVec // pilot_webhook_deliveries_total{result="ok|error"} (declared, populated from WebhookStatsFn at scrape time)
+	WebhookLastUnix   Gauge       // pilot_webhook_last_delivery_unix_seconds
+
+	// WebhookStatsFn surfaces the webhook store's atomic counters at
+	// scrape time. ok=false (no URL configured) → the webhook block is
+	// omitted entirely, same as BeaconStatsFn. Source in webhook.Stats().
+	WebhookStatsFn func() (delivered, failed, dropped uint64, lastUnix int64, ok bool)
+
+	// Rate-limit denials by kind (label = kind: ip|punch|relay|discover)
+	RateLimitDenied *CounterVec // pilot_ratelimit_denied_total{kind="..."}
+
+	// BeaconStatsFn surfaces the beacon's atomic relay counters when wired.
+	// nil when no beacon is attached; the scrape omits the metrics in that
+	// case so a registry without a beacon doesn't read as 0 traffic.
+	BeaconStatsFn func() (forwarded, dropped, notFound uint64, ok bool)
+
+	// RegistryInternalsFn surfaces server-internal state that's not part of
+	// the request path (pubkey index size, WAL bytes, replication epoch +
+	// role). The closure is invoked at scrape time so the values are always
+	// fresh. nil → the metrics are omitted from the scrape output.
+	RegistryInternalsFn func() (pubkeys uint64, walSize uint64, term uint64, isStandby bool, ok bool)
+
 	// Per-network metrics (computed on scrape, for Grafana dashboards)
 	networkMetricsMu sync.Mutex
 	NetworkMetrics   []NetworkMetricSnapshot
@@ -285,6 +330,14 @@ func (st *Store) GetNetworkMetrics() []NetworkMetricSnapshot {
 	return st.NetworkMetrics
 }
 
+// SaveDurationBuckets bracket the typical flushSave wall time for a
+// production-sized snapshot. At 220k+ nodes we see ~1.5 s steady-state and
+// up to ~5 s under heavy concurrent load; the long buckets catch the
+// occasional cliff so an operator can spot it.
+var SaveDurationBuckets = []float64{
+	0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10, 30, 60,
+}
+
 // NewStore creates a new Store with all vecs initialized.
 func NewStore(panicCountFn func() uint64) *Store {
 	return &Store{
@@ -292,6 +345,12 @@ func NewStore(panicCountFn func() uint64) *Store {
 		RequestDuration: NewHistogramVec(DefaultDurationBuckets),
 		ErrorsTotal:     NewCounterVec(),
 		RbacOps:         NewCounterVec(),
+		AuditActions:          NewCounterVec(),
+		SignatureVerify:       NewCounterVec(),
+		RateLimitDenied:       NewCounterVec(),
+		EventBusPublishByType: NewCounterVec(),
+		WebhookDeliveries:     NewCounterVec(),
+		SaveDuration:          NewHistogram(SaveDurationBuckets),
 		PanicCountFn:    panicCountFn,
 	}
 }
@@ -416,6 +475,129 @@ func (st *Store) WriteTo(w io.Writer) (int64, error) {
 		panicCount = float64(st.PanicCountFn())
 	}
 	writeMetric(&b, "pilot_recovered_panics_total", panicCount)
+
+	// --- Save lifecycle ---
+	writeHelp(&b, "pilot_save_total", "flushSave() invocations that completed (success). Pair with pilot_save_failures_total for total attempts.")
+	writeType(&b, "pilot_save_total", "counter")
+	writeMetric(&b, "pilot_save_total", st.SaveTotal.Get())
+
+	writeHelp(&b, "pilot_save_last_unix_seconds", "Unix timestamp of the most recent successful flushSave. (now - this) gives save age in seconds; alert if it exceeds 2× save_interval.")
+	writeType(&b, "pilot_save_last_unix_seconds", "gauge")
+	writeMetric(&b, "pilot_save_last_unix_seconds", st.SaveLastUnixSeconds.Get())
+
+	if st.SaveDuration != nil {
+		writeHelp(&b, "pilot_save_duration_seconds", "Histogram of flushSave wall time. Cliffs in the upper buckets indicate GC pressure or disk contention during snapshot encode.")
+		writeType(&b, "pilot_save_duration_seconds", "histogram")
+		buckets, counts, sum, count := st.SaveDuration.Snapshot()
+		// Histogram.Observe already stores cumulative counts in-place
+		// (counts[i] = samples <= buckets[i]). Emit each value directly;
+		// do NOT accumulate again — that double-counts and caused
+		// le="60" to read 59 against a true count of 27 in production.
+		for i, bound := range buckets {
+			writeBucketMetricNoLabel(&b, "pilot_save_duration_seconds", bound, counts[i])
+		}
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_bucket{le=\"+Inf\"} %d\n", count)
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_sum %s\n", FormatFloat(sum))
+		fmt.Fprintf(&b, "pilot_save_duration_seconds_count %d\n", count)
+	}
+
+	// --- Per-action audit breakdown ---
+	if st.AuditActions != nil {
+		writeHelp(&b, "pilot_audit_action_total", "Audit events emitted, broken down by action name (e.g. node.re_registered, trust.created).")
+		writeType(&b, "pilot_audit_action_total", "counter")
+		for _, lv := range st.AuditActions.Snapshot() {
+			writeLabeledMetric(&b, "pilot_audit_action_total", "action", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Signature verify outcomes ---
+	if st.SignatureVerify != nil {
+		writeHelp(&b, "pilot_signature_verify_total", "Ed25519 signature verification outcomes (result=ok|fail). Non-zero fail rate indicates malformed clients, replay attempts, or version-mismatched signers.")
+		writeType(&b, "pilot_signature_verify_total", "counter")
+		for _, lv := range st.SignatureVerify.Snapshot() {
+			writeLabeledMetric(&b, "pilot_signature_verify_total", "result", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Event-bus publish total ---
+	writeHelp(&b, "pilot_event_bus_publish_total", "Total events published to the in-process event bus. Tracks fan-out load and helps correlate spikes with downstream subscriber latency.")
+	writeType(&b, "pilot_event_bus_publish_total", "counter")
+	writeMetric(&b, "pilot_event_bus_publish_total", st.EventBusPublish.Get())
+
+	// --- Event-bus publish broken down by "source.type" ---
+	if st.EventBusPublishByType != nil {
+		writeHelp(&b, "pilot_event_bus_publish_by_type_total", "Event-bus publish counter broken down by 'source.type' label (e.g. membership.changed, trust.created, audit.entry). Lets operators see what kinds of events are flowing through the bus and at what rate.")
+		writeType(&b, "pilot_event_bus_publish_by_type_total", "counter")
+		for _, lv := range st.EventBusPublishByType.Snapshot() {
+			writeLabeledMetric(&b, "pilot_event_bus_publish_by_type_total", "event", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Webhook deliveries ---
+	if st.WebhookStatsFn != nil {
+		if delivered, failed, dropped, lastUnix, ok := st.WebhookStatsFn(); ok {
+			writeHelp(&b, "pilot_webhook_deliveries_total", "HTTP webhook delivery attempts, broken down by result (ok|error|dropped). Only present when a webhook URL is configured.")
+			writeType(&b, "pilot_webhook_deliveries_total", "counter")
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "ok", float64(delivered))
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "error", float64(failed))
+			writeLabeledMetric(&b, "pilot_webhook_deliveries_total", "result", "dropped", float64(dropped))
+
+			writeHelp(&b, "pilot_webhook_last_delivery_unix_seconds", "Unix timestamp of the most recent webhook delivery attempt (success or failure). (now - this) gives the age; alert when this stops moving on a configured webhook.")
+			writeType(&b, "pilot_webhook_last_delivery_unix_seconds", "gauge")
+			writeMetric(&b, "pilot_webhook_last_delivery_unix_seconds", float64(lastUnix))
+		}
+	}
+
+	// --- Rate-limit denied (labeled) ---
+	if st.RateLimitDenied != nil {
+		writeHelp(&b, "pilot_ratelimit_denied_total", "Requests rejected by a rate limiter, broken down by kind. Sustained non-zero rate from a single client IP suggests abuse; from many clients suggests the limit needs tuning.")
+		writeType(&b, "pilot_ratelimit_denied_total", "counter")
+		for _, lv := range st.RateLimitDenied.Snapshot() {
+			writeLabeledMetric(&b, "pilot_ratelimit_denied_total", "kind", lv.Label, lv.Value)
+		}
+	}
+
+	// --- Beacon relay counters (only when a beacon is attached) ---
+	if st.BeaconStatsFn != nil {
+		if fwd, drp, nfd, ok := st.BeaconStatsFn(); ok {
+			writeHelp(&b, "pilot_beacon_relay_forwarded_total", "UDP relay packets delivered to their destination by the beacon.")
+			writeType(&b, "pilot_beacon_relay_forwarded_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_forwarded_total", float64(fwd))
+
+			writeHelp(&b, "pilot_beacon_relay_dropped_total", "UDP relay packets dropped because the relay queue was full (back-pressure).")
+			writeType(&b, "pilot_beacon_relay_dropped_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_dropped_total", float64(drp))
+
+			writeHelp(&b, "pilot_beacon_relay_not_found_total", "UDP relay packets addressed to a node the beacon has no route for. High rate suggests stale client routing tables or aggressive node reaping.")
+			writeType(&b, "pilot_beacon_relay_not_found_total", "counter")
+			writeMetric(&b, "pilot_beacon_relay_not_found_total", float64(nfd))
+		}
+	}
+
+	// --- Registry internals (pubkey index size, WAL bytes, replication) ---
+	if st.RegistryInternalsFn != nil {
+		if pk, wal, term, standby, ok := st.RegistryInternalsFn(); ok {
+			writeHelp(&b, "pilot_pubkeys_total", "Distinct Ed25519 public keys present in the registry's identity index. Differs from pilot_nodes_total when a node has re-registered with a fresh key.")
+			writeType(&b, "pilot_pubkeys_total", "gauge")
+			writeMetric(&b, "pilot_pubkeys_total", float64(pk))
+
+			writeHelp(&b, "pilot_wal_size_bytes", "Current write-ahead log size in bytes. Truncated to zero on every successful flushSave; sustained non-zero size during steady state indicates flushSave isn't keeping up.")
+			writeType(&b, "pilot_wal_size_bytes", "gauge")
+			writeMetric(&b, "pilot_wal_size_bytes", float64(wal))
+
+			writeHelp(&b, "pilot_replication_term", "Monotonic replication epoch (PILOT-328). Incremented on primary promotion; standbys reject snapshots from a stale primary.")
+			writeType(&b, "pilot_replication_term", "gauge")
+			writeMetric(&b, "pilot_replication_term", float64(term))
+
+			role := 0.0
+			if standby {
+				role = 1.0
+			}
+			writeHelp(&b, "pilot_replication_is_standby", "1 if this instance is currently a replication standby, 0 if it's the active primary.")
+			writeType(&b, "pilot_replication_is_standby", "gauge")
+			writeMetric(&b, "pilot_replication_is_standby", role)
+		}
+	}
 
 	// --- Network gauges ---
 	writeHelp(&b, "pilot_networks_total", "Total number of networks (excluding backbone).")
@@ -569,6 +751,13 @@ func writeBucketMetric(b *strings.Builder, name, labelKey, labelVal string, le f
 
 func writeBucketInf(b *strings.Builder, name, labelKey, labelVal string, count uint64) {
 	fmt.Fprintf(b, "%s_bucket{%s=%q,le=\"+Inf\"} %d\n", name, labelKey, labelVal, count)
+}
+
+// writeBucketMetricNoLabel emits a histogram bucket for a metric with no
+// labels. Used by single-instance histograms like pilot_save_duration_seconds
+// where the only dimension is the bucket boundary.
+func writeBucketMetricNoLabel(b *strings.Builder, name string, le float64, count uint64) {
+	fmt.Fprintf(b, "%s_bucket{le=%q} %d\n", name, FormatFloat(le), count)
 }
 
 // FormatFloat formats a float64 for Prometheus output.

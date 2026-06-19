@@ -21,7 +21,7 @@ jobs:
       - name: Checkout web4
         uses: actions/checkout@v6
         with:
-          repository: TeoSlayer/pilotprotocol
+          repository: pilot-protocol/pilotprotocol
           path: web4
 
       - uses: actions/setup-go@v6
@@ -35,7 +35,7 @@ jobs:
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: ./rendezvous/coverage.out
           flags: unittests
