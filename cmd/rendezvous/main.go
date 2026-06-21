@@ -70,10 +70,13 @@ func main() {
 	httpAddr := flag.String("http", "", "HTTP dashboard listen address (e.g. :3000)")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
-	adminToken := flag.String("admin-token", "", "admin token for network creation (empty = creation disabled)")
-	dashboardToken := flag.String("dashboard-token", "", "token for per-network stats on dashboard (empty = public-only)")
+	// Token defaults come from the environment so secrets can be supplied via a
+	// root-only EnvironmentFile and never appear in the process command line
+	// (argv is world-readable via /proc). An explicit flag still overrides.
+	adminToken := flag.String("admin-token", os.Getenv("PILOT_ADMIN_TOKEN"), "admin token for network creation (empty = creation disabled; default $PILOT_ADMIN_TOKEN)")
+	dashboardToken := flag.String("dashboard-token", os.Getenv("PILOT_DASHBOARD_TOKEN"), "token for per-network stats on dashboard (empty = public-only; default $PILOT_DASHBOARD_TOKEN)")
 	maintenanceBanner := flag.String("maintenance-banner", "", "free-form notice rendered on the dashboard (empty = no banner)")
-	replToken := flag.String("repl-token", "", "shared token required for hot-standby replication (empty = replication disabled)")
+	replToken := flag.String("repl-token", os.Getenv("PILOT_REPL_TOKEN"), "shared token required for hot-standby replication (empty = replication disabled; default $PILOT_REPL_TOKEN)")
 	staleThreshold := flag.Duration("stale-threshold", 30*time.Minute, "how long since last heartbeat before a node is considered stale on the dashboard (e.g. 30m, 5m). Default 30m tolerates client reconnect storms; smaller values give faster dashboard reflection of disconnects.")
 	mutexProfileFraction := flag.Int("mutex-profile-fraction", 1000, "rate for runtime mutex contention profiling (1/N events sampled; 0 = off). Always-on at low overhead so profile data is available without runtime reconfiguration.")
 	blockProfileRate := flag.Int("block-profile-rate", 10000, "rate for runtime blocking profile in nanoseconds (0 = off). Captures goroutines blocked on chan/select/Cond — same rationale as -mutex-profile-fraction.")
