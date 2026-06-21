@@ -1124,10 +1124,14 @@ func (st *Store) HandleBinaryLookup(conn net.Conn, payload []byte) {
 			realAddr = node.RealAddr
 		}
 	}
+	// Privacy: never surface the raw external identity on the open lookup path
+	// (the JSON HandleLookup redacts it the same way — only the offline-
+	// verifiable badge is public). A verified address is signalled by its
+	// badge, not by leaking the provider handle.
 	resp := wire.EncodeLookupResp(
 		node.ID, node.Public, node.TaskExec,
 		node.Networks, node.PublicKey, node.Hostname, node.Tags,
-		realAddr, node.ExternalID,
+		realAddr, "",
 	)
 	sh.RUnlock()
 
