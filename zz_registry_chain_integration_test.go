@@ -16,9 +16,9 @@ import (
 
 // Fixed test keys. To exercise the REAL badgeverify path (no stubs), run:
 //
-//   GOWORK=off go test ./ -run TestRegistryChainRealVerification \
-//     -ldflags "-X 'github.com/pilot-protocol/common/badgeverify.keyringB64=bdg-v1=kIyseGuqMq6Y/mpk3Z8KD21JpSykJCyXQSWw05OJKb8=' \
-//               -X 'github.com/pilot-protocol/common/badgeverify.recoveryKeyringB64=rec-v1=kkNP/GeIoyULdJVjfFH2Yqmgg/QgcppCkjzHYiMPUXs='"
+//	GOWORK=off go test ./ -run TestRegistryChainRealVerification \
+//	  -ldflags "-X 'github.com/pilot-protocol/common/badgeverify.keyringB64=bdg-v1=kIyseGuqMq6Y/mpk3Z8KD21JpSykJCyXQSWw05OJKb8=' \
+//	            -X 'github.com/pilot-protocol/common/badgeverify.recoveryKeyringB64=rec-v1=kkNP/GeIoyULdJVjfFH2Yqmgg/QgcppCkjzHYiMPUXs='"
 //
 // Without those ldflags the keyring holds all-zero placeholders and the
 // test skips (verification correctly fails closed).
@@ -132,5 +132,40 @@ func TestRegistryChainRealVerification(t *testing.T) {
 	s.mu.RUnlock()
 	if gotKey != newPubB64 {
 		t.Fatalf("recovery did not rotate the address key: got %s want %s", gotKey, newPubB64)
+	}
+}
+
+// TestForceRotateKeyClearsBadge pins that a recovery (force-rotate) does NOT
+// let the new key holder inherit the prior owner's verification badge — the
+// badge may attest a different external identity than the recoverer.
+func TestForceRotateKeyClearsBadge(t *testing.T) {
+	s := newTestServer(t, "admin")
+	const nodeID = uint32(0x2BADC0DE)
+	id, err := pilotcrypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	s.mu.Lock()
+	s.nodes[nodeID] = &NodeInfo{
+		ID: nodeID, PublicKey: id.PublicKey,
+		Badge: "pilotbadge:v1:1:github:1:0:bdg-v1:", BadgeSig: "sig",
+		VerificationProvider: "github", VerifiedAt: time.Now(),
+	}
+	s.mu.Unlock()
+
+	newID, err := pilotcrypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("new keygen: %v", err)
+	}
+	if _, err := s.ForceRotateKey(nodeID, newID.PublicKey, time.Now()); err != nil {
+		t.Fatalf("ForceRotateKey: %v", err)
+	}
+
+	s.mu.RLock()
+	n := s.nodes[nodeID]
+	s.mu.RUnlock()
+	if n.Badge != "" || n.BadgeSig != "" || n.VerificationProvider != "" || !n.VerifiedAt.IsZero() {
+		t.Fatalf("verification badge not cleared after recovery: badge=%q provider=%q verified_at=%v",
+			n.Badge, n.VerificationProvider, n.VerifiedAt)
 	}
 }

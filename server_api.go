@@ -486,6 +486,13 @@ func (s *Server) ForceRotateKey(id uint32, newPubKey []byte, rotatedAt time.Time
 	node.SetLastSeen(rotatedAt)
 	node.KeyMeta.RotatedAt = rotatedAt
 	node.KeyMeta.RotateCount++
+	// A recovered address must NOT inherit the prior key holder's verification
+	// badge: the badge may attest a different external identity than the one
+	// that authorized this recovery, so the new holder must re-verify.
+	node.Badge = ""
+	node.BadgeSig = ""
+	node.VerificationProvider = ""
+	node.VerifiedAt = time.Time{}
 	sh.Unlock()
 	return oldPubKeyB64, nil
 }

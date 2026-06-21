@@ -156,6 +156,15 @@ func (st *Store) HandleRecoverIdentity(msg map[string]interface{}) (map[string]i
 		return nil, fmt.Errorf("recovery is not bound to this new key")
 	}
 
+	// Bound the authorization lifetime. The single-use nonce ledger is
+	// in-memory, so a far-future Exp would let a captured, already-used
+	// authorization be replayed after a registry restart (the ledger resets).
+	// Legitimate recoveries are minutes-valid; reject anything longer.
+	const maxRecoveryWindow = 30 * time.Minute
+	if time.Unix(r.Exp, 0).After(time.Now().Add(maxRecoveryWindow)) {
+		return nil, fmt.Errorf("recovery authorization expiry too far in the future (max %s)", maxRecoveryWindow)
+	}
+
 	// The re-proven identity's commitment must match what was enrolled.
 	storedCommitment, provider, ok := st.nodes.GetRecoveryEnrollment(nodeID)
 	if !ok {
