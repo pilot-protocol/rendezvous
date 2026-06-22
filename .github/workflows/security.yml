@@ -108,8 +108,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+      # The gitleaks GitHub Action (gitleaks/gitleaks-action) requires a paid
+      # GITLEAKS_LICENSE secret for ORGANIZATION repos. The gitleaks binary
+      # itself is MIT-licensed and free, so we run a version-pinned binary
+      # release directly — same scan, no license gate.
+      - name: Install gitleaks
         env:
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
-          GITLEAKS_ENABLE_SUMMARY: "true"
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (full history)
+        run: |
+          gitleaks git --no-banner --redact --verbose .
