@@ -5,7 +5,6 @@ package server
 import (
 	"crypto/ed25519"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -20,8 +19,9 @@ import (
 //	  -ldflags "-X 'github.com/pilot-protocol/common/badgeverify.keyringB64=bdg-v1=kIyseGuqMq6Y/mpk3Z8KD21JpSykJCyXQSWw05OJKb8=' \
 //	            -X 'github.com/pilot-protocol/common/badgeverify.recoveryKeyringB64=rec-v1=kkNP/GeIoyULdJVjfFH2Yqmgg/QgcppCkjzHYiMPUXs='"
 //
-// Without those ldflags the keyring holds all-zero placeholders and the
-// test skips (verification correctly fails closed).
+// Without those ldflags the keyring holds the build-time default key (which
+// does not match these test fixtures), so the probe badge fails to verify
+// and the test skips — it only runs the real chain when pinned.
 const (
 	itIssuerPrivB64 = "7zyivJ460ALCc9W29LDCgGdDUZ9T3fWTKOF3HyPfOkiQjKx4a6oyrpj+amTdnwoPbUmlLKQkLJdBJbDTk4kpvw=="
 	itColdPrivB64   = "MINhBLxWw93Ga2a3pund99bu3Cj3VqXaQu8awgRLXhiSQ0/8Z4ijJQt0lWN8UfZiqaCD9CBymkKSPMdiIw9Rew=="
@@ -60,8 +60,15 @@ func TestRegistryChainRealVerification(t *testing.T) {
 		return s, b64sign(issuerPriv, s)
 	}
 	badge, badgeSig := mintBadge()
-	if _, err := badgeverify.VerifyForNode(badge, badgeSig, nodeID); errors.Is(err, badgeverify.ErrNoKey) {
-		t.Skip("keyring not pinned; re-run with -ldflags pinning the test keys (see file header)")
+	// The probe badge is signed with the test fixture issuer key, so it only
+	// verifies when the keyring is pinned to those fixtures via -ldflags (see
+	// file header). Without the pin, the build-time default keyring holds
+	// either the all-zero placeholder (ErrNoKey) or — once common ships real
+	// keys — a real-but-different issuer key whose signature check fails.
+	// Either way the pinned path is not being exercised, so skip rather than
+	// fail.
+	if _, err := badgeverify.VerifyForNode(badge, badgeSig, nodeID); err != nil {
+		t.Skipf("keyring not pinned to test fixtures (%v); re-run with -ldflags pinning the test keys (see file header)", err)
 	}
 
 	s := newTestServer(t, "admin")
