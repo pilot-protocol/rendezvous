@@ -783,6 +783,16 @@ func localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 
 // Serve starts an HTTP server serving the dashboard UI and stats API.
 func (h *Handler) Serve(addr string) error {
+	mux := h.buildMux()
+	slog.Info("dashboard listening", "addr", addr)
+	return http.ListenAndServe(addr, mux)
+}
+
+// buildMux constructs the dashboard's route table. Factored out of
+// Serve so tests can exercise the real routes (e.g. the /api/stats
+// auth path) against an httptest server without re-implementing
+// registration and drifting from production wiring.
+func (h *Handler) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -882,14 +892,15 @@ func (h *Handler) Serve(addr string) error {
 	mux.HandleFunc("/api/stats", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		authenticated := false
-		if token := r.URL.Query().Get("token"); token != "" {
-			dt := h.cb.GetDashboardToken()
-			if dt != "" && subtle.ConstantTimeCompare([]byte(token), []byte(dt)) == 1 {
-				authenticated = true
-			}
-		}
-		_ = json.NewEncoder(w).Encode(h.buildStatsResponse(authenticated))
+		// requireAdminToken (PR #50) already verified a valid admin
+		// token reached this handler — so the caller is an authenticated
+		// operator and gets the elevated per-network payload. The old
+		// inner ?token= dashboard-token check became dead once the
+		// endpoint moved behind the admin gate (the gate 401s anything
+		// without the admin token first), and the dashboard frontend
+		// sent ?token= which the gate ignored, so operator stats silently
+		// 401'd. The frontend now sends admin_token=; this matches it.
+		_ = json.NewEncoder(w).Encode(h.buildStatsResponse(true))
 	}))
 
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
@@ -1551,8 +1562,7 @@ func (h *Handler) Serve(addr string) error {
 	// because adding a router dependency for three routes isn't worth it.
 	mux.HandleFunc("/api/admin/networks/", h.requireAdminToken(h.serveMembershipAdmin))
 
-	slog.Info("dashboard listening", "addr", addr)
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
 // serveMembershipAdmin dispatches the three /api/admin/networks/{id}/members*
@@ -2163,7 +2173,11 @@ function update(){
   // directly. Token-aware dashboard-token path retained for operators
   // who set one in localStorage.
   var t=getToken();
-  var url=t?('/api/stats?token='+encodeURIComponent(t)):'/api/public-stats';
+  // /api/stats is admin-gated (PR #50). The operator's stored token is
+  // the admin token (same one /api/pulse uses below), so send it as
+  // admin_token to clear the gate. Without this the request was sent as
+  // ?token= — which the admin gate ignores — and silently 401'd.
+  var url=t?('/api/stats?admin_token='+encodeURIComponent(t)):'/api/public-stats';
   fetch(url).then(function(r){
     if(!r.ok)return null;
     return r.json();
