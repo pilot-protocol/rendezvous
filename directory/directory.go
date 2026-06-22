@@ -892,35 +892,22 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 	// Owner-based reclaim
 	if owner != "" {
 		if existingID, ok := st.ownerIdx[owner]; ok {
-			if existingNode, exists := st.nodes[existingID]; exists {
-				oldPubKeyB64 := crypto.EncodePublicKey(existingNode.PublicKey)
-				delete(st.pubKeyIdx, oldPubKeyB64)
-				sh := st.nodeShard(existingID)
-				sh.Lock()
-				existingNode.PublicKey = pubKey
-				existingNode.RealAddr = listenAddr
-				existingNode.SetLastSeen(time.Now())
-				existingNode.LANAddrs = lanAddrs
-				if version != "" {
-					existingNode.Version = version
-				}
-				existingNode.RelayOnly = relayOnly
-				sh.Unlock()
-				st.pubKeyIdx[pubKeyB64] = existingID
-
-				addr := protocol.Addr{Network: 0, Node: existingID}
-				resp := map[string]interface{}{
-					"type":       "register_ok",
-					"node_id":    existingID,
-					"network_id": 0,
-					"address":    addr.String(),
-					"public_key": pubKeyB64,
-				}
-				st.setNodeHostname(existingNode, hostname, resp)
-				st.cb.Save()
-				slog.Debug("registered node", "node_id", existingID, "listen", listenAddr, "addr", addr, "mode", "owner_key_update")
-				st.cb.Audit("node.re_registered", "node_id", existingID, "mode", "owner_key_update")
-				return resp, nil
+			if _, exists := st.nodes[existingID]; exists {
+				// SECURITY (H2/H3): an existing node_id already has a key bound
+				// to it. The same-key refresh/heartbeat case never reaches here
+				// (it is served by the fast/slow path above via pubKeyIdx), so a
+				// live owner match with an UNKNOWN pubkey is always a request to
+				// REBIND the address to a different key. A plain register carries
+				// no proof-of-possession of the old key and no recovery
+				// authorization, so honoring it would let anyone who learns an
+				// owner string hijack the node_id (and inherit its badge).
+				//
+				// The ONLY sanctioned way to change a node_id's bound key is the
+				// recover_identity path (cold-key authorization), which also
+				// clears the badge. Refuse the rebind and keep the existing
+				// binding intact.
+				st.cb.Audit("node.rebind_rejected", "node_id", existingID, "owner", owner)
+				return nil, fmt.Errorf("owner %q is already bound to node %d with a different key; use recover_identity to rotate the key", owner, existingID)
 			}
 
 			// Owner node reaped — reclaim with new key
