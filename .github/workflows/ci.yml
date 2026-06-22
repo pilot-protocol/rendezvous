@@ -32,7 +32,10 @@ jobs:
 
       - name: Run tests with coverage
         working-directory: rendezvous
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+        # -parallel 4 caps concurrent test parallelism: unbounded parallelism
+        # exhausts ephemeral ports/sockets in the registry's integration tests
+        # and causes spurious dial timeouts (project convention).
+        run: go test -race -parallel 4 -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

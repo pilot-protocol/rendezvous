@@ -2,6 +2,8 @@ module github.com/pilot-protocol/rendezvous
 
 go 1.25.10
 
+toolchain go1.25.11
+
 require github.com/pilot-protocol/common v0.5.6
 
 require (

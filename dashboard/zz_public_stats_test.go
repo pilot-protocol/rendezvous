@@ -197,7 +197,10 @@ func TestPublicStats_BuildInfoOmittedWhenAbsent(t *testing.T) {
 		mux.ServeHTTP(w, r)
 	}))
 	defer srv.Close()
-	resp, _ := http.Get(srv.URL + "/api/public-stats")
+	resp, err := http.Get(srv.URL + "/api/public-stats")
+	if err != nil {
+		t.Fatalf("GET public-stats: %v", err)
+	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	var payload map[string]interface{}

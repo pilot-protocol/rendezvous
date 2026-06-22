@@ -1,0 +1,37 @@
+name: dependency-review
+
+# Reviews a PR's dependency changes for known vulnerabilities / disallowed
+# licenses. Complements .github/dependabot.yml (which proposes upgrades
+# weekly) by reviewing the inbound side.
+#
+# NOTE: actions/dependency-review-action requires the repository's Dependency
+# Graph to be enabled (Settings -> Security -> Dependency graph; on private
+# org repos this needs GitHub Advanced Security). Until that one-click setting
+# is on, the action errors with "Dependency review is not supported on this
+# repository". The step is marked continue-on-error so this prerequisite does
+# not turn CI red; once the graph is enabled, flip continue-on-error to false
+# (or drop it) and add this job to the required status checks to make it gate.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Dependency Review
+        continue-on-error: true
+        uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
+        with:
+          fail-on-severity: high
