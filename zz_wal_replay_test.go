@@ -236,6 +236,106 @@ func TestWALReplayRestoresKeyRotation(t *testing.T) {
 	}
 }
 
+// TestWALReplayKeyRotationClearsBadge locks down the M2 fix: a recovery-driven
+// rotation (ForceRotateKey) clears the verification badge in memory, and the
+// WAL delta carries ClearBadge=true so a crash between the WAL fsync and the
+// next snapshot replays the rotation AND drops the stale badge. Without this,
+// the recovered key would inherit the prior holder's verified status.
+func TestWALReplayKeyRotationClearsBadge(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	oldPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	oldPkB64 := base64.StdEncoding.EncodeToString(oldPub)
+
+	storePath := writeMinimalSnapshot(t, dir, func(s *Server) {
+		s.mu.Lock()
+		n := &NodeInfo{
+			ID:        444,
+			Owner:     "recovered",
+			PublicKey: oldPub,
+			Networks:  []uint16{0},
+			// The pre-recovery snapshot still carries the old holder's badge.
+			Badge:                "BADGE-DATA",
+			BadgeSig:             "BADGE-SIG",
+			VerificationProvider: "github",
+			VerifiedAt:           time.Now(),
+		}
+		n.SetLastSeen(time.Now())
+		s.nodes[444] = n
+		s.pubKeyIdx[oldPkB64] = 444
+		s.networks[0].Members = append(s.networks[0].Members, 444)
+		s.mu.Unlock()
+	})
+
+	newPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	newPkB64 := base64.StdEncoding.EncodeToString(newPub)
+
+	appendWALDelta(t, storePath, DeltaKeyRotation, 444, keyRotationDelta{
+		NodeID:       444,
+		NewPublicKey: newPkB64,
+		RotatedAt:    time.Now().UTC().Format(time.RFC3339),
+		ClearBadge:   true,
+	})
+
+	s := NewWithStore("", storePath)
+	defer s.Close()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	node := s.nodes[444]
+	if base64.StdEncoding.EncodeToString(node.PublicKey) != newPkB64 {
+		t.Fatalf("node.PublicKey not updated to new key")
+	}
+	if node.Badge != "" || node.BadgeSig != "" || node.VerificationProvider != "" || !node.VerifiedAt.IsZero() {
+		t.Fatalf("badge not cleared on recovery-rotation replay: %+v", node)
+	}
+}
+
+// TestWALReplayNormalRotationKeepsBadge asserts the converse: a normal
+// rotate_key (ClearBadge=false) leaves the badge intact, so the M2 change
+// does not regress ordinary key rotation.
+func TestWALReplayNormalRotationKeepsBadge(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	oldPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	oldPkB64 := base64.StdEncoding.EncodeToString(oldPub)
+
+	storePath := writeMinimalSnapshot(t, dir, func(s *Server) {
+		s.mu.Lock()
+		n := &NodeInfo{
+			ID:                   555,
+			PublicKey:            oldPub,
+			Networks:             []uint16{0},
+			Badge:                "BADGE-DATA",
+			VerificationProvider: "github",
+		}
+		n.SetLastSeen(time.Now())
+		s.nodes[555] = n
+		s.pubKeyIdx[oldPkB64] = 555
+		s.networks[0].Members = append(s.networks[0].Members, 555)
+		s.mu.Unlock()
+	})
+
+	newPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	newPkB64 := base64.StdEncoding.EncodeToString(newPub)
+	appendWALDelta(t, storePath, DeltaKeyRotation, 555, keyRotationDelta{
+		NodeID:       555,
+		NewPublicKey: newPkB64,
+		RotatedAt:    time.Now().UTC().Format(time.RFC3339),
+		ClearBadge:   false,
+	})
+
+	s := NewWithStore("", storePath)
+	defer s.Close()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	node := s.nodes[555]
+	if node.Badge != "BADGE-DATA" || node.VerificationProvider != "github" {
+		t.Fatalf("normal rotation should keep the badge: %+v", node)
+	}
+}
+
 // TestWALReplayHandlesUnknownTypeGracefully ensures forward-compatibility:
 // a future version writing a new DeltaType doesn't break replay on an
 // older binary. Unknown types should be skipped.

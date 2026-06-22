@@ -53,7 +53,11 @@ type KeyInfo struct {
 }
 
 // WALRecorder is called to write a WAL entry after a key rotation.
-type WALRecorder func(nodeID uint32, newPubKeyB64, rotatedAt string)
+// clearBadge is true only for recovery-driven rotations (ForceRotateKey),
+// which also drop the verification badge — the WAL replay must reproduce
+// that badge-clear, otherwise a crash between the WAL fsync and the next
+// snapshot replays the rotation but leaves a stale badge on the new key.
+type WALRecorder func(nodeID uint32, newPubKeyB64, rotatedAt string, clearBadge bool)
 
 // ErrKeyRotatedConcurrently is returned by NodeView.UpdateNodeKey when a
 // concurrent rotation landed between Phase 1 (snapshot) and Phase 3 (commit).
@@ -120,6 +124,14 @@ type NodeView interface {
 	// GetRecoveryEnrollment returns the stored recovery commitment for a
 	// node. ok is false if the node does not exist or is not enrolled.
 	GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool)
+
+	// ConsumeRecoveryNonce atomically records a recovery-authorization nonce
+	// as consumed for a node, persisted+replicated alongside the recovery
+	// commitment. It returns false (without mutating) if the SAME nonce is
+	// already recorded as consumed for this node — i.e. a replay that
+	// survived a restart or standby failover. ok is false if the node does
+	// not exist.
+	ConsumeRecoveryNonce(id uint32, nonce string, exp time.Time) (recorded, ok bool)
 
 	// ForceRotateKey swaps a node's public key WITHOUT requiring the old
 	// key — used only by identity recovery, whose authorization comes from a
@@ -438,9 +450,10 @@ func (st *Store) HandleRotateKey(msg map[string]interface{}) (map[string]interfa
 		st.cb.OnKeyRotated(nodeID, oldPubKeyB64, newPubKeyB64)
 	}
 
-	// WAL the rotation.
+	// WAL the rotation. A normal rotate_key keeps the badge (the same
+	// identity continues to hold the address), so clearBadge is false.
 	if st.cb.RecordWAL != nil {
-		st.cb.RecordWAL(nodeID, newPubKeyB64, rotatedAt.UTC().Format(time.RFC3339))
+		st.cb.RecordWAL(nodeID, newPubKeyB64, rotatedAt.UTC().Format(time.RFC3339), false)
 	}
 
 	if st.cb.Save != nil {

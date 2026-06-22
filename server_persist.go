@@ -59,12 +59,14 @@ type rawNodeCopy struct {
 	version    string
 	relayOnly  bool // task 32
 
-	badge              string
-	badgeSig           string
-	verifProvider      string
-	verifiedAt         time.Time
-	recoveryCommitment string
-	recoveryProvider   string
+	badge                 string
+	badgeSig              string
+	verifProvider         string
+	verifiedAt            time.Time
+	recoveryCommitment    string
+	recoveryProvider      string
+	recoveryConsumedNonce string
+	recoveryConsumedExp   time.Time
 }
 
 // save signals that state has changed and should be persisted AND pushed
@@ -167,12 +169,14 @@ func (s *Server) flushSave() (retErr error) {
 			version:    n.Version,
 			relayOnly:  n.RelayOnly, // task 32
 
-			badge:              n.Badge,
-			badgeSig:           n.BadgeSig,
-			verifProvider:      n.VerificationProvider,
-			verifiedAt:         n.VerifiedAt,
-			recoveryCommitment: n.RecoveryCommitment,
-			recoveryProvider:   n.RecoveryProvider,
+			badge:                 n.Badge,
+			badgeSig:              n.BadgeSig,
+			verifProvider:         n.VerificationProvider,
+			verifiedAt:            n.VerifiedAt,
+			recoveryCommitment:    n.RecoveryCommitment,
+			recoveryProvider:      n.RecoveryProvider,
+			recoveryConsumedNonce: n.RecoveryConsumedNonce,
+			recoveryConsumedExp:   n.RecoveryConsumedExp,
 		})
 		shard.RUnlock()
 	}
@@ -335,6 +339,10 @@ func (s *Server) flushSave() (retErr error) {
 		}
 		sn.RecoveryCommitment = rn.recoveryCommitment
 		sn.RecoveryProvider = rn.recoveryProvider
+		sn.RecoveryConsumedNonce = rn.recoveryConsumedNonce
+		if !rn.recoveryConsumedExp.IsZero() {
+			sn.RecoveryConsumedExp = rn.recoveryConsumedExp.Format(time.RFC3339)
+		}
 		snap.Nodes[fmt.Sprintf("%d", rn.id)] = sn
 
 		// Dashboard metrics (computed outside lock)
@@ -750,6 +758,12 @@ func (s *Server) load() error {
 		}
 		node.RecoveryCommitment = n.RecoveryCommitment
 		node.RecoveryProvider = n.RecoveryProvider
+		node.RecoveryConsumedNonce = n.RecoveryConsumedNonce
+		if n.RecoveryConsumedExp != "" {
+			if t, err := time.Parse(time.RFC3339, n.RecoveryConsumedExp); err == nil {
+				node.RecoveryConsumedExp = t
+			}
+		}
 		s.nodes[n.ID] = node
 		s.pubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

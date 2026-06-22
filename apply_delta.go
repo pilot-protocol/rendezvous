@@ -420,5 +420,15 @@ func (s *Server) applyKeyRotationDelta(data json.RawMessage) error {
 		}
 	}
 	node.KeyMeta.RotateCount++
+	// Recovery-driven rotations rotate the address to a new holder, so the
+	// prior verification badge must NOT survive replay (ForceRotateKey clears
+	// it in-memory; without this a crash between WAL fsync and the next
+	// snapshot would leave a stale badge bound to the recovered key).
+	if d.ClearBadge {
+		node.Badge = ""
+		node.BadgeSig = ""
+		node.VerificationProvider = ""
+		node.VerifiedAt = time.Time{}
+	}
 	return nil
 }

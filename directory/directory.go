@@ -85,6 +85,15 @@ type NodeInfo struct {
 	RecoveryCommitment string
 	RecoveryProvider   string
 
+	// RecoveryConsumedNonce / RecoveryConsumedExp record the last recovery
+	// authorization nonce redeemed for this node, with its expiry. Persisted
+	// and replicated so a redeemed-but-unexpired recovery cannot be replayed
+	// after a registry restart or standby failover (the in-memory ledger is
+	// lost on restart, but this binding survives). Bounded by the 30-minute
+	// maxRecoveryWindow, after which it no longer matters.
+	RecoveryConsumedNonce string
+	RecoveryConsumedExp   time.Time
+
 	// LastSeenNano stores time.UnixNano() for lock-free heartbeat updates.
 	LastSeenNano atomic.Int64
 	// LastVerifiedNano stores the last Ed25519 verify time. Used by verify-skip.

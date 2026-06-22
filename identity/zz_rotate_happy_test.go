@@ -46,7 +46,7 @@ func TestHandleRotateKey_HappyPath(t *testing.T) {
 		Save:            func() {},
 		Audit:           func(string, ...any) {},
 		IncKeyRotations: func() {},
-		RecordWAL:       func(uint32, string, string) {},
+		RecordWAL:       func(uint32, string, string, bool) {},
 		OnKeyRotated:    func(uint32, string, string) {},
 	})
 

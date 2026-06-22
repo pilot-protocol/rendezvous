@@ -37,7 +37,7 @@ func newAdminStore(t *testing.T, nodes map[uint32]fakeNode, adminOK bool) *Store
 		Audit:               func(string, ...any) {},
 		IncKeyRotations:     func() {},
 		IncIDPVerifications: func() {},
-		RecordWAL:           func(uint32, string, string) {},
+		RecordWAL:           func(uint32, string, string, bool) {},
 		OnKeyRotated:        func(uint32, string, string) {},
 	})
 }

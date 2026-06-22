@@ -630,11 +630,12 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		Audit:               s.audit,
 		IncKeyRotations:     s.metrics.KeyRotations.Inc,
 		IncIDPVerifications: s.metrics.IdpVerifications.Inc,
-		RecordWAL: func(nodeID uint32, newPubKeyB64, rotatedAt string) {
+		RecordWAL: func(nodeID uint32, newPubKeyB64, rotatedAt string, clearBadge bool) {
 			s.recordWAL(DeltaKeyRotation, nodeID, keyRotationDelta{
 				NodeID:       nodeID,
 				NewPublicKey: newPubKeyB64,
 				RotatedAt:    rotatedAt,
+				ClearBadge:   clearBadge,
 			})
 		},
 		OnKeyRotated: func(nodeID uint32, oldPubKeyB64, newPubKeyB64 string) {
