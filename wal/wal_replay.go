@@ -58,4 +58,10 @@ type KeyRotationDelta struct {
 	NodeID       uint32 `json:"node_id"`
 	NewPublicKey string `json:"new_public_key"` // base64
 	RotatedAt    string `json:"rotated_at"`     // RFC3339
+
+	// ClearBadge is set for recovery-driven rotations (force-rotate to a new
+	// holder). When true, replay drops the verification badge so a crash
+	// between the WAL fsync and the next snapshot doesn't leave a stale badge
+	// bound to the recovered key. Normal rotate_key sets this false.
+	ClearBadge bool `json:"clear_badge,omitempty"`
 }

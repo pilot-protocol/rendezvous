@@ -53,6 +53,12 @@ type SnapshotNode struct {
 	VerifiedAt           string `json:"verified_at,omitempty"`
 	RecoveryCommitment   string `json:"recovery_commitment,omitempty"`
 	RecoveryProvider     string `json:"recovery_provider,omitempty"`
+
+	// Last redeemed recovery-authorization nonce + its expiry. Persisted so a
+	// redeemed-but-unexpired recovery cannot be replayed across a restart or
+	// standby failover (the in-memory single-use ledger is lost on restart).
+	RecoveryConsumedNonce string `json:"recovery_consumed_nonce,omitempty"`
+	RecoveryConsumedExp   string `json:"recovery_consumed_exp,omitempty"`
 }
 
 // SnapshotNet is the JSON-serializable form of a single registry network.

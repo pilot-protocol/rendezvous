@@ -33,6 +33,8 @@ type fakeNode struct {
 	verifiedAt time.Time
 	recCommit  string
 	recProv    string
+	recNonce   string
+	recExp     time.Time
 }
 
 func (v *fakeNodeView) LookupNodeKey(id uint32) ([]byte, bool) {
@@ -92,6 +94,18 @@ func (v *fakeNodeView) GetRecoveryEnrollment(id uint32) (string, string, bool) {
 	}
 	return n.recCommit, n.recProv, true
 }
+func (v *fakeNodeView) ConsumeRecoveryNonce(id uint32, nonce string, exp time.Time) (bool, bool) {
+	n, ok := v.nodes[id]
+	if !ok {
+		return false, false
+	}
+	if nonce != "" && n.recNonce == nonce {
+		return false, true
+	}
+	n.recNonce, n.recExp = nonce, exp
+	v.nodes[id] = n
+	return true, true
+}
 func (v *fakeNodeView) ForceRotateKey(id uint32, newPubKey []byte, at time.Time) (string, error) {
 	n, ok := v.nodes[id]
 	if !ok {
@@ -109,7 +123,7 @@ func newTestStore() *Store {
 		Audit:               func(string, ...any) {},
 		IncKeyRotations:     func() {},
 		IncIDPVerifications: func() {},
-		RecordWAL:           func(uint32, string, string) {},
+		RecordWAL:           func(uint32, string, string, bool) {},
 		OnKeyRotated:        func(uint32, string, string) {},
 	})
 }

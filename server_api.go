@@ -469,6 +469,29 @@ func (s *Server) GetRecoveryEnrollment(id uint32) (commitment, provider string, 
 	return node.RecoveryCommitment, node.RecoveryProvider, true
 }
 
+// ConsumeRecoveryNonce satisfies identpkg.NodeView. It records a recovery
+// nonce as consumed for the node — persisted and replicated alongside the
+// recovery commitment — so a redeemed authorization cannot be replayed after
+// a restart or standby failover. Returns recorded=false (without mutating)
+// if the same nonce is already recorded as consumed for this node.
+func (s *Server) ConsumeRecoveryNonce(id uint32, nonce string, exp time.Time) (recorded, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false, false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	defer sh.Unlock()
+	if nonce != "" && node.RecoveryConsumedNonce == nonce {
+		return false, true
+	}
+	node.RecoveryConsumedNonce = nonce
+	node.RecoveryConsumedExp = exp
+	return true, true
+}
+
 // ForceRotateKey satisfies identpkg.NodeView. Swaps the public key WITHOUT
 // an old-key stale-check — used only by identity recovery, authorized by a
 // cold-key-signed recovery statement rather than the old key.
