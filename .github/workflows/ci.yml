@@ -14,12 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.0
         with:
           path: rendezvous
 
       - name: Checkout web4
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.0
         with:
           repository: TeoSlayer/pilotprotocol
           path: web4
