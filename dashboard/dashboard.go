@@ -739,9 +739,10 @@ func (l *ipRateLimiter) middleware(maxReqs int, window time.Duration, next http.
 // requireAdminToken wraps next so it returns 401 Unauthorized to anyone
 // that doesn't present the operator-configured admin token. The token
 // may be supplied via X-Admin-Token header (preferred for write paths)
-// or admin_token=... query parameter (read-only convenience). When no
-// admin token is configured on the server the wrapped path is locked
-// shut entirely — operators must set -admin-token to enable access.
+// or admin_token=... query parameter (GET only — read-only convenience;
+// mutations require the header to prevent CSRF from leaked URLs).
+// When no admin token is configured on the server the wrapped path is
+// locked shut entirely — operators must set -admin-token to enable access.
 //
 // Used to lock down the previously-public stats / pulse / badge /
 // snapshot endpoints so polo.pilotprotocol.network can expose only the
@@ -750,7 +751,10 @@ func (l *ipRateLimiter) middleware(maxReqs int, window time.Duration, next http.
 func (h *Handler) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Admin-Token")
-		if token == "" {
+		// Query-param fallback only for GET (read-only, no CSRF risk).
+		// POST/PUT/DELETE require the header so a leaked URL cannot
+		// be used for cross-site mutation attacks.
+		if token == "" && r.Method == http.MethodGet {
 			token = r.URL.Query().Get("admin_token")
 		}
 		adminToken := h.cb.GetAdminToken()

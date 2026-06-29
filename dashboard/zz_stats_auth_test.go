@@ -3,6 +3,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -98,4 +99,58 @@ func TestStatsAuth_UnconfiguredLocksShut(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("unconfigured: status %d, want 401", resp.StatusCode)
 	}
+}
+
+// TestRequireAdminToken_RejectsQueryParamOnWrite confirms that
+// requireAdminToken rejects admin_token= query-param for POST/PUT/DELETE,
+// preventing CSRF and referer leaks from a leaked URL. The token must
+// be sent via X-Admin-Token header for mutating requests.
+func TestRequireAdminToken_RejectsQueryParamOnWrite(t *testing.T) {
+	t.Parallel()
+	cb := minimalCallbacks()
+	cb.GetAdminToken = func() string { return "op-secret" }
+	h := NewHandler(cb)
+
+	hit := false
+	wrapped := h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	cases := []struct {
+		name   string
+		method string
+	}{
+		{"POST", http.MethodPost},
+		{"PUT", http.MethodPut},
+		{"DELETE", http.MethodDelete},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			hit = false
+			req := httptest.NewRequest(tc.method, "/?admin_token=op-secret", bytes.NewReader(nil))
+			rec := httptest.NewRecorder()
+			wrapped(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s with query-param token: status %d, want 401", tc.method, rec.Code)
+			}
+			if hit {
+				t.Errorf("%s with query-param token: next handler was called unexpectedly", tc.method)
+			}
+		})
+	}
+
+	// Confirm GET still accepts query-param token (read-only convenience).
+	t.Run("GET", func(t *testing.T) {
+		hit = false
+		req := httptest.NewRequest(http.MethodGet, "/?admin_token=op-secret", nil)
+		rec := httptest.NewRecorder()
+		wrapped(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET with query-param token: status %d, want 200", rec.Code)
+		}
+		if !hit {
+			t.Errorf("GET with query-param token: next handler was not called")
+		}
+	})
 }
