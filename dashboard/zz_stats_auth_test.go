@@ -3,6 +3,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -97,5 +98,41 @@ func TestStatsAuth_UnconfiguredLocksShut(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("unconfigured: status %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestAdminToken_CSRF_MutationRejectsQueryParam confirms that
+// query-param admin_token is REJECTED on mutation endpoints (POST/PUT/...)
+// — these require the X-Admin-Token header to prevent CSRF from leaked URLs.
+func TestAdminToken_CSRF_MutationRejectsQueryParam(t *testing.T) {
+	t.Parallel()
+	cb := minimalCallbacks()
+	cb.GetAdminToken = func() string { return "op-secret" }
+	h := NewHandler(cb)
+	srv := httptest.NewServer(h.buildMux())
+	defer srv.Close()
+
+	// POST /api/admin/runtime/gc with query-param token — must 401.
+	body := bytes.NewBufferString("{}")
+	req, _ := http.NewRequest("POST", srv.URL+"/api/admin/runtime/gc?admin_token=op-secret", body)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/admin/runtime/gc (query-param): %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("query-param token on POST got %d, want 401", resp.StatusCode)
+	}
+
+	// POST with proper X-Admin-Token header — must succeed.
+	req2, _ := http.NewRequest("POST", srv.URL+"/api/admin/runtime/gc", body)
+	req2.Header.Set("X-Admin-Token", "op-secret")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("POST /api/admin/runtime/gc (header): %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("header token on POST got %d, want 200", resp2.StatusCode)
 	}
 }
