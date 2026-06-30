@@ -411,14 +411,15 @@ func (st *Store) ClearIDPConfig() {
 	st.mu.Unlock()
 }
 
-// SetPinnedCertFingerprint sets the pinned TLS certificate fingerprint
-// (SHA-256 of the DER-encoded certificate) for the IDP. When set, every
-// outbound TLS connection to the identity provider will verify that the
-// server's certificate matches this fingerprint (PILOT-241).
+// SetPinnedCertFingerprint sets the pinned TLS certificate fingerprint for
+// the IDP. When set, every outbound JWKS TLS connection to the identity
+// provider must, in addition to passing normal chain verification, present a
+// leaf certificate whose fingerprint matches this pin (PILOT-241).
 //
-// The fingerprint should be specified as a lowercase hex-encoded SHA-256
-// hash of the DER-encoded certificate, e.g.
-// "a4b3c2d1e5f6..." (64 hex chars).
+// The fingerprint is a lowercase hex-encoded SHA-256 (64 hex chars) of either
+// the certificate's Subject Public Key Info (SPKI, preferred — survives cert
+// renewal that reuses the key) or the full DER-encoded certificate. Either
+// form is accepted at verification time.
 func (st *Store) SetPinnedCertFingerprint(fp string) {
 	st.mu.Lock()
 	st.pinnedCertFingerprint = fp
@@ -1052,11 +1053,57 @@ func newJWKSCache() *JWKSCache {
 	return NewJWKSCache()
 }
 
+// spkiFingerprint returns the lowercase hex-encoded SHA-256 hash of the
+// certificate's Subject Public Key Info (SPKI). Pinning the SPKI rather than
+// the whole certificate means the pin survives certificate renewal as long as
+// the issuer reuses the same key pair, which is the standard HPKP/RFC 7469
+// practice.
+func spkiFingerprint(cert *x509.Certificate) string {
+	h := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	return hex.EncodeToString(h[:])
+}
+
+// certFingerprint returns the lowercase hex-encoded SHA-256 hash of the full
+// DER-encoded certificate, supporting operators who pin the leaf certificate
+// rather than its public key.
+func certFingerprint(cert *x509.Certificate) string {
+	h := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(h[:])
+}
+
+// pinVerifyConnection returns a tls.Config.VerifyConnection callback that, on
+// top of the standard chain verification that Go performs by default, requires
+// the presented leaf certificate to match the configured pin. The pin may be
+// either the SPKI-SHA256 (preferred) or the full-certificate SHA-256, both
+// hex-encoded. Returning a non-nil error aborts the handshake (PILOT-241).
+func pinVerifyConnection(pinnedFingerprint string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return fmt.Errorf("tls pin: no peer certificate presented")
+		}
+		leaf := cs.PeerCertificates[0]
+		if strings.EqualFold(spkiFingerprint(leaf), pinnedFingerprint) {
+			return nil
+		}
+		if strings.EqualFold(certFingerprint(leaf), pinnedFingerprint) {
+			return nil
+		}
+		return fmt.Errorf("tls pin: leaf certificate fingerprint mismatch (spki=%s cert=%s want=%s)",
+			spkiFingerprint(leaf), certFingerprint(leaf), pinnedFingerprint)
+	}
+}
+
 // jwksPinnedHTTPClient returns an HTTP client for JWKS fetch that enforces
 // TLS certificate pinning when a pinnedFingerprint is provided. The
-// fingerprint is a lowercase hex-encoded SHA-256 hash of the DER-encoded
-// certificate. When no fingerprint is set, the standard jwksHTTPClient
-// is returned (PILOT-241).
+// fingerprint is a lowercase hex-encoded SHA-256 of either the certificate's
+// SPKI (preferred) or the full DER certificate. When no fingerprint is set,
+// the standard jwksHTTPClient is returned (PILOT-241).
+//
+// Pinning is layered ON TOP of normal certificate-chain verification: the
+// default Go verifier still validates the chain, expiry, and hostname
+// (InsecureSkipVerify stays false), and VerifyConnection then additionally
+// requires the leaf to match the configured pin. A MITM presenting a
+// different (even otherwise-valid) certificate is rejected.
 func jwksPinnedHTTPClient(pinnedFingerprint string) *http.Client {
 	if pinnedFingerprint == "" {
 		return jwksHTTPClient
@@ -1068,27 +1115,8 @@ func jwksPinnedHTTPClient(pinnedFingerprint string) *http.Client {
 		},
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-				VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-					if len(rawCerts) == 0 {
-						return fmt.Errorf("no peer certificate to pin")
-					}
-					cert, err := x509.ParseCertificate(rawCerts[0])
-					if err != nil {
-						return fmt.Errorf("parse peer certificate: %w", err)
-					}
-					h := sha256.Sum256(cert.Raw)
-					got := hex.EncodeToString(h[:])
-					if !strings.EqualFold(got, pinnedFingerprint) {
-						return fmt.Errorf("certificate fingerprint mismatch: got %s, want %s", got, pinnedFingerprint)
-					}
-					return nil
-				},
-				// InsecureSkipVerify is true because VerifyPeerCertificate does
-				// the actual cert verification via fingerprint check. The standard
-				// chain verification is bypassed to allow self-signed or
-				// non-CA-signed certs that match the pinned fingerprint.
-				InsecureSkipVerify: true,
+				MinVersion:       tls.VersionTLS12,
+				VerifyConnection: pinVerifyConnection(pinnedFingerprint),
 			},
 		},
 	}
@@ -1168,7 +1196,8 @@ func fetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
 }
 
 // FetchJWKSKeysWithPinning fetches JWKS keys with TLS certificate pinning.
-// The pinnedFingerprint is a hex-encoded SHA-256 of the DER certificate.
+// The pinnedFingerprint is a hex-encoded SHA-256 of the leaf certificate's
+// SPKI (preferred) or full DER certificate; an empty value disables pinning.
 func FetchJWKSKeysWithPinning(jwksURL, pinnedFingerprint string) ([]JwksKey, error) {
 	client := jwksPinnedHTTPClient(pinnedFingerprint)
 	return fetchJWKSKeysWithClient(jwksURL, client)
