@@ -13,6 +13,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -63,17 +64,31 @@ type WALRecorder func(nodeID uint32, newPubKeyB64, rotatedAt string, clearBadge 
 // concurrent rotation landed between Phase 1 (snapshot) and Phase 3 (commit).
 var ErrKeyRotatedConcurrently = fmt.Errorf("rotate_key: key rotated concurrently, retry")
 
-// sharedHTTPClient is reused across identity webhook and JWKS fetch calls so
-// that the underlying TCP connections are pooled by the transport layer.
-var sharedHTTPClient = &http.Client{Timeout: 5 * time.Second}
+// sharedHTTPClient is reused across identity webhook calls so that the
+// underlying TCP connections are pooled by the transport layer.
+// It disables redirects entirely (a redirect during identity webhook calls
+// is a protocol anomaly and a supply-chain attack vector) and enforces a
+// TLS 1.2 minimum version (PILOT-241).
+var sharedHTTPClient = &http.Client{
+	Timeout: 5 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
+}
 
 // jwksHTTPClient is a hardened HTTP client used ONLY for JWKS key-fetch
 // (fetchJWKSKeys). It disables redirects entirely (a redirect during JWKS
 // fetch is a protocol anomaly and a supply-chain attack vector) and enforces
 // a TLS 1.2 minimum version.
 //
-// TLS certificate pinning per-IDP is a follow-up tracked in PILOT-241; it
-// requires a new BlueprintIdentityProvider field in common/registry/wire.
+// TLS certificate pinning is handled via jwksPinnedHTTPClient which returns
+// a client that verifies the server's TLS certificate fingerprint against
+// the configured pinned fingerprint (PILOT-241).
 var jwksHTTPClient = &http.Client{
 	Timeout: 10 * time.Second,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -198,6 +213,7 @@ type Store struct {
 	identityWebhookURL    string
 	identityWebhookSecret string
 	idpConfig             *BlueprintIdentityProvider
+	pinnedCertFingerprint string
 
 	jwksCache *JWKSCache
 
@@ -391,7 +407,31 @@ func (st *Store) ClearIDPConfig() {
 	st.mu.Lock()
 	st.idpConfig = nil
 	st.identityWebhookURL = ""
+	st.pinnedCertFingerprint = ""
 	st.mu.Unlock()
+}
+
+// SetPinnedCertFingerprint sets the pinned TLS certificate fingerprint for
+// the IDP. When set, every outbound JWKS TLS connection to the identity
+// provider must, in addition to passing normal chain verification, present a
+// leaf certificate whose fingerprint matches this pin (PILOT-241).
+//
+// The fingerprint is a lowercase hex-encoded SHA-256 (64 hex chars) of either
+// the certificate's Subject Public Key Info (SPKI, preferred — survives cert
+// renewal that reuses the key) or the full DER-encoded certificate. Either
+// form is accepted at verification time.
+func (st *Store) SetPinnedCertFingerprint(fp string) {
+	st.mu.Lock()
+	st.pinnedCertFingerprint = fp
+	st.mu.Unlock()
+}
+
+// GetPinnedCertFingerprint returns the currently configured pinned
+// TLS certificate fingerprint, or empty string if not set.
+func (st *Store) GetPinnedCertFingerprint() string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.pinnedCertFingerprint
 }
 
 // ---------------------------------------------------------------------------
@@ -812,7 +852,7 @@ func (st *Store) HandleValidateToken(msg map[string]interface{}) (map[string]int
 
 	switch header.Alg {
 	case "HS256":
-		key, err := st.jwksCache.GetKey(idp.URL, header.Kid)
+		key, err := st.jwksCache.GetKeyWithPinning(idp.URL, header.Kid, st.pinnedCertFingerprint)
 		if err != nil {
 			return nil, fmt.Errorf("JWKS: %w", err)
 		}
@@ -835,7 +875,7 @@ func (st *Store) HandleValidateToken(msg map[string]interface{}) (map[string]int
 		}
 
 	case "RS256":
-		key, err := st.jwksCache.GetKey(idp.URL, header.Kid)
+		key, err := st.jwksCache.GetKeyWithPinning(idp.URL, header.Kid, st.pinnedCertFingerprint)
 		if err != nil {
 			return nil, fmt.Errorf("JWKS: %w", err)
 		}
@@ -1013,8 +1053,86 @@ func newJWKSCache() *JWKSCache {
 	return NewJWKSCache()
 }
 
+// spkiFingerprint returns the lowercase hex-encoded SHA-256 hash of the
+// certificate's Subject Public Key Info (SPKI). Pinning the SPKI rather than
+// the whole certificate means the pin survives certificate renewal as long as
+// the issuer reuses the same key pair, which is the standard HPKP/RFC 7469
+// practice.
+func spkiFingerprint(cert *x509.Certificate) string {
+	h := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	return hex.EncodeToString(h[:])
+}
+
+// certFingerprint returns the lowercase hex-encoded SHA-256 hash of the full
+// DER-encoded certificate, supporting operators who pin the leaf certificate
+// rather than its public key.
+func certFingerprint(cert *x509.Certificate) string {
+	h := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(h[:])
+}
+
+// pinVerifyConnection returns a tls.Config.VerifyConnection callback that, on
+// top of the standard chain verification that Go performs by default, requires
+// the presented leaf certificate to match the configured pin. The pin may be
+// either the SPKI-SHA256 (preferred) or the full-certificate SHA-256, both
+// hex-encoded. Returning a non-nil error aborts the handshake (PILOT-241).
+func pinVerifyConnection(pinnedFingerprint string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return fmt.Errorf("tls pin: no peer certificate presented")
+		}
+		leaf := cs.PeerCertificates[0]
+		if strings.EqualFold(spkiFingerprint(leaf), pinnedFingerprint) {
+			return nil
+		}
+		if strings.EqualFold(certFingerprint(leaf), pinnedFingerprint) {
+			return nil
+		}
+		return fmt.Errorf("tls pin: leaf certificate fingerprint mismatch (spki=%s cert=%s want=%s)",
+			spkiFingerprint(leaf), certFingerprint(leaf), pinnedFingerprint)
+	}
+}
+
+// jwksPinnedHTTPClient returns an HTTP client for JWKS fetch that enforces
+// TLS certificate pinning when a pinnedFingerprint is provided. The
+// fingerprint is a lowercase hex-encoded SHA-256 of either the certificate's
+// SPKI (preferred) or the full DER certificate. When no fingerprint is set,
+// the standard jwksHTTPClient is returned (PILOT-241).
+//
+// Pinning is layered ON TOP of normal certificate-chain verification: the
+// default Go verifier still validates the chain, expiry, and hostname
+// (InsecureSkipVerify stays false), and VerifyConnection then additionally
+// requires the leaf to match the configured pin. A MITM presenting a
+// different (even otherwise-valid) certificate is rejected.
+func jwksPinnedHTTPClient(pinnedFingerprint string) *http.Client {
+	if pinnedFingerprint == "" {
+		return jwksHTTPClient
+	}
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion:       tls.VersionTLS12,
+				VerifyConnection: pinVerifyConnection(pinnedFingerprint),
+			},
+		},
+	}
+}
+
 // GetKey returns the JWKS key for the given URL and kid, fetching if stale.
+// Pinning is not applied; use GetKeyWithPinning for pinned TLS verification.
 func (c *JWKSCache) GetKey(jwksURL, kid string) (*JwksKey, error) {
+	return c.GetKeyWithPinning(jwksURL, kid, "")
+}
+
+// GetKeyWithPinning returns the JWKS key for the given URL and kid, fetching
+// if stale. When pinnedFingerprint is non-empty, the TLS connection is
+// verified against the certificate fingerprint (SHA-256 of DER) so that a
+// MITM serving a different certificate is rejected (PILOT-241).
+func (c *JWKSCache) GetKeyWithPinning(jwksURL, kid, pinnedFingerprint string) (*JwksKey, error) {
 	c.mu.RLock()
 	if c.URL == jwksURL && time.Since(c.FetchedAt) < c.TTL && len(c.Keys) > 0 {
 		if kid == "" {
@@ -1038,7 +1156,7 @@ func (c *JWKSCache) GetKey(jwksURL, kid string) (*JwksKey, error) {
 	}
 	c.mu.RUnlock()
 
-	keys, err := FetchJWKSKeys(jwksURL)
+	keys, err := FetchJWKSKeysWithPinning(jwksURL, pinnedFingerprint)
 	if err != nil {
 		return nil, err
 	}
@@ -1074,7 +1192,19 @@ func FetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
 }
 
 func fetchJWKSKeys(jwksURL string) ([]JwksKey, error) {
-	resp, err := jwksHTTPClient.Get(jwksURL)
+	return fetchJWKSKeysWithClient(jwksURL, jwksHTTPClient)
+}
+
+// FetchJWKSKeysWithPinning fetches JWKS keys with TLS certificate pinning.
+// The pinnedFingerprint is a hex-encoded SHA-256 of the leaf certificate's
+// SPKI (preferred) or full DER certificate; an empty value disables pinning.
+func FetchJWKSKeysWithPinning(jwksURL, pinnedFingerprint string) ([]JwksKey, error) {
+	client := jwksPinnedHTTPClient(pinnedFingerprint)
+	return fetchJWKSKeysWithClient(jwksURL, client)
+}
+
+func fetchJWKSKeysWithClient(jwksURL string, client *http.Client) ([]JwksKey, error) {
+	resp, err := client.Get(jwksURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
