@@ -117,6 +117,14 @@ type Callbacks struct {
 	// implicitly allowed (default-Closed semantics, same as a missing
 	// breakers.json).
 	BreakerAllow func(name string) (allowed bool, reason string)
+	// VerifyRequest verifies an external request-signature envelope
+	// (reqsig canonical form) plus its base64 signature and returns the
+	// JSON-serializable verification response (server.VerifyResponse).
+	// nil disables POST /api/v1/verify.
+	VerifyRequest func(canonical, sigB64 string) interface{}
+	// VerifyKeys returns the verdict-issuer public keys published on
+	// GET /api/v1/verify/keys. Each entry carries kid, algo, public_key.
+	VerifyKeys func() []map[string]string
 	// BreakerList returns the live snapshot for /api/breakers — one
 	// entry per known name with state, reason, counters, last-denied
 	// timestamp. Required for the read endpoint; nil disables it.
@@ -307,6 +315,12 @@ type Handler struct {
 	// Per-IP rate limiter for public badge endpoints.
 	badgeLimiter *ipRateLimiter
 
+	// Per-IP rate limiters for the public verification endpoints.
+	// Deliberately separate buckets from badgeLimiter (and from each
+	// other) so verify traffic can't starve badge fetches or vice versa.
+	verifyLimiter     *ipRateLimiter
+	verifyKeysLimiter *ipRateLimiter
+
 	// Probe state — per-probe health history ring.
 	probeMu       sync.Mutex
 	probeStates   map[string]*ProbeState
@@ -321,7 +335,12 @@ type Handler struct {
 
 // NewHandler creates a ready-to-use dashboard Handler backed by cb.
 func NewHandler(cb Callbacks) *Handler {
-	return &Handler{cb: cb, badgeLimiter: newIPRateLimiter()}
+	return &Handler{
+		cb:                cb,
+		badgeLimiter:      newIPRateLimiter(),
+		verifyLimiter:     newIPRateLimiter(),
+		verifyKeysLimiter: newIPRateLimiter(),
+	}
 }
 
 // SetWhitelistCallbacks wires the GET/PUT /api/admin/whitelist endpoints
@@ -782,6 +801,104 @@ func localhostOnly(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // --------------------------------------------------------------------------
+// External request verification — /api/v1/verify
+// --------------------------------------------------------------------------
+
+// maxVerifyBodyBytes caps the POST /api/v1/verify request body. A canonical
+// envelope plus base64 signature fits comfortably under 1 KB; 8 KB leaves
+// headroom without letting anonymous callers stream junk.
+const maxVerifyBodyBytes = 8 << 10
+
+// registerVerifyRoutes registers the public verification endpoints on mux.
+// Called from Serve; split out so tests can mount the routes on a bare mux
+// without spinning up the full Serve lifecycle.
+func (h *Handler) registerVerifyRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/v1/verify", h.verifyLimiter.middleware(60, time.Minute, h.handleVerify))
+	mux.HandleFunc("/api/v1/verify/keys", h.verifyKeysLimiter.middleware(120, time.Minute, h.handleVerifyKeys))
+}
+
+// verifyBreakerDenied writes the 503 breaker payload (same shape as
+// /api/public-stats) and reports whether the request was denied. Both
+// verification endpoints share the single "dashboard.verify" switch.
+func (h *Handler) verifyBreakerDenied(w http.ResponseWriter) bool {
+	if h.cb.BreakerAllow == nil {
+		return false
+	}
+	ok, reason := h.cb.BreakerAllow("dashboard.verify")
+	if ok {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	body := map[string]string{"status": "unavailable"}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	_ = json.NewEncoder(w).Encode(body)
+	return true
+}
+
+// handleVerify serves POST /api/v1/verify — public (no admin token),
+// breaker-gated, per-IP rate-limited. Body: {"envelope":"...","signature":"..."}.
+// The response is the server's VerifyResponse; failures inside verification
+// still return 200 with valid:false (uniform shape, no existence oracle).
+func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.verifyBreakerDenied(w) {
+		return
+	}
+	if h.cb.VerifyRequest == nil {
+		http.Error(w, "verification not available", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxVerifyBodyBytes)
+	defer r.Body.Close()
+	var req struct {
+		Envelope  string `json:"envelope"`
+		Signature string `json:"signature"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// MaxBytesReader turns an oversized body into a read error, so
+		// malformed JSON and oversized bodies both land here.
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Envelope == "" || req.Signature == "" {
+		http.Error(w, "envelope and signature are required", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	_ = json.NewEncoder(w).Encode(h.cb.VerifyRequest(req.Envelope, req.Signature))
+}
+
+// handleVerifyKeys serves GET /api/v1/verify/keys — the verdict-issuer public
+// keys, so consumers can pin them and check verdicts offline.
+func (h *Handler) handleVerifyKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.verifyBreakerDenied(w) {
+		return
+	}
+	keys := []map[string]string{}
+	if h.cb.VerifyKeys != nil {
+		if k := h.cb.VerifyKeys(); k != nil {
+			keys = k
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"keys": keys})
+}
+
+// --------------------------------------------------------------------------
 // Serve
 // --------------------------------------------------------------------------
 
@@ -798,6 +915,11 @@ func (h *Handler) Serve(addr string) error {
 // registration and drifting from production wiring.
 func (h *Handler) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
+
+	// /api/v1/verify + /api/v1/verify/keys — public external
+	// request-signature verification (no admin token, breaker-gated,
+	// per-IP rate-limited).
+	h.registerVerifyRoutes(mux)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1090,6 +1091,20 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		BreakerSet:        s.BreakerSet,
 		BreakerDelete:     s.BreakerDelete,
 		HealthSnapshot:    s.HealthSnapshot,
+		VerifyRequest: func(canonical, sigB64 string) interface{} {
+			return s.VerifyRequest(canonical, sigB64)
+		},
+		VerifyKeys: func() []map[string]string {
+			pub := s.VerdictPublicKey()
+			if len(pub) == 0 {
+				return nil
+			}
+			return []map[string]string{{
+				"kid":        s.VerdictKid(),
+				"algo":       "ed25519",
+				"public_key": base64.StdEncoding.EncodeToString(pub),
+			}}
+		},
 		ReplicationStatus: replSnap,
 		NetworksList:      s.AdminListNetworks,
 		MembersList:       s.AdminListMembers,
