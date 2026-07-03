@@ -1022,6 +1022,14 @@ func (st *Store) HandleLookup(msg map[string]interface{}) (map[string]interface{
 		"public_key": crypto.EncodePublicKey(node.PublicKey),
 		"public":     node.Public,
 	}
+	// Additive enrichment for external verifiers (JSON path only — the
+	// binary lookup wire format is untouched).
+	if ls := node.GetLastSeen(); !ls.IsZero() {
+		resp["last_seen_unix"] = ls.Unix()
+	} else {
+		resp["last_seen_unix"] = int64(0)
+	}
+	resp["key_generation"] = node.KeyMeta.RotateCount
 	if node.Hostname != "" {
 		resp["hostname"] = node.Hostname
 	}

@@ -3,6 +3,7 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -219,6 +220,15 @@ type Server struct {
 
 	// Clock (overridable for testing)
 	now func() time.Time
+
+	// Verdict signing key for the external verification endpoint
+	// (POST /api/v1/verify). Lazily initialized on first use via
+	// verdictKeyOnce; persisted as verdict-key.json next to the registry
+	// snapshot when persistence is configured, ephemeral otherwise.
+	// Immutable after initialization — read without holding s.mu.
+	verdictKeyOnce sync.Once
+	verdictKid     string
+	verdictPriv    ed25519.PrivateKey
 
 	// staleNodeThreshold controls how long since last heartbeat a node is
 	// considered online for dashboard / reap purposes. Defaults to
