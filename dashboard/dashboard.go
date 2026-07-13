@@ -2117,7 +2117,7 @@ footer a:hover{color:var(--accent)}
 <footer>
   Pilot Protocol &middot;
   <a href="https://pilotprotocol.network">pilotprotocol.network</a> &middot;
-  <a href="https://github.com/TeoSlayer/pilotprotocol">GitHub</a>
+  <a href="https://github.com/pilot-protocol/pilotprotocol">GitHub</a>
   <div id="build-info" class="build-info" style="display:none"></div>
 </footer>
 

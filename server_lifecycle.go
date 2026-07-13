@@ -1135,7 +1135,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		},
 	})
 
-	s.releasePoller = newReleasePoller("TeoSlayer/pilotprotocol")
+	s.releasePoller = newReleasePoller("pilot-protocol/pilotprotocol")
 	go s.dashboard.StatsCollectorLoop(s.readyCh, s.done, s.sampleStats, s.recordSample)
 	go s.dashboard.PulseLoop()
 	go s.heartbeatLoop()
