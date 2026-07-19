@@ -24,7 +24,7 @@ jobs:
           repository: pilot-protocol/pilotprotocol
           path: web4
 
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: rendezvous/go.mod
           cache: true
