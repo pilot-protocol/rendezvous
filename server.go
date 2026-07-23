@@ -283,6 +283,8 @@ type Server struct {
 	listNodesCache    listNodesCacheState // legacy backbone admin cache
 	listNodesPerNetMu sync.Mutex          // guards the map itself
 	listNodesPerNet   map[uint16]*listNodesCacheState
+
+	strictDirectoryAuth atomic.Bool
 }
 
 // listNodesCacheState is defined in the directory sub-package (R4.2).

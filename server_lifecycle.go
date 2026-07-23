@@ -110,6 +110,21 @@ func (s *Server) SetMaxNodes(n int) {
 	s.mu.Unlock()
 }
 
+// SetStrictDirectoryAuth toggles WS2 strict directory authorization. When
+// enabled, private-node directory RPCs (lookup/resolve/resolve_hostname/
+// list_nodes/punch/check_trust/list_networks) require the requester to prove
+// trust or shared-network membership. Default off for wire-compatibility.
+func (s *Server) SetStrictDirectoryAuth(enabled bool) {
+	s.strictDirectoryAuth.Store(enabled)
+}
+
+// StrictDirectoryAuth reports whether WS2 strict directory authorization is
+// enforced. Wired into the trust/membership/directory/routing sub-packages as
+// a callback so gating stays lock-free on the hot path.
+func (s *Server) StrictDirectoryAuth() bool {
+	return s.strictDirectoryAuth.Load()
+}
+
 // SetDashboardToken gates per-network stats on the dashboard.
 // Empty string restricts the dashboard to global aggregates only.
 func (s *Server) SetDashboardToken(token string) {
@@ -625,6 +640,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		IncTrustReports:      s.metrics.TrustReports.Inc,
 		IncTrustRevocations:  s.metrics.TrustRevocations.Inc,
 		IncHandshakeRequests: s.metrics.HandshakeRequests.Inc,
+		StrictDirectoryAuth:  s.StrictDirectoryAuth,
 	})
 	s.identity = identpkg.NewStore(s, identpkg.Callbacks{ // R2.3: identity sub-package
 		Save:                s.save,
@@ -792,10 +808,11 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				sh.Unlock()
 				return found
 			},
-			IncInvitesSent:     s.metrics.InvitesSent.Inc,
-			IncInvitesAccepted: s.metrics.InvitesAccepted.Inc,
-			IncInvitesRejected: s.metrics.InvitesRejected.Inc,
-			IncRbacOps:         func(op string) { s.metrics.RbacOps.WithLabel(op).Inc() },
+			IncInvitesSent:      s.metrics.InvitesSent.Inc,
+			IncInvitesAccepted:  s.metrics.InvitesAccepted.Inc,
+			IncInvitesRejected:  s.metrics.InvitesRejected.Inc,
+			IncRbacOps:          func(op string) { s.metrics.RbacOps.WithLabel(op).Inc() },
+			StrictDirectoryAuth: s.StrictDirectoryAuth,
 		},
 		func() time.Time { return s.now() },
 	)
@@ -924,6 +941,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				}
 				return nets
 			},
+			StrictDirectoryAuth: s.StrictDirectoryAuth,
 		},
 	)
 

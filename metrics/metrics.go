@@ -86,83 +86,57 @@ func (h *Histogram) Snapshot() (buckets []float64, counts []uint64, sum float64,
 	return buckets, counts, h.sum, h.count
 }
 
-// CounterVec is a set of Counters keyed by a single label value.
 type CounterVec struct {
-	mu       sync.RWMutex
-	counters map[string]*Counter
+	counters sync.Map
 }
 
 func NewCounterVec() *CounterVec {
-	return &CounterVec{counters: make(map[string]*Counter)}
+	return &CounterVec{}
 }
 
 func (cv *CounterVec) WithLabel(val string) *Counter {
-	cv.mu.RLock()
-	c, ok := cv.counters[val]
-	cv.mu.RUnlock()
-	if ok {
-		return c
+	if c, ok := cv.counters.Load(val); ok {
+		return c.(*Counter)
 	}
-	cv.mu.Lock()
-	defer cv.mu.Unlock()
-	if c, ok = cv.counters[val]; ok {
-		return c
-	}
-	c = &Counter{}
-	cv.counters[val] = c
-	return c
+	c, _ := cv.counters.LoadOrStore(val, &Counter{})
+	return c.(*Counter)
 }
 
 func (cv *CounterVec) Snapshot() []LabelValue {
-	cv.mu.RLock()
-	defer cv.mu.RUnlock()
-	out := make([]LabelValue, 0, len(cv.counters))
-	for k, c := range cv.counters {
-		out = append(out, LabelValue{Label: k, Value: c.Get()})
-	}
+	out := make([]LabelValue, 0)
+	cv.counters.Range(func(k, v any) bool {
+		out = append(out, LabelValue{Label: k.(string), Value: v.(*Counter).Get()})
+		return true
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
 	return out
 }
 
-// HistogramVec is a set of Histograms keyed by a single label value.
 type HistogramVec struct {
-	mu         sync.RWMutex
-	histograms map[string]*Histogram
+	histograms sync.Map
 	buckets    []float64
 }
 
 func NewHistogramVec(buckets []float64) *HistogramVec {
-	return &HistogramVec{
-		histograms: make(map[string]*Histogram),
-		buckets:    buckets,
-	}
+	return &HistogramVec{buckets: buckets}
 }
 
 func (hv *HistogramVec) WithLabel(val string) *Histogram {
-	hv.mu.RLock()
-	h, ok := hv.histograms[val]
-	hv.mu.RUnlock()
-	if ok {
-		return h
+	if h, ok := hv.histograms.Load(val); ok {
+		return h.(*Histogram)
 	}
-	hv.mu.Lock()
-	defer hv.mu.Unlock()
-	if h, ok = hv.histograms[val]; ok {
-		return h
-	}
-	h = NewHistogram(hv.buckets)
-	hv.histograms[val] = h
-	return h
+	h, _ := hv.histograms.LoadOrStore(val, NewHistogram(hv.buckets))
+	return h.(*Histogram)
 }
 
 func (hv *HistogramVec) Snapshot() []LabelHistogram {
-	hv.mu.RLock()
-	defer hv.mu.RUnlock()
-	out := make([]LabelHistogram, 0, len(hv.histograms))
-	for k, h := range hv.histograms {
+	out := make([]LabelHistogram, 0)
+	hv.histograms.Range(func(k, v any) bool {
+		h := v.(*Histogram)
 		buckets, counts, sum, count := h.Snapshot()
-		out = append(out, LabelHistogram{Label: k, Buckets: buckets, Counts: counts, Sum: sum, Count: count})
-	}
+		out = append(out, LabelHistogram{Label: k.(string), Buckets: buckets, Counts: counts, Sum: sum, Count: count})
+		return true
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
 	return out
 }

@@ -258,21 +258,35 @@ func (s *Server) NodeAddrs(nodeA, nodeB uint32) (addrA string, okA bool, addrB s
 	s.mu.RLock()
 	a, foundA := s.nodes[nodeA]
 	b, foundB := s.nodes[nodeB]
+	strict := s.StrictDirectoryAuth()
+	beaconAddr := s.beaconAddr
 	s.mu.RUnlock()
 
 	if foundA {
 		shA := s.nodeShard(nodeA)
 		shA.RLock()
-		addrA = a.RealAddr
+		if strict && a.RelayOnly {
+			addrA = beaconAddr
+		} else {
+			addrA = a.RealAddr
+		}
 		shA.RUnlock()
 	}
 	if foundB {
 		shB := s.nodeShard(nodeB)
 		shB.RLock()
-		addrB = b.RealAddr
+		if strict && b.RelayOnly {
+			addrB = beaconAddr
+		} else {
+			addrB = b.RealAddr
+		}
 		shB.RUnlock()
 	}
 	return addrA, foundA, addrB, foundB
+}
+
+func (s *Server) IsTrusted(nodeA, nodeB uint32) bool {
+	return s.trust.IsTrusted(nodeA, nodeB)
 }
 
 // --- Persistence ---

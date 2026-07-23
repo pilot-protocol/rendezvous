@@ -163,7 +163,8 @@ type Callbacks struct {
 	// IncInvitesRejected increments the invites_rejected_total counter.
 	IncInvitesRejected func()
 	// IncRbacOps increments the rbac_operations_total{op=label} counter.
-	IncRbacOps func(op string)
+	IncRbacOps          func(op string)
+	StrictDirectoryAuth func() bool
 }
 
 // Store holds membership handler logic. The actual data maps (networks,
@@ -709,12 +710,44 @@ func (st *Store) HandleSetNetworkEnterprise(msg map[string]interface{}) (map[str
 // HandleListNetworks implements the "list_networks" protocol command.
 func (st *Store) HandleListNetworks(msg map[string]interface{}) (map[string]interface{}, error) {
 	includeMembers := st.cb.RequireAdminToken(msg) == nil
+	strict := st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() && !includeMembers
+
+	var requesterID uint32
+	var requesterVerified bool
+	if strict {
+		requesterID = jsonUint32(msg, "requester_id")
+		if requesterID != 0 {
+			st.mu.RLock()
+			pubKey, _, _, ok := st.cb.GetNode(requesterID)
+			adminToken := st.cb.AdminToken()
+			st.mu.RUnlock()
+			if ok {
+				if err := st.cb.VerifyNodeSignature(pubKey, adminToken, msg, fmt.Sprintf("list_networks:%d", requesterID)); err == nil {
+					requesterVerified = true
+				}
+			}
+		}
+	}
 
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 
 	nets := make([]map[string]interface{}, 0, len(st.networks))
 	for _, n := range st.networks {
+		if strict {
+			isMember := false
+			if requesterVerified {
+				for _, m := range n.Members {
+					if m == requesterID {
+						isMember = true
+						break
+					}
+				}
+			}
+			if n.JoinRule != "open" && !isMember {
+				continue
+			}
+		}
 		entry := map[string]interface{}{
 			"id":         n.ID,
 			"name":       n.Name,
