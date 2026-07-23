@@ -62,6 +62,7 @@ type Callbacks struct {
 	IncTrustRevocations func()
 	// IncHandshakeRequests increments the handshake-requests counter.
 	IncHandshakeRequests func()
+	StrictDirectoryAuth  func() bool
 }
 
 // Store holds all mutable trust-pair and handshake-relay state.
@@ -301,6 +302,21 @@ func (st *Store) HandleRevokeTrust(req map[string]interface{}) (map[string]inter
 func (st *Store) HandleCheckTrust(req map[string]interface{}) (map[string]interface{}, error) {
 	nodeA := jsonUint32(req, "node_id")
 	nodeB := jsonUint32(req, "peer_id")
+
+	if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() {
+		requesterID := jsonUint32(req, "requester_id")
+		if requesterID != nodeA && requesterID != nodeB {
+			return nil, fmt.Errorf("check_trust denied: requester must be participant")
+		}
+		requesterPubKey, _, ok := st.nodes.LookupNode(requesterID)
+		if !ok {
+			return nil, fmt.Errorf("node %d: %w", requesterID, protocol.ErrNodeNotFound)
+		}
+		adminToken := st.nodes.AdminToken()
+		if err := verifyHeartbeatSignature(requesterPubKey, adminToken, req, fmt.Sprintf("check_trust:%d:%d", nodeA, nodeB)); err != nil {
+			return nil, err
+		}
+	}
 
 	st.mu.RLock()
 	trusted := st.trustPairs[pairKey(nodeA, nodeB)]

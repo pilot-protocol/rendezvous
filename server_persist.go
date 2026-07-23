@@ -58,6 +58,13 @@ type rawNodeCopy struct {
 	externalID string
 	version    string
 	relayOnly  bool // task 32
+
+	badge                string
+	badgeSig             string
+	verificationProvider string
+	verifiedAt           time.Time
+	recoveryCommitment   string
+	recoveryProvider     string
 }
 
 // save signals that state has changed and should be persisted AND pushed
@@ -133,6 +140,13 @@ func (s *Server) flushSave() error {
 			externalID: n.ExternalID,
 			version:    n.Version,
 			relayOnly:  n.RelayOnly, // task 32
+
+			badge:                n.Badge,
+			badgeSig:             n.BadgeSig,
+			verificationProvider: n.VerificationProvider,
+			verifiedAt:           n.VerifiedAt,
+			recoveryCommitment:   n.RecoveryCommitment,
+			recoveryProvider:     n.RecoveryProvider,
 		})
 		shard.RUnlock()
 	}
@@ -286,6 +300,14 @@ func (s *Server) flushSave() error {
 		}
 		sn.ExternalID = rn.externalID
 		sn.Version = rn.version
+		sn.Badge = rn.badge
+		sn.BadgeSig = rn.badgeSig
+		sn.VerificationProvider = rn.verificationProvider
+		if !rn.verifiedAt.IsZero() {
+			sn.VerifiedAt = rn.verifiedAt.Format(time.RFC3339)
+		}
+		sn.RecoveryCommitment = rn.recoveryCommitment
+		sn.RecoveryProvider = rn.recoveryProvider
 		snap.Nodes[fmt.Sprintf("%d", rn.id)] = sn
 
 		// Dashboard metrics (computed outside lock)
@@ -690,6 +712,16 @@ func (s *Server) load() error {
 		}
 		node.ExternalID = n.ExternalID
 		node.Version = n.Version
+		node.Badge = n.Badge
+		node.BadgeSig = n.BadgeSig
+		node.VerificationProvider = n.VerificationProvider
+		if n.VerifiedAt != "" {
+			if t, err := time.Parse(time.RFC3339, n.VerifiedAt); err == nil {
+				node.VerifiedAt = t
+			}
+		}
+		node.RecoveryCommitment = n.RecoveryCommitment
+		node.RecoveryProvider = n.RecoveryProvider
 		s.nodes[n.ID] = node
 		s.pubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

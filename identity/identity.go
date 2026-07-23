@@ -29,6 +29,7 @@ import (
 	"github.com/pilot-protocol/rendezvous/events"
 	"github.com/pilot-protocol/common/registry/wire"
 	pilotcrypto "github.com/pilot-protocol/common/crypto"
+	"github.com/pilot-protocol/common/badgeverify"
 )
 
 // BlueprintIdentityProvider is a type alias so callers don't need to import wire.
@@ -122,6 +123,14 @@ type NodeView interface {
 
 	// Now returns the current time (may be overridden in tests).
 	Now() time.Time
+
+	SubmitBadge(nodeID uint32, badge, badgeSig, provider string, now time.Time) bool
+
+	SetRecoveryEnrollment(nodeID uint32, commitment, provider string) bool
+
+	GetRecoveryEnrollment(nodeID uint32) (commitment, provider string, ok bool)
+
+	ForceRotateKey(nodeID uint32, newPubKey []byte, now time.Time) (oldPubKeyB64 string, err error)
 }
 
 // Callbacks bundles the side-effect functions the Store calls on state changes.
@@ -168,14 +177,25 @@ type Store struct {
 	idpConfig           *BlueprintIdentityProvider
 
 	jwksCache *JWKSCache
+
+	nonceMu        sync.Mutex
+	consumedNonces map[string]time.Time
+
+	verifyBadge      func(badge, badgeSig string, nodeID uint32) (badgeverify.Badge, error)
+	verifyEnrollment func(enrollment, enrollSig string) (badgeverify.Enrollment, error)
+	verifyRecovery   func(statement, recSig string) (badgeverify.Recovery, error)
 }
 
 // NewStore creates an empty, ready-to-use Store.
 func NewStore(nodes NodeView, cb Callbacks) *Store {
 	return &Store{
-		nodes:     nodes,
-		cb:        cb,
-		jwksCache: NewJWKSCache(),
+		nodes:            nodes,
+		cb:               cb,
+		jwksCache:        NewJWKSCache(),
+		consumedNonces:   make(map[string]time.Time),
+		verifyBadge:      badgeverify.VerifyForNode,
+		verifyEnrollment: badgeverify.VerifyEnrollment,
+		verifyRecovery:   badgeverify.VerifyRecovery,
 	}
 }
 

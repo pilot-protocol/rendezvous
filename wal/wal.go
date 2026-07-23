@@ -73,11 +73,20 @@ var ErrWALFull = errors.New("WAL: at size cap, refusing append")
 // On-disk format: sequential records of [4-byte little-endian length][delta entry JSON].
 // The WAL file path is derived from the snapshot path: "{storePath}.wal".
 type WAL struct {
-	mu   sync.Mutex
-	f    *os.File
-	path string
-	size int64 // current file size for monitoring
+	mu        sync.Mutex
+	f         *os.File
+	path      string
+	size      int64
+	unsynced  int
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	syncDone  chan struct{}
 }
+
+const (
+	walSyncInterval = 200 * time.Millisecond
+	walSyncBatch    = 200
+)
 
 // NewWAL opens or creates a WAL file at the given path.
 // Returns nil if path is empty (no persistence configured).
@@ -97,11 +106,40 @@ func NewWAL(path string) (*WAL, error) {
 		return nil, fmt.Errorf("stat WAL: %w", err)
 	}
 
-	return &WAL{
-		f:    f,
-		path: path,
-		size: info.Size(),
-	}, nil
+	w := &WAL{
+		f:        f,
+		path:     path,
+		size:     info.Size(),
+		closeCh:  make(chan struct{}),
+		syncDone: make(chan struct{}),
+	}
+	go w.syncLoop()
+	return w, nil
+}
+
+func (w *WAL) syncLoop() {
+	defer close(w.syncDone)
+	ticker := time.NewTicker(walSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			w.mu.Lock()
+			if w.unsynced > 0 {
+				w.f.Sync()
+				w.unsynced = 0
+			}
+			w.mu.Unlock()
+		case <-w.closeCh:
+			w.mu.Lock()
+			if w.unsynced > 0 {
+				w.f.Sync()
+				w.unsynced = 0
+			}
+			w.mu.Unlock()
+			return
+		}
+	}
 }
 
 // Append writes a delta entry to the WAL. The entry is fsync'd to ensure
@@ -142,11 +180,14 @@ func (w *WAL) Append(entry DeltaEntry) error {
 	if _, err := w.f.Write(record); err != nil {
 		return fmt.Errorf("write WAL record: %w", err)
 	}
-	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("sync WAL: %w", err)
-	}
-
 	w.size += int64(4 + len(data))
+	w.unsynced++
+	if w.unsynced >= walSyncBatch {
+		if err := w.f.Sync(); err != nil {
+			return fmt.Errorf("sync WAL: %w", err)
+		}
+		w.unsynced = 0
+	}
 	return nil
 }
 
@@ -237,6 +278,7 @@ func (w *WAL) Truncate() error {
 	}
 
 	w.size = 0
+	w.unsynced = 0
 	return nil
 }
 
@@ -278,6 +320,10 @@ func (w *WAL) Close() error {
 	if w == nil {
 		return nil
 	}
+	w.closeOnce.Do(func() {
+		close(w.closeCh)
+		<-w.syncDone
+	})
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.f.Close()

@@ -109,6 +109,14 @@ func (s *Server) snapshotJSON() []byte {
 			sn.KeyExpires = n.KeyMeta.ExpiresAt.Format(time.RFC3339)
 		}
 		sn.ExternalID = n.ExternalID
+		sn.Badge = n.Badge
+		sn.BadgeSig = n.BadgeSig
+		sn.VerificationProvider = n.VerificationProvider
+		if !n.VerifiedAt.IsZero() {
+			sn.VerifiedAt = n.VerifiedAt.Format(time.RFC3339)
+		}
+		sn.RecoveryCommitment = n.RecoveryCommitment
+		sn.RecoveryProvider = n.RecoveryProvider
 		shard.RUnlock()
 		snap.Nodes[fmt.Sprintf("%d", id)] = sn
 	}
@@ -302,6 +310,16 @@ func (s *Server) applySnapshot(data []byte) error {
 			}
 		}
 		node.ExternalID = n.ExternalID
+		node.Badge = n.Badge
+		node.BadgeSig = n.BadgeSig
+		node.VerificationProvider = n.VerificationProvider
+		if n.VerifiedAt != "" {
+			if t, err := time.Parse(time.RFC3339, n.VerifiedAt); err == nil {
+				node.VerifiedAt = t
+			}
+		}
+		node.RecoveryCommitment = n.RecoveryCommitment
+		node.RecoveryProvider = n.RecoveryProvider
 		newNodes[n.ID] = node
 		newPubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

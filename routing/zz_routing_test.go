@@ -18,6 +18,8 @@ type stubBackend struct {
 		addr   string
 	}
 	adminToken string
+	strict     bool
+	trusted    map[[2]uint32]bool
 }
 
 func (b *stubBackend) NodePubKeyAndAdminToken(nodeID uint32) ([]byte, string, bool) {
@@ -37,6 +39,18 @@ func (b *stubBackend) NodeAddrs(nodeA, nodeB uint32) (string, bool, string, bool
 	a, okA := b.nodes[nodeA]
 	bv, okB := b.nodes[nodeB]
 	return a.addr, okA, bv.addr, okB
+}
+
+func (b *stubBackend) IsTrusted(nodeA, nodeB uint32) bool {
+	key := [2]uint32{nodeA, nodeB}
+	if nodeA > nodeB {
+		key = [2]uint32{nodeB, nodeA}
+	}
+	return b.trusted[key]
+}
+
+func (b *stubBackend) StrictDirectoryAuth() bool {
+	return b.strict
 }
 
 // --- tests ---
@@ -291,4 +305,10 @@ func (f *failVerifyBackend) VerifyPunchSignature(_ []byte, _ string, _ map[strin
 }
 func (f *failVerifyBackend) NodeAddrs(a, b uint32) (string, bool, string, bool) {
 	return f.inner.NodeAddrs(a, b)
+}
+func (f *failVerifyBackend) IsTrusted(a, b uint32) bool {
+	return f.inner.IsTrusted(a, b)
+}
+func (f *failVerifyBackend) StrictDirectoryAuth() bool {
+	return f.inner.StrictDirectoryAuth()
 }

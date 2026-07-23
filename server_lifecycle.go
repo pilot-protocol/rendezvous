@@ -110,6 +110,14 @@ func (s *Server) SetMaxNodes(n int) {
 	s.mu.Unlock()
 }
 
+func (s *Server) SetStrictDirectoryAuth(enabled bool) {
+	s.strictDirectoryAuth.Store(enabled)
+}
+
+func (s *Server) StrictDirectoryAuth() bool {
+	return s.strictDirectoryAuth.Load()
+}
+
 // SetDashboardToken gates per-network stats on the dashboard.
 // Empty string restricts the dashboard to global aggregates only.
 func (s *Server) SetDashboardToken(token string) {
@@ -573,6 +581,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		IncTrustReports:      s.metrics.TrustReports.Inc,
 		IncTrustRevocations:  s.metrics.TrustRevocations.Inc,
 		IncHandshakeRequests: s.metrics.HandshakeRequests.Inc,
+		StrictDirectoryAuth:  s.StrictDirectoryAuth,
 	})
 	s.identity = identpkg.NewStore(s, identpkg.Callbacks{ // R2.3: identity sub-package
 		Save:                s.save,
@@ -739,10 +748,11 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				sh.Unlock()
 				return found
 			},
-			IncInvitesSent:     s.metrics.InvitesSent.Inc,
-			IncInvitesAccepted: s.metrics.InvitesAccepted.Inc,
-			IncInvitesRejected: s.metrics.InvitesRejected.Inc,
-			IncRbacOps:         func(op string) { s.metrics.RbacOps.WithLabel(op).Inc() },
+			IncInvitesSent:      s.metrics.InvitesSent.Inc,
+			IncInvitesAccepted:  s.metrics.InvitesAccepted.Inc,
+			IncInvitesRejected:  s.metrics.InvitesRejected.Inc,
+			IncRbacOps:          func(op string) { s.metrics.RbacOps.WithLabel(op).Inc() },
+			StrictDirectoryAuth: s.StrictDirectoryAuth,
 		},
 		func() time.Time { return s.now() },
 	)
@@ -871,6 +881,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				}
 				return nets
 			},
+			StrictDirectoryAuth: s.StrictDirectoryAuth,
 		},
 	)
 

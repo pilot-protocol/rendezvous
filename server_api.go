@@ -258,21 +258,35 @@ func (s *Server) NodeAddrs(nodeA, nodeB uint32) (addrA string, okA bool, addrB s
 	s.mu.RLock()
 	a, foundA := s.nodes[nodeA]
 	b, foundB := s.nodes[nodeB]
+	strict := s.StrictDirectoryAuth()
+	beaconAddr := s.beaconAddr
 	s.mu.RUnlock()
 
 	if foundA {
 		shA := s.nodeShard(nodeA)
 		shA.RLock()
-		addrA = a.RealAddr
+		if strict && a.RelayOnly {
+			addrA = beaconAddr
+		} else {
+			addrA = a.RealAddr
+		}
 		shA.RUnlock()
 	}
 	if foundB {
 		shB := s.nodeShard(nodeB)
 		shB.RLock()
-		addrB = b.RealAddr
+		if strict && b.RelayOnly {
+			addrB = beaconAddr
+		} else {
+			addrB = b.RealAddr
+		}
 		shB.RUnlock()
 	}
 	return addrA, foundA, addrB, foundB
+}
+
+func (s *Server) IsTrusted(nodeA, nodeB uint32) bool {
+	return s.trust.IsTrusted(nodeA, nodeB)
 }
 
 // --- Persistence ---
@@ -456,4 +470,78 @@ func (s *Server) VerifyHeartbeatSignature(pubKey []byte, adminToken string, msg 
 // server-overridable clock (supports testing).
 func (s *Server) Now() time.Time {
 	return s.now()
+}
+
+func (s *Server) SubmitBadge(id uint32, badge, badgeSig, provider string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.Badge = badge
+	node.BadgeSig = badgeSig
+	node.VerificationProvider = provider
+	node.VerifiedAt = now
+	sh.Unlock()
+	return true
+}
+
+func (s *Server) SetRecoveryEnrollment(id uint32, commitment, provider string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.RecoveryCommitment = commitment
+	node.RecoveryProvider = provider
+	sh.Unlock()
+	return true
+}
+
+func (s *Server) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	node, exists := s.nodes[id]
+	if !exists {
+		return "", "", false
+	}
+	sh := s.nodeShard(id)
+	sh.RLock()
+	commitment = node.RecoveryCommitment
+	provider = node.RecoveryProvider
+	sh.RUnlock()
+	if commitment == "" {
+		return "", "", false
+	}
+	return commitment, provider, true
+}
+
+func (s *Server) ForceRotateKey(id uint32, newPubKey []byte, now time.Time) (oldPubKeyB64 string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.nodes[id]
+	if !ok {
+		return "", fmt.Errorf("node %d: %w", id, protocol.ErrNodeNotFound)
+	}
+
+	oldPubKeyB64 = crypto.EncodePublicKey(node.PublicKey)
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.PublicKey = newPubKey
+	node.SetLastSeen(now)
+	node.KeyMeta.RotatedAt = now
+	node.KeyMeta.RotateCount++
+	sh.Unlock()
+
+	return oldPubKeyB64, nil
 }

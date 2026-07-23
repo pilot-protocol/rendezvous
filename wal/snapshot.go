@@ -43,6 +43,13 @@ type SnapshotNode struct {
 	ExternalID  string   `json:"external_id,omitempty"`
 	Version     string   `json:"version,omitempty"`
 	RelayOnly   bool     `json:"relay_only,omitempty"` // preserve flag across snapshots
+
+	Badge                string `json:"badge,omitempty"`
+	BadgeSig             string `json:"badge_sig,omitempty"`
+	VerificationProvider string `json:"verification_provider,omitempty"`
+	VerifiedAt           string `json:"verified_at,omitempty"`
+	RecoveryCommitment   string `json:"recovery_commitment,omitempty"`
+	RecoveryProvider     string `json:"recovery_provider,omitempty"`
 }
 
 // SnapshotNet is the JSON-serializable form of a single registry network.

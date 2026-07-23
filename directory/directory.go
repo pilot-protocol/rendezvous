@@ -74,6 +74,13 @@ type NodeInfo struct {
 	Version    string
 	RelayOnly  bool
 
+	Badge                string
+	BadgeSig             string
+	VerificationProvider string
+	VerifiedAt           time.Time
+	RecoveryCommitment   string
+	RecoveryProvider     string
+
 	// LastSeenNano stores time.UnixNano() for lock-free heartbeat updates.
 	LastSeenNano atomic.Int64
 	// LastVerifiedNano stores the last Ed25519 verify time. Used by verify-skip.
@@ -215,6 +222,7 @@ type Callbacks struct {
 	// still list nodeID as a member. Used to restore network memberships after
 	// a reaped node reclaims its old identity. Caller holds mu.Lock.
 	ScanNetworkMemberships func(nodeID uint32) []uint16
+	StrictDirectoryAuth    func() bool
 }
 
 // --------------------------------------------------------------------------
@@ -1000,9 +1008,19 @@ func (st *Store) HandleLookup(msg map[string]interface{}) (map[string]interface{
 
 	st.mu.RLock()
 	node, ok := st.nodes[nodeID]
+	var nodePublic bool
+	if ok {
+		nodePublic = node.Public
+	}
 	st.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
+	}
+
+	if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() && !nodePublic {
+		if err := st.authorizeLookup(msg, nodeID, node); err != nil {
+			return nil, err
+		}
 	}
 
 	sh := st.nodeShard(nodeID)
@@ -1049,13 +1067,61 @@ func (st *Store) HandleLookup(msg map[string]interface{}) (map[string]interface{
 			resp["endpoint"] = node.RealAddr
 		}
 	}
-	if node.ExternalID != "" {
+	if node.Badge != "" || node.VerificationProvider != "" {
+		resp["verified"] = true
+		if node.Badge != "" {
+			resp["badge"] = node.Badge
+		}
+		if node.VerificationProvider != "" {
+			resp["verification_provider"] = node.VerificationProvider
+		}
+	} else if node.ExternalID != "" {
 		resp["external_id"] = node.ExternalID
 	}
 	if node.Version != "" {
 		resp["version"] = node.Version
 	}
 	return resp, nil
+}
+
+func (st *Store) authorizeLookup(msg map[string]interface{}, nodeID uint32, node *NodeInfo) error {
+	notFound := fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
+	requesterID := jsonUint32(msg, "requester_id")
+
+	st.mu.RLock()
+	requester, requesterOK := st.nodes[requesterID]
+	var requesterPubKey []byte
+	var requesterNetworks []uint16
+	if requesterOK {
+		requesterPubKey = requester.PublicKey
+		requesterNetworks = append([]uint16(nil), requester.Networks...)
+	}
+	adminToken := st.cb.AdminToken()
+	targetNetworks := append([]uint16(nil), node.Networks...)
+	trustOK := st.cb.IsTrusted(requesterID, nodeID)
+	st.mu.RUnlock()
+
+	if !requesterOK {
+		return notFound
+	}
+	if err := st.cb.VerifyNodeSignature(requesterPubKey, adminToken, msg, fmt.Sprintf("lookup:%d:%d", requesterID, nodeID)); err != nil {
+		return notFound
+	}
+
+	if trustOK {
+		return nil
+	}
+	for _, rNet := range requesterNetworks {
+		if rNet == 0 {
+			continue
+		}
+		for _, tNet := range targetNetworks {
+			if rNet == tNet {
+				return nil
+			}
+		}
+	}
+	return notFound
 }
 
 // --------------------------------------------------------------------------
@@ -1078,8 +1144,18 @@ func (st *Store) HandleBinaryLookup(conn net.Conn, payload []byte) {
 
 	st.mu.RLock()
 	node, ok := st.nodes[nodeID]
+	var nodePublic bool
+	if ok {
+		nodePublic = node.Public
+	}
 	st.mu.RUnlock()
 	if !ok {
+		st.cb.IncErrorsTotal("lookup")
+		wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(fmt.Sprintf("node %d: not found", nodeID)))
+		return
+	}
+
+	if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() && !nodePublic {
 		st.cb.IncErrorsTotal("lookup")
 		wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(fmt.Sprintf("node %d: not found", nodeID)))
 		return
@@ -1166,6 +1242,9 @@ func (st *Store) HandleResolve(msg map[string]interface{}) (map[string]interface
 		}
 		if !allowed {
 			st.mu.RUnlock()
+			if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() {
+				return nil, fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
+			}
 			return nil, fmt.Errorf("resolve denied: node %d is private (establish mutual trust first)", nodeID)
 		}
 	}
@@ -1300,7 +1379,11 @@ func (st *Store) HandleBinaryResolve(conn net.Conn, payload []byte) {
 		if !allowed {
 			tSh.RUnlock()
 			st.cb.IncErrorsTotal("resolve")
-			wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(fmt.Sprintf("resolve denied: node %d is private (establish mutual trust first)", nodeID)))
+			if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() {
+				wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(fmt.Sprintf("node %d: not found", nodeID)))
+			} else {
+				wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(fmt.Sprintf("resolve denied: node %d is private (establish mutual trust first)", nodeID)))
+			}
 			return
 		}
 	}
@@ -1343,57 +1426,81 @@ func (st *Store) HandleResolveHostname(msg map[string]interface{}) (map[string]i
 	}
 
 	st.mu.RLock()
-	defer st.mu.RUnlock()
-
 	nodeID, ok := st.hostnameIdx[hostname]
 	if !ok {
+		st.mu.RUnlock()
 		return nil, fmt.Errorf("hostname %q not found", hostname)
 	}
 
 	node, ok := st.nodes[nodeID]
 	if !ok {
+		st.mu.RUnlock()
 		return nil, fmt.Errorf("hostname %q maps to missing node %d", hostname, nodeID)
 	}
 
-	if !node.Public {
-		requesterID := jsonUint32(msg, "requester_id")
-		allowed := false
+	if node.Public {
+		nid, npub, nhost := node.ID, node.Public, node.Hostname
+		st.mu.RUnlock()
+		return map[string]interface{}{
+			"type":     "resolve_hostname_ok",
+			"node_id":  nid,
+			"address":  protocol.Addr{Network: 0, Node: nid}.String(),
+			"public":   npub,
+			"hostname": nhost,
+		}, nil
+	}
 
-		if requesterID == nodeID {
-			allowed = true
+	strict := st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth()
+	requesterID := jsonUint32(msg, "requester_id")
+	requester, requesterOK := st.nodes[requesterID]
+	var requesterPubKey []byte
+	var requesterNetworks []uint16
+	if requesterOK {
+		requesterPubKey = requester.PublicKey
+		requesterNetworks = append([]uint16(nil), requester.Networks...)
+	}
+	adminToken := st.cb.AdminToken()
+	targetNetworks := append([]uint16(nil), node.Networks...)
+	trustOK := st.cb.IsTrusted(requesterID, nodeID)
+	nid, npub, nhost := node.ID, node.Public, node.Hostname
+	st.mu.RUnlock()
+
+	if strict {
+		if !requesterOK {
+			return nil, fmt.Errorf("hostname %q not found", hostname)
 		}
-		if !allowed && st.cb.IsTrusted(requesterID, nodeID) {
-			allowed = true
-		}
-		if !allowed {
-			if requester, rOk := st.nodes[requesterID]; rOk {
-				for _, rNet := range requester.Networks {
-					if rNet == 0 {
-						continue
-					}
-					for _, tNet := range node.Networks {
-						if rNet == tNet {
-							allowed = true
-							break
-						}
-					}
-					if allowed {
-						break
-					}
-				}
-			}
-		}
-		if !allowed {
+		if err := st.cb.VerifyNodeSignature(requesterPubKey, adminToken, msg, fmt.Sprintf("resolve_hostname:%d", requesterID)); err != nil {
 			return nil, fmt.Errorf("hostname %q not found", hostname)
 		}
 	}
 
+	allowed := requesterID == nodeID || trustOK
+	if !allowed {
+		for _, rNet := range requesterNetworks {
+			if rNet == 0 {
+				continue
+			}
+			for _, tNet := range targetNetworks {
+				if rNet == tNet {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				break
+			}
+		}
+	}
+	if !allowed {
+		return nil, fmt.Errorf("hostname %q not found", hostname)
+	}
+
 	return map[string]interface{}{
 		"type":     "resolve_hostname_ok",
-		"node_id":  node.ID,
-		"address":  protocol.Addr{Network: 0, Node: node.ID}.String(),
-		"public":   node.Public,
-		"hostname": node.Hostname,
+		"node_id":  nid,
+		"address":  protocol.Addr{Network: 0, Node: nid}.String(),
+		"public":   npub,
+		"hostname": nhost,
 	}, nil
 }
 
@@ -1432,11 +1539,50 @@ func (st *Store) HandleListNodes(msg map[string]interface{}, requireAdminToken f
 
 	// Per-network listing — open. Users need to list the members of
 	// the networks they belong to without holding the network admin token.
+	if st.cb.StrictDirectoryAuth != nil && st.cb.StrictDirectoryAuth() {
+		if err := st.requireNetworkMembership(msg, netID); err != nil {
+			return nil, err
+		}
+	}
+
 	body, err := st.PerNetworkListNodesCached(netID)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{RawResponseKey: body}, nil
+}
+
+func (st *Store) requireNetworkMembership(msg map[string]interface{}, netID uint16) error {
+	requesterID := jsonUint32(msg, "requester_id")
+
+	st.mu.RLock()
+	requester, requesterOK := st.nodes[requesterID]
+	var requesterPubKey []byte
+	if requesterOK {
+		requesterPubKey = requester.PublicKey
+	}
+	adminToken := st.cb.AdminToken()
+	st.mu.RUnlock()
+
+	if !requesterOK {
+		return fmt.Errorf("list_nodes denied: requester node %d is not registered", requesterID)
+	}
+	if err := st.cb.VerifyNodeSignature(requesterPubKey, adminToken, msg, fmt.Sprintf("list_nodes:%d:%d", requesterID, netID)); err != nil {
+		return err
+	}
+
+	st.mu.RLock()
+	view, netOK := st.getNetworkView(netID)
+	st.mu.RUnlock()
+	if !netOK {
+		return fmt.Errorf("network %d: %w", netID, protocol.ErrNetworkNotFound)
+	}
+	for _, m := range view.Members {
+		if m == requesterID {
+			return nil
+		}
+	}
+	return fmt.Errorf("list_nodes denied: node %d is not a member of network %d", requesterID, netID)
 }
 
 // --------------------------------------------------------------------------

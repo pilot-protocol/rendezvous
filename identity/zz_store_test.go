@@ -5,8 +5,10 @@ package identity
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -22,11 +24,16 @@ type fakeNodeView struct {
 }
 
 type fakeNode struct {
-	pubKey     []byte
-	keyMeta    KeyInfo
-	networks   []uint16
-	externalID string
-	owner      string
+	pubKey      []byte
+	keyMeta     KeyInfo
+	networks    []uint16
+	externalID  string
+	owner       string
+	badge       string
+	badgeSig    string
+	provider    string
+	recCommit   string
+	recProvider string
 }
 
 func (v *fakeNodeView) LookupNodeKey(id uint32) ([]byte, bool) {
@@ -61,6 +68,48 @@ func (v *fakeNodeView) VerifyHeartbeatSignature([]byte, string, map[string]inter
 	return nil
 }
 func (v *fakeNodeView) Now() time.Time { return time.Now() }
+
+func (v *fakeNodeView) SubmitBadge(id uint32, badge, badgeSig, provider string, now time.Time) bool {
+	n, ok := v.nodes[id]
+	if !ok {
+		return false
+	}
+	n.badge = badge
+	n.badgeSig = badgeSig
+	n.provider = provider
+	v.nodes[id] = n
+	return true
+}
+
+func (v *fakeNodeView) SetRecoveryEnrollment(id uint32, commitment, provider string) bool {
+	n, ok := v.nodes[id]
+	if !ok {
+		return false
+	}
+	n.recCommit = commitment
+	n.recProvider = provider
+	v.nodes[id] = n
+	return true
+}
+
+func (v *fakeNodeView) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
+	n, exists := v.nodes[id]
+	if !exists || n.recCommit == "" {
+		return "", "", false
+	}
+	return n.recCommit, n.recProvider, true
+}
+
+func (v *fakeNodeView) ForceRotateKey(id uint32, newPubKey []byte, now time.Time) (string, error) {
+	n, ok := v.nodes[id]
+	if !ok {
+		return "", fmt.Errorf("node %d not found", id)
+	}
+	oldPubKeyB64 := base64.StdEncoding.EncodeToString(n.pubKey)
+	n.pubKey = newPubKey
+	v.nodes[id] = n
+	return oldPubKeyB64, nil
+}
 
 func newTestStore() *Store {
 	return NewStore(&fakeNodeView{nodes: map[uint32]fakeNode{}}, Callbacks{

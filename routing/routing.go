@@ -44,6 +44,9 @@ type PunchBackend interface {
 
 	// NodeAddrs returns false for addrA or addrB when the respective node is absent.
 	NodeAddrs(nodeA, nodeB uint32) (addrA string, okA bool, addrB string, okB bool)
+
+	IsTrusted(nodeA, nodeB uint32) bool
+	StrictDirectoryAuth() bool
 }
 
 // Store holds the beacon cluster state and implements the three
@@ -158,6 +161,10 @@ func (st *Store) HandlePunch(msg map[string]interface{}) (map[string]interface{}
 	challenge := fmt.Sprintf("punch:%d:%d", nodeA, nodeB)
 	if err := st.backend.VerifyPunchSignature(pubKey, adminToken, msg, challenge); err != nil {
 		return nil, err
+	}
+
+	if st.backend.StrictDirectoryAuth() && !st.backend.IsTrusted(nodeA, nodeB) {
+		return nil, fmt.Errorf("punch denied: node %d and node %d have not established trust", nodeA, nodeB)
 	}
 
 	// Phase 3: node address lookup.
