@@ -15,11 +15,11 @@ import (
 	"sync"
 	"time"
 
-	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
-	trustpkg "github.com/pilot-protocol/rendezvous/trust"
+	"github.com/pilot-protocol/common/fsutil"
 	"github.com/pilot-protocol/common/registry/wire"
 	"github.com/pilot-protocol/common/urlvalidate"
-	"github.com/pilot-protocol/common/fsutil"
+	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
+	trustpkg "github.com/pilot-protocol/rendezvous/trust"
 )
 
 // flushSaveBufPool reuses the bytes buffer that backs the snapshot JSON
@@ -59,12 +59,14 @@ type rawNodeCopy struct {
 	version    string
 	relayOnly  bool // task 32
 
-	badge                string
-	badgeSig             string
-	verificationProvider string
-	verifiedAt           time.Time
-	recoveryCommitment   string
-	recoveryProvider     string
+	badge                 string
+	badgeSig              string
+	verifProvider         string
+	verifiedAt            time.Time
+	recoveryCommitment    string
+	recoveryProvider      string
+	recoveryConsumedNonce string
+	recoveryConsumedExp   time.Time
 }
 
 // save signals that state has changed and should be persisted AND pushed
@@ -79,12 +81,12 @@ func (s *Server) save() {
 // flushSave serializes the full registry state and writes it to disk.
 // Phase 1 (RLock): copy raw values only — no encoding.
 // Phase 2 (no lock): base64, time.Format, JSON marshal.
-func (s *Server) flushSave() error {
-	// Measure wall time end-to-end so operators can see save cliffs in
-	// pilot_save_duration_seconds. Recorded on success only (a save that
-	// returns an error bumps SaveFailures and isn't a meaningful timing
-	// sample). The deferred record fires last, after the WAL truncate and
-	// the success metrics below.
+func (s *Server) flushSave() (retErr error) {
+	// Single timing scope for both telemetry systems. saveStart is the one
+	// time.Now() for this save; the deferred record below derives the
+	// Prometheus histogram observation (pilot_save_duration_seconds) and the
+	// atomic snapshot-duration counters from it — no second clock read at the
+	// top, no second defer.
 	saveStart := time.Now()
 	// Breaker gate: snapshot.write opens during incidents where the
 	// in-memory state is suspect (post-crash recovery, mid-load) and an
@@ -98,12 +100,38 @@ func (s *Server) flushSave() error {
 			return nil
 		}
 	}
-	// Record save success at the end of the function. We hook the success
-	// path explicitly (after fsync + atomic rename complete) so failures
-	// don't pollute the duration histogram or the last-save timestamp.
+	// phase1End is stamped once Phase 1 (the RLock copy) completes, so the
+	// deferred record can attribute RLock hold time. Zero until then.
+	var phase1End time.Time
+	// One deferred record for both telemetry systems off the single saveStart:
+	//
+	//   - Prometheus pilot_save_duration_seconds (main): observed on every
+	//     exit path (including the error paths) so save cliffs show up in the
+	//     histogram even when the save ultimately fails.
+	//   - Atomic snapshot counters (this PR): success path bumps total +
+	//     timestamps + last/max duration + RLock hold time; the error path
+	//     bumps the failed counter only. Split on retErr.
 	defer func() {
+		dur := time.Since(saveStart)
 		if s.metrics != nil && s.metrics.SaveDuration != nil {
-			s.metrics.SaveDuration.Observe(time.Since(saveStart).Seconds())
+			s.metrics.SaveDuration.Observe(dur.Seconds())
+		}
+		durMs := dur.Milliseconds()
+		if retErr == nil {
+			s.snapshotsTotal.Add(1)
+			s.lastSnapshotUnixMs.Store(time.Now().UnixMilli())
+			s.lastSnapshotDurMs.Store(durMs)
+			if !phase1End.IsZero() {
+				s.lastSnapshotRLockMs.Store(phase1End.Sub(saveStart).Milliseconds())
+			}
+			for {
+				prev := s.maxSnapshotDurMs.Load()
+				if durMs <= prev || s.maxSnapshotDurMs.CompareAndSwap(prev, durMs) {
+					break
+				}
+			}
+		} else {
+			s.snapshotsFailed.Add(1)
 		}
 	}()
 	// Phase 1: RLock — copy raw values (pointer copies, integer copies only)
@@ -141,12 +169,14 @@ func (s *Server) flushSave() error {
 			version:    n.Version,
 			relayOnly:  n.RelayOnly, // task 32
 
-			badge:                n.Badge,
-			badgeSig:             n.BadgeSig,
-			verificationProvider: n.VerificationProvider,
-			verifiedAt:           n.VerifiedAt,
-			recoveryCommitment:   n.RecoveryCommitment,
-			recoveryProvider:     n.RecoveryProvider,
+			badge:                 n.Badge,
+			badgeSig:              n.BadgeSig,
+			verifProvider:         n.VerificationProvider,
+			verifiedAt:            n.VerifiedAt,
+			recoveryCommitment:    n.RecoveryCommitment,
+			recoveryProvider:      n.RecoveryProvider,
+			recoveryConsumedNonce: n.RecoveryConsumedNonce,
+			recoveryConsumedExp:   n.RecoveryConsumedExp,
 		})
 		shard.RUnlock()
 	}
@@ -255,6 +285,7 @@ func (s *Server) flushSave() error {
 		netDailyCopy[id] = &cp
 	}
 	s.mu.RUnlock()
+	phase1End = time.Now()
 
 	// Phase 2: no lock — all encoding (base64, time.Format, JSON) happens here
 	snap := snapshot{
@@ -302,12 +333,16 @@ func (s *Server) flushSave() error {
 		sn.Version = rn.version
 		sn.Badge = rn.badge
 		sn.BadgeSig = rn.badgeSig
-		sn.VerificationProvider = rn.verificationProvider
+		sn.VerificationProvider = rn.verifProvider
 		if !rn.verifiedAt.IsZero() {
 			sn.VerifiedAt = rn.verifiedAt.Format(time.RFC3339)
 		}
 		sn.RecoveryCommitment = rn.recoveryCommitment
 		sn.RecoveryProvider = rn.recoveryProvider
+		sn.RecoveryConsumedNonce = rn.recoveryConsumedNonce
+		if !rn.recoveryConsumedExp.IsZero() {
+			sn.RecoveryConsumedExp = rn.recoveryConsumedExp.Format(time.RFC3339)
+		}
 		snap.Nodes[fmt.Sprintf("%d", rn.id)] = sn
 
 		// Dashboard metrics (computed outside lock)
@@ -499,6 +534,7 @@ func (s *Server) flushSave() error {
 			slog.Error("registry save error", "err", err)
 			return fmt.Errorf("write snapshot: %w", err)
 		}
+		s.lastSnapshotSizeB.Store(int64(len(data)))
 		// Truncate WAL after successful snapshot (compaction).
 		if w := s.walStore.WAL(); w != nil {
 			if err := w.Truncate(); err != nil {
@@ -722,6 +758,12 @@ func (s *Server) load() error {
 		}
 		node.RecoveryCommitment = n.RecoveryCommitment
 		node.RecoveryProvider = n.RecoveryProvider
+		node.RecoveryConsumedNonce = n.RecoveryConsumedNonce
+		if n.RecoveryConsumedExp != "" {
+			if t, err := time.Parse(time.RFC3339, n.RecoveryConsumedExp); err == nil {
+				node.RecoveryConsumedExp = t
+			}
+		}
 		s.nodes[n.ID] = node
 		s.pubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

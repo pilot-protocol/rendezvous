@@ -139,6 +139,11 @@ type Callbacks struct {
 	// preserved so post-incident review still shows traffic that
 	// flowed through the gate. Persists the change to breakers.json.
 	BreakerDelete func(name string) error
+	// HealthSnapshot returns a flat map of operator-facing health
+	// signals: snapshot save telemetry, WAL size, snapshot.write
+	// breaker state, replica subscriber count. Backs /api/health.
+	// Optional — when nil, /api/health 503s.
+	HealthSnapshot func() map[string]any
 	// AuditRecent returns the most recent N audit-log entries from the
 	// in-memory ring buffer (caller-supplied bound, server-clamped to a
 	// safe maximum). Optional — when nil, /api/admin/audit/recent
@@ -753,9 +758,10 @@ func (l *ipRateLimiter) middleware(maxReqs int, window time.Duration, next http.
 // requireAdminToken wraps next so it returns 401 Unauthorized to anyone
 // that doesn't present the operator-configured admin token. The token
 // may be supplied via X-Admin-Token header (preferred for write paths)
-// or admin_token=... query parameter (read-only convenience). When no
-// admin token is configured on the server the wrapped path is locked
-// shut entirely — operators must set -admin-token to enable access.
+// or admin_token=... query parameter (GET only — read-only convenience;
+// mutations require the header to prevent CSRF from leaked URLs).
+// When no admin token is configured on the server the wrapped path is
+// locked shut entirely — operators must set -admin-token to enable access.
 //
 // Used to lock down the previously-public stats / pulse / badge /
 // snapshot endpoints so polo.pilotprotocol.network can expose only the
@@ -764,7 +770,10 @@ func (l *ipRateLimiter) middleware(maxReqs int, window time.Duration, next http.
 func (h *Handler) requireAdminToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Admin-Token")
-		if token == "" {
+		// Query-param fallback only for GET (read-only, no CSRF risk).
+		// POST/PUT/DELETE require the header so a leaked URL cannot
+		// be used for cross-site mutation attacks.
+		if token == "" && r.Method == http.MethodGet {
 			token = r.URL.Query().Get("admin_token")
 		}
 		adminToken := h.cb.GetAdminToken()
@@ -895,6 +904,16 @@ func (h *Handler) handleVerifyKeys(w http.ResponseWriter, r *http.Request) {
 
 // Serve starts an HTTP server serving the dashboard UI and stats API.
 func (h *Handler) Serve(addr string) error {
+	mux := h.buildMux()
+	slog.Info("dashboard listening", "addr", addr)
+	return http.ListenAndServe(addr, mux)
+}
+
+// buildMux constructs the dashboard's route table. Factored out of
+// Serve so tests can exercise the real routes (e.g. the /api/stats
+// auth path) against an httptest server without re-implementing
+// registration and drifting from production wiring.
+func (h *Handler) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// /api/v1/verify + /api/v1/verify/keys — public external
@@ -999,14 +1018,15 @@ func (h *Handler) Serve(addr string) error {
 	mux.HandleFunc("/api/stats", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		authenticated := false
-		if token := r.URL.Query().Get("token"); token != "" {
-			dt := h.cb.GetDashboardToken()
-			if dt != "" && subtle.ConstantTimeCompare([]byte(token), []byte(dt)) == 1 {
-				authenticated = true
-			}
-		}
-		_ = json.NewEncoder(w).Encode(h.buildStatsResponse(authenticated))
+		// requireAdminToken (PR #50) already verified a valid admin
+		// token reached this handler — so the caller is an authenticated
+		// operator and gets the elevated per-network payload. The old
+		// inner ?token= dashboard-token check became dead once the
+		// endpoint moved behind the admin gate (the gate 401s anything
+		// without the admin token first), and the dashboard frontend
+		// sent ?token= which the gate ignored, so operator stats silently
+		// 401'd. The frontend now sends admin_token=; this matches it.
+		_ = json.NewEncoder(w).Encode(h.buildStatsResponse(true))
 	}))
 
 	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
@@ -1191,6 +1211,35 @@ func (h *Handler) Serve(addr string) error {
 	mux.HandleFunc("/api/runtime", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(collectRuntimeMetrics())
+	}))
+
+	// /api/health (admin) — single curl-able operator health snapshot.
+	// Aggregates the persistence + WAL + replication signals that today
+	// require scraping the rich /api/stats or reading journald. Output
+	// is a flat map so future fields can be added without versioning
+	// the response shape.
+	//
+	// Fields surfaced (typical values, all optional — present only when
+	// the Server has the corresponding subsystem):
+	//
+	//   snapshots_total              monotonic count of successful saves
+	//   snapshots_failed             monotonic count of failed saves
+	//   last_snapshot_at             unix-ms of last successful save
+	//   last_snapshot_duration_ms    duration of last successful save
+	//   last_snapshot_size_bytes     bytes written by last save
+	//   last_snapshot_rlock_ms       s.mu.RLock hold time in phase 1
+	//   max_snapshot_duration_ms     worst-ever save (process lifetime)
+	//   wal_size_bytes               current WAL size (0 if not in use)
+	//   wal_size_cap_bytes           configured WAL cap
+	//   snapshot_write_breaker       "closed" | "half_open" | "open"
+	//   replication_subscribers      live standby count
+	mux.HandleFunc("/api/health", h.requireAdminToken(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if h.cb.HealthSnapshot == nil {
+			http.Error(w, "health snapshot not wired", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(h.cb.HealthSnapshot())
 	}))
 
 	// /api/pulse — live request-count ring. Moved behind admin auth as
@@ -1639,8 +1688,7 @@ func (h *Handler) Serve(addr string) error {
 	// because adding a router dependency for three routes isn't worth it.
 	mux.HandleFunc("/api/admin/networks/", h.requireAdminToken(h.serveMembershipAdmin))
 
-	slog.Info("dashboard listening", "addr", addr)
-	return http.ListenAndServe(addr, mux)
+	return mux
 }
 
 // serveMembershipAdmin dispatches the three /api/admin/networks/{id}/members*
@@ -2251,7 +2299,11 @@ function update(){
   // directly. Token-aware dashboard-token path retained for operators
   // who set one in localStorage.
   var t=getToken();
-  var url=t?('/api/stats?token='+encodeURIComponent(t)):'/api/public-stats';
+  // /api/stats is admin-gated (PR #50). The operator's stored token is
+  // the admin token (same one /api/pulse uses below), so send it as
+  // admin_token to clear the gate. Without this the request was sent as
+  // ?token= — which the admin gate ignores — and silently 401'd.
+  var url=t?('/api/stats?admin_token='+encodeURIComponent(t)):'/api/public-stats';
   fetch(url).then(function(r){
     if(!r.ok)return null;
     return r.json();

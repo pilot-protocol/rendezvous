@@ -10,11 +10,9 @@
 package authz
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"sync"
 	"sync/atomic"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -194,58 +192,6 @@ func (c *Checker) IsEnterpriseNode(nodeID uint32, nodes NodeReader, nr NetworkRe
 	return false
 }
 
-const sigCacheRotateThreshold = 250000
-
-type sigCacheGen struct {
-	m sync.Map
-	n atomic.Int64
-}
-
-var (
-	sigCacheCur  atomic.Pointer[sigCacheGen]
-	sigCachePrev atomic.Pointer[sigCacheGen]
-)
-
-func init() {
-	sigCacheCur.Store(&sigCacheGen{})
-	sigCachePrev.Store(&sigCacheGen{})
-}
-
-func sigCacheKey(pubKey, sig []byte, challenge string) [32]byte {
-	h := sha256.New()
-	h.Write(pubKey)
-	h.Write([]byte(challenge))
-	h.Write(sig)
-	var out [32]byte
-	h.Sum(out[:0])
-	return out
-}
-
-func sigCacheHit(key [32]byte) bool {
-	if _, ok := sigCacheCur.Load().m.Load(key); ok {
-		return true
-	}
-	_, ok := sigCachePrev.Load().m.Load(key)
-	return ok
-}
-
-func sigCacheAdd(key [32]byte) {
-	cur := sigCacheCur.Load()
-	if _, loaded := cur.m.LoadOrStore(key, struct{}{}); loaded {
-		return
-	}
-	if cur.n.Add(1) >= sigCacheRotateThreshold {
-		sigCacheRotate(cur)
-	}
-}
-
-func sigCacheRotate(full *sigCacheGen) {
-	next := &sigCacheGen{}
-	if sigCacheCur.CompareAndSwap(full, next) {
-		sigCachePrev.Store(full)
-	}
-}
-
 // VerifyNodeSignature verifies a registry write operation signature.
 // pubKey is the node's stored Ed25519 public key; adminToken is a
 // pre-copied value of the global admin token (copy it before releasing
@@ -267,10 +213,6 @@ func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interf
 	if err != nil {
 		return fmt.Errorf("invalid signature encoding: %w", err)
 	}
-	key := sigCacheKey(pubKey, sig, challenge)
-	if sigCacheHit(key) {
-		return nil
-	}
 	ok := crypto.Verify(pubKey, []byte(challenge), sig)
 	if fn := loadSigVerifyHook(); fn != nil {
 		fn(ok)
@@ -278,7 +220,6 @@ func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interf
 	if !ok {
 		return fmt.Errorf("signature verification failed")
 	}
-	sigCacheAdd(key)
 	return nil
 }
 

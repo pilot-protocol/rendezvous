@@ -1,0 +1,128 @@
+name: security
+
+# Security CI baseline for the rendezvous registry. Gating jobs:
+#   codeql        — Go static analysis (security-and-quality)
+#   gosec         — Go SAST (HIGH/MEDIUM severity; accepted rule classes
+#                   excluded via .gosec.json, justified in that file)
+#   govulncheck   — known-vuln scan of the call graph (stdlib + deps)
+#   gitleaks      — secret scan over the diff/history
+# Each runs on push to main and on every PR targeting main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL (Go)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          queries: security-and-quality
+
+      - name: Build
+        env:
+          GOWORK: off
+        run: go build ./...
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:go
+
+  gosec:
+    name: gosec SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run gosec
+        env:
+          GOWORK: off
+        # Gate on HIGH and MEDIUM severity at MEDIUM+ confidence. Accepted
+        # rule classes (length-conversion overflows, operator-config file
+        # reads, 0644 registry persistence) are excluded in .gosec.json with
+        # per-rule justification; nothing is blanket-disabled.
+        run: |
+          go run github.com/securego/gosec/v2/cmd/gosec@v2.22.9 \
+            -conf .gosec.json \
+            -severity medium \
+            -confidence medium \
+            ./...
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run govulncheck
+        env:
+          GOWORK: off
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  gitleaks:
+    name: gitleaks secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      # The gitleaks GitHub Action (gitleaks/gitleaks-action) requires a paid
+      # GITLEAKS_LICENSE secret for ORGANIZATION repos. The gitleaks binary
+      # itself is MIT-licensed and free, so we run a version-pinned binary
+      # release directly — same scan, no license gate.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (full history)
+        run: |
+          gitleaks git --no-banner --redact --verbose .

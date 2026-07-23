@@ -11,10 +11,10 @@ import (
 	"net"
 	"time"
 
+	"github.com/pilot-protocol/common/urlvalidate"
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	replpkg "github.com/pilot-protocol/rendezvous/replication"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
-	"github.com/pilot-protocol/common/urlvalidate"
 )
 
 // handleSubscribeReplication is called when a client sends {"type": "subscribe_replication"}.
@@ -117,6 +117,10 @@ func (s *Server) snapshotJSON() []byte {
 		}
 		sn.RecoveryCommitment = n.RecoveryCommitment
 		sn.RecoveryProvider = n.RecoveryProvider
+		sn.RecoveryConsumedNonce = n.RecoveryConsumedNonce
+		if !n.RecoveryConsumedExp.IsZero() {
+			sn.RecoveryConsumedExp = n.RecoveryConsumedExp.Format(time.RFC3339)
+		}
 		shard.RUnlock()
 		snap.Nodes[fmt.Sprintf("%d", id)] = sn
 	}
@@ -320,6 +324,12 @@ func (s *Server) applySnapshot(data []byte) error {
 		}
 		node.RecoveryCommitment = n.RecoveryCommitment
 		node.RecoveryProvider = n.RecoveryProvider
+		node.RecoveryConsumedNonce = n.RecoveryConsumedNonce
+		if n.RecoveryConsumedExp != "" {
+			if t, err := time.Parse(time.RFC3339, n.RecoveryConsumedExp); err == nil {
+				node.RecoveryConsumedExp = t
+			}
+		}
 		newNodes[n.ID] = node
 		newPubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

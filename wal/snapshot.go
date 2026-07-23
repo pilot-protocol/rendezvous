@@ -14,11 +14,11 @@ package wal
 import (
 	"encoding/json"
 
+	"github.com/pilot-protocol/common/registry/wire"
 	auditpkg "github.com/pilot-protocol/rendezvous/audit"
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	membpkg "github.com/pilot-protocol/rendezvous/membership"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
-	"github.com/pilot-protocol/common/registry/wire"
 )
 
 // SnapshotNode is the JSON-serializable form of a single registry node.
@@ -44,12 +44,21 @@ type SnapshotNode struct {
 	Version     string   `json:"version,omitempty"`
 	RelayOnly   bool     `json:"relay_only,omitempty"` // preserve flag across snapshots
 
+	// Verified-address badge + recovery enrollment. RecoveryCommitment in
+	// particular MUST persist: losing it on restart would break recovery for
+	// every enrolled address.
 	Badge                string `json:"badge,omitempty"`
 	BadgeSig             string `json:"badge_sig,omitempty"`
 	VerificationProvider string `json:"verification_provider,omitempty"`
 	VerifiedAt           string `json:"verified_at,omitempty"`
 	RecoveryCommitment   string `json:"recovery_commitment,omitempty"`
 	RecoveryProvider     string `json:"recovery_provider,omitempty"`
+
+	// Last redeemed recovery-authorization nonce + its expiry. Persisted so a
+	// redeemed-but-unexpired recovery cannot be replayed across a restart or
+	// standby failover (the in-memory single-use ledger is lost on restart).
+	RecoveryConsumedNonce string `json:"recovery_consumed_nonce,omitempty"`
+	RecoveryConsumedExp   string `json:"recovery_consumed_exp,omitempty"`
 }
 
 // SnapshotNet is the JSON-serializable form of a single registry network.

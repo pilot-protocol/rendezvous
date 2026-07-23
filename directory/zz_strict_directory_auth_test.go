@@ -44,8 +44,12 @@ func TestHandleLookup_StrictOff_PrivateNodeFullyDisclosed(t *testing.T) {
 	if resp["hostname"] != "priv" {
 		t.Fatalf("expected hostname disclosed under flag-off, resp=%v", resp)
 	}
-	if resp["external_id"] != "ext-1" {
-		t.Fatalf("expected external_id disclosed under flag-off, resp=%v", resp)
+	// main #90 redacts the raw external_id on the unauthenticated lookup path
+	// (privacy — only the offline-verifiable badge is public). Flag-off
+	// disclosure of the node is proven by the hostname above; external_id must
+	// stay redacted regardless of the strict flag.
+	if _, leaked := resp["external_id"]; leaked {
+		t.Fatalf("external_id must stay redacted on lookup even flag-off, resp=%v", resp)
 	}
 }
 
@@ -105,8 +109,14 @@ func TestHandleLookup_StrictOn_PrivateNodeAllowedBySharedNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected shared-network requester to be authorized, got: %v", err)
 	}
-	if resp["hostname"] != "priv" || resp["external_id"] != "ext-1" {
-		t.Fatalf("authorized caller should see full identity fields, resp=%v", resp)
+	// Authorization succeeds (shared network 8) → the node's disclosed fields
+	// are returned. The raw external_id stays redacted per main #90 privacy
+	// even for an authorized caller; hostname proves the authorized disclosure.
+	if resp["hostname"] != "priv" {
+		t.Fatalf("authorized caller should see the node's disclosed fields, resp=%v", resp)
+	}
+	if _, leaked := resp["external_id"]; leaked {
+		t.Fatalf("external_id must stay redacted even for an authorized caller, resp=%v", resp)
 	}
 }
 

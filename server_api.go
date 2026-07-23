@@ -10,10 +10,10 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	identpkg "github.com/pilot-protocol/rendezvous/identity"
 	walpkg "github.com/pilot-protocol/rendezvous/wal"
-	"github.com/pilot-protocol/common/crypto"
 )
 
 // ConnCount returns the current number of active connections (for testing).
@@ -437,6 +437,103 @@ func (s *Server) UpdateNodeExternalID(id uint32, externalID string) (oldID strin
 	return oldID, true
 }
 
+// SubmitBadge satisfies identpkg.NodeView. Stores a verified-address badge.
+func (s *Server) SubmitBadge(id uint32, badge, badgeSig, provider string, verifiedAt time.Time) (ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.Badge = badge
+	node.BadgeSig = badgeSig
+	node.VerificationProvider = provider
+	node.VerifiedAt = verifiedAt
+	sh.Unlock()
+	return true
+}
+
+// SetRecoveryEnrollment satisfies identpkg.NodeView. Records the opaque
+// identity commitment a future recovery must match.
+func (s *Server) SetRecoveryEnrollment(id uint32, commitment, provider string) (ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.RecoveryCommitment = commitment
+	node.RecoveryProvider = provider
+	sh.Unlock()
+	return true
+}
+
+// GetRecoveryEnrollment satisfies identpkg.NodeView.
+func (s *Server) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	node, exists := s.nodes[id]
+	if !exists || node.RecoveryCommitment == "" {
+		return "", "", false
+	}
+	return node.RecoveryCommitment, node.RecoveryProvider, true
+}
+
+// ConsumeRecoveryNonce satisfies identpkg.NodeView. It records a recovery
+// nonce as consumed for the node — persisted and replicated alongside the
+// recovery commitment — so a redeemed authorization cannot be replayed after
+// a restart or standby failover. Returns recorded=false (without mutating)
+// if the same nonce is already recorded as consumed for this node.
+func (s *Server) ConsumeRecoveryNonce(id uint32, nonce string, exp time.Time) (recorded, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, exists := s.nodes[id]
+	if !exists {
+		return false, false
+	}
+	sh := s.nodeShard(id)
+	sh.Lock()
+	defer sh.Unlock()
+	if nonce != "" && node.RecoveryConsumedNonce == nonce {
+		return false, true
+	}
+	node.RecoveryConsumedNonce = nonce
+	node.RecoveryConsumedExp = exp
+	return true, true
+}
+
+// ForceRotateKey satisfies identpkg.NodeView. Swaps the public key WITHOUT
+// an old-key stale-check — used only by identity recovery, authorized by a
+// cold-key-signed recovery statement rather than the old key.
+func (s *Server) ForceRotateKey(id uint32, newPubKey []byte, rotatedAt time.Time) (oldPubKeyB64 string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, ok := s.nodes[id]
+	if !ok {
+		return "", fmt.Errorf("node %d: %w", id, protocol.ErrNodeNotFound)
+	}
+	oldPubKeyB64 = crypto.EncodePublicKey(node.PublicKey)
+	sh := s.nodeShard(id)
+	sh.Lock()
+	node.PublicKey = newPubKey
+	node.SetLastSeen(rotatedAt)
+	node.KeyMeta.RotatedAt = rotatedAt
+	node.KeyMeta.RotateCount++
+	// A recovered address must NOT inherit the prior key holder's verification
+	// badge: the badge may attest a different external identity than the one
+	// that authorized this recovery, so the new holder must re-verify.
+	node.Badge = ""
+	node.BadgeSig = ""
+	node.VerificationProvider = ""
+	node.VerifiedAt = time.Time{}
+	sh.Unlock()
+	return oldPubKeyB64, nil
+}
+
 // NodeIsEnterprise satisfies identpkg.NodeView. Returns true if the node belongs
 // to at least one enterprise network.
 func (s *Server) NodeIsEnterprise(id uint32) bool {
@@ -470,78 +567,4 @@ func (s *Server) VerifyHeartbeatSignature(pubKey []byte, adminToken string, msg 
 // server-overridable clock (supports testing).
 func (s *Server) Now() time.Time {
 	return s.now()
-}
-
-func (s *Server) SubmitBadge(id uint32, badge, badgeSig, provider string, now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	node, exists := s.nodes[id]
-	if !exists {
-		return false
-	}
-	sh := s.nodeShard(id)
-	sh.Lock()
-	node.Badge = badge
-	node.BadgeSig = badgeSig
-	node.VerificationProvider = provider
-	node.VerifiedAt = now
-	sh.Unlock()
-	return true
-}
-
-func (s *Server) SetRecoveryEnrollment(id uint32, commitment, provider string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	node, exists := s.nodes[id]
-	if !exists {
-		return false
-	}
-	sh := s.nodeShard(id)
-	sh.Lock()
-	node.RecoveryCommitment = commitment
-	node.RecoveryProvider = provider
-	sh.Unlock()
-	return true
-}
-
-func (s *Server) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	node, exists := s.nodes[id]
-	if !exists {
-		return "", "", false
-	}
-	sh := s.nodeShard(id)
-	sh.RLock()
-	commitment = node.RecoveryCommitment
-	provider = node.RecoveryProvider
-	sh.RUnlock()
-	if commitment == "" {
-		return "", "", false
-	}
-	return commitment, provider, true
-}
-
-func (s *Server) ForceRotateKey(id uint32, newPubKey []byte, now time.Time) (oldPubKeyB64 string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	node, ok := s.nodes[id]
-	if !ok {
-		return "", fmt.Errorf("node %d: %w", id, protocol.ErrNodeNotFound)
-	}
-
-	oldPubKeyB64 = crypto.EncodePublicKey(node.PublicKey)
-	sh := s.nodeShard(id)
-	sh.Lock()
-	node.PublicKey = newPubKey
-	node.SetLastSeen(now)
-	node.KeyMeta.RotatedAt = now
-	node.KeyMeta.RotateCount++
-	sh.Unlock()
-
-	return oldPubKeyB64, nil
 }

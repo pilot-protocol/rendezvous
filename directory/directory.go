@@ -21,9 +21,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/registry/wire"
-	"github.com/pilot-protocol/common/crypto"
 )
 
 // --------------------------------------------------------------------------
@@ -74,12 +74,25 @@ type NodeInfo struct {
 	Version    string
 	RelayOnly  bool
 
+	// Verified-address badge (offline-verifiable; carries no raw identity).
 	Badge                string
 	BadgeSig             string
 	VerificationProvider string
 	VerifiedAt           time.Time
-	RecoveryCommitment   string
-	RecoveryProvider     string
+
+	// Recovery enrollment: opaque commitment (HMAC of the external identity)
+	// that a cold-key-signed recovery must match. Raw identity never stored.
+	RecoveryCommitment string
+	RecoveryProvider   string
+
+	// RecoveryConsumedNonce / RecoveryConsumedExp record the last recovery
+	// authorization nonce redeemed for this node, with its expiry. Persisted
+	// and replicated so a redeemed-but-unexpired recovery cannot be replayed
+	// after a registry restart or standby failover (the in-memory ledger is
+	// lost on restart, but this binding survives). Bounded by the 30-minute
+	// maxRecoveryWindow, after which it no longer matters.
+	RecoveryConsumedNonce string
+	RecoveryConsumedExp   time.Time
 
 	// LastSeenNano stores time.UnixNano() for lock-free heartbeat updates.
 	LastSeenNano atomic.Int64
@@ -456,8 +469,19 @@ func (st *Store) PerNetworkListNodesCached(netID uint16) ([]byte, error) {
 			if len(node.Tags) > 0 {
 				entry["tags"] = node.Tags
 			}
-			if node.ExternalID != "" {
-				entry["external_id"] = node.ExternalID
+			// Privacy: the raw external identity is NOT exposed on this open
+			// (per-network) listing. Surface only the offline-verifiable badge,
+			// which carries no identity.
+			if node.Badge != "" {
+				entry["verified"] = true
+				entry["badge"] = node.Badge
+				entry["badge_sig"] = node.BadgeSig
+				if node.VerificationProvider != "" {
+					entry["verification_provider"] = node.VerificationProvider
+				}
+				if !node.VerifiedAt.IsZero() {
+					entry["verified_at"] = node.VerifiedAt.UTC().Format(time.RFC3339)
+				}
 			}
 			if node.Version != "" {
 				entry["version"] = node.Version
@@ -878,35 +902,22 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 	// Owner-based reclaim
 	if owner != "" {
 		if existingID, ok := st.ownerIdx[owner]; ok {
-			if existingNode, exists := st.nodes[existingID]; exists {
-				oldPubKeyB64 := crypto.EncodePublicKey(existingNode.PublicKey)
-				delete(st.pubKeyIdx, oldPubKeyB64)
-				sh := st.nodeShard(existingID)
-				sh.Lock()
-				existingNode.PublicKey = pubKey
-				existingNode.RealAddr = listenAddr
-				existingNode.SetLastSeen(time.Now())
-				existingNode.LANAddrs = lanAddrs
-				if version != "" {
-					existingNode.Version = version
-				}
-				existingNode.RelayOnly = relayOnly
-				sh.Unlock()
-				st.pubKeyIdx[pubKeyB64] = existingID
-
-				addr := protocol.Addr{Network: 0, Node: existingID}
-				resp := map[string]interface{}{
-					"type":       "register_ok",
-					"node_id":    existingID,
-					"network_id": 0,
-					"address":    addr.String(),
-					"public_key": pubKeyB64,
-				}
-				st.setNodeHostname(existingNode, hostname, resp)
-				st.cb.Save()
-				slog.Debug("registered node", "node_id", existingID, "listen", listenAddr, "addr", addr, "mode", "owner_key_update")
-				st.cb.Audit("node.re_registered", "node_id", existingID, "mode", "owner_key_update")
-				return resp, nil
+			if _, exists := st.nodes[existingID]; exists {
+				// SECURITY (H2/H3): an existing node_id already has a key bound
+				// to it. The same-key refresh/heartbeat case never reaches here
+				// (it is served by the fast/slow path above via pubKeyIdx), so a
+				// live owner match with an UNKNOWN pubkey is always a request to
+				// REBIND the address to a different key. A plain register carries
+				// no proof-of-possession of the old key and no recovery
+				// authorization, so honoring it would let anyone who learns an
+				// owner string hijack the node_id (and inherit its badge).
+				//
+				// The ONLY sanctioned way to change a node_id's bound key is the
+				// recover_identity path (cold-key authorization), which also
+				// clears the badge. Refuse the rebind and keep the existing
+				// binding intact.
+				st.cb.Audit("node.rebind_rejected", "node_id", existingID, "owner", owner)
+				return nil, fmt.Errorf("owner %q is already bound to node %d with a different key; use recover_identity to rotate the key", owner, existingID)
 			}
 
 			// Owner node reaped — reclaim with new key
@@ -1067,16 +1078,18 @@ func (st *Store) HandleLookup(msg map[string]interface{}) (map[string]interface{
 			resp["endpoint"] = node.RealAddr
 		}
 	}
-	if node.Badge != "" || node.VerificationProvider != "" {
+	// Privacy: lookup is unauthenticated, so the raw external identity is NOT
+	// returned. Surface only the offline-verifiable badge (no identity).
+	if node.Badge != "" {
 		resp["verified"] = true
-		if node.Badge != "" {
-			resp["badge"] = node.Badge
-		}
+		resp["badge"] = node.Badge
+		resp["badge_sig"] = node.BadgeSig
 		if node.VerificationProvider != "" {
 			resp["verification_provider"] = node.VerificationProvider
 		}
-	} else if node.ExternalID != "" {
-		resp["external_id"] = node.ExternalID
+		if !node.VerifiedAt.IsZero() {
+			resp["verified_at"] = node.VerifiedAt.UTC().Format(time.RFC3339)
+		}
 	}
 	if node.Version != "" {
 		resp["version"] = node.Version
@@ -1176,10 +1189,14 @@ func (st *Store) HandleBinaryLookup(conn net.Conn, payload []byte) {
 			realAddr = node.RealAddr
 		}
 	}
+	// Privacy: never surface the raw external identity on the open lookup path
+	// (the JSON HandleLookup redacts it the same way — only the offline-
+	// verifiable badge is public). A verified address is signalled by its
+	// badge, not by leaking the provider handle.
 	resp := wire.EncodeLookupResp(
 		node.ID, node.Public, node.TaskExec,
 		node.Networks, node.PublicKey, node.Hostname, node.Tags,
-		realAddr, node.ExternalID,
+		realAddr, "",
 	)
 	sh.RUnlock()
 

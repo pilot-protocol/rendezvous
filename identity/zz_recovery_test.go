@@ -26,7 +26,7 @@ func recoveryTestStore(t *testing.T) (*Store, *pilotcrypto.Identity, uint32, *fa
 		Save:         func() {},
 		Audit:        func(a string, _ ...any) { audits = append(audits, a) },
 		OnKeyRotated: func(uint32, string, string) {},
-		RecordWAL:    func(uint32, string, string) {},
+		RecordWAL:    func(uint32, string, string, bool) {},
 	})
 	return st, id, nodeID, fv, &audits
 }
@@ -172,6 +172,48 @@ func TestHandleRecoverIdentityRejectsNonceReplay(t *testing.T) {
 	msg2["new_public_key"] = newPubB64
 	if _, err := st.HandleRecoverIdentity(msg2); err == nil || !strings.Contains(err.Error(), "already used") {
 		t.Fatalf("expected nonce-replay rejection, got %v", err)
+	}
+}
+
+// TestHandleRecoverIdentityRejectsNonceReplayAcrossReload asserts the M1 fix:
+// a redeemed nonce must still be rejected after a registry restart / standby
+// failover, when the in-memory single-use ledger has been lost. The fakeNodeView
+// (which models the persisted+replicated per-node state) carries the consumed
+// nonce across the reload, and the per-node ConsumeRecoveryNonce check catches
+// the replay even though a brand-new Store has an empty in-memory ledger.
+func TestHandleRecoverIdentityRejectsNonceReplayAcrossReload(t *testing.T) {
+	st, _, nodeID, fv, _ := recoveryTestStore(t)
+	fv.SetRecoveryEnrollment(nodeID, "COMMIT==", "github")
+	msg, newPubB64 := recoverMsg(t, nodeID)
+	verify := func(s, sig string) (badgeverify.Recovery, error) {
+		return badgeverify.Recovery{NodeID: nodeID, NewPubKey: newPubB64, Commitment: "COMMIT==", Exp: time.Now().Add(time.Minute).Unix(), Nonce: "persist-me"}, nil
+	}
+	st.verifyRecovery = verify
+	if _, err := st.HandleRecoverIdentity(msg); err != nil {
+		t.Fatalf("first recovery should succeed: %v", err)
+	}
+	// The persisted per-node state must now carry the consumed nonce.
+	if fv.nodes[nodeID].recNonce != "persist-me" {
+		t.Fatalf("consumed nonce not persisted on node: %+v", fv.nodes[nodeID])
+	}
+
+	// Simulate a restart/failover: a FRESH Store with an empty in-memory
+	// ledger, reconstructed over the SAME persisted node state (fv).
+	reloaded := NewStore(fv, Callbacks{
+		Save:         func() {},
+		Audit:        func(string, ...any) {},
+		OnKeyRotated: func(uint32, string, string) {},
+		RecordWAL:    func(uint32, string, string, bool) {},
+	})
+	reloaded.verifyRecovery = verify
+	// Re-bind the recovery to the node's current (rotated) key so we get past
+	// the new-key check and reach the nonce check.
+	msg2, newPubB64b := recoverMsg(t, nodeID)
+	reloaded.verifyRecovery = func(s, sig string) (badgeverify.Recovery, error) {
+		return badgeverify.Recovery{NodeID: nodeID, NewPubKey: newPubB64b, Commitment: "COMMIT==", Exp: time.Now().Add(time.Minute).Unix(), Nonce: "persist-me"}, nil
+	}
+	if _, err := reloaded.HandleRecoverIdentity(msg2); err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("expected nonce replay rejected after reload, got %v", err)
 	}
 }
 

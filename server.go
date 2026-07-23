@@ -85,6 +85,18 @@ type Server struct {
 	lastHeartbeatMs   atomic.Int64 // updated each heartbeat tick, persisted
 	requestCount      atomic.Int64
 
+	// Snapshot persistence telemetry, all updated by flushSave under
+	// its own internal locking. Surfaced read-only via /api/health and
+	// included in the rich /api/stats payload. Reads are non-blocking
+	// (atomic loads) so a probe doesn't contend with a save in flight.
+	snapshotsTotal       atomic.Int64 // successful flushSave calls
+	snapshotsFailed      atomic.Int64 // flushSave returning an error
+	lastSnapshotUnixMs   atomic.Int64 // wall time of last successful save
+	lastSnapshotDurMs    atomic.Int64 // duration of last successful save
+	lastSnapshotSizeB    atomic.Int64 // bytes written by last successful save
+	lastSnapshotRLockMs  atomic.Int64 // s.mu.RLock hold time in phase 1
+	maxSnapshotDurMs     atomic.Int64 // worst-ever save duration
+
 	// buildInfo carries the build-time identity surfaced on
 	// /api/public-stats for code-verification (version, git commit, ISO
 	// build time, SHA256 of /proc/self/exe, Go runtime version). Set

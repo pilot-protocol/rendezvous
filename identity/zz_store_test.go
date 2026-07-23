@@ -5,10 +5,8 @@ package identity
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -24,16 +22,19 @@ type fakeNodeView struct {
 }
 
 type fakeNode struct {
-	pubKey      []byte
-	keyMeta     KeyInfo
-	networks    []uint16
-	externalID  string
-	owner       string
-	badge       string
-	badgeSig    string
-	provider    string
-	recCommit   string
-	recProvider string
+	pubKey     []byte
+	keyMeta    KeyInfo
+	networks   []uint16
+	externalID string
+	owner      string
+	badge      string
+	badgeSig   string
+	provider   string
+	verifiedAt time.Time
+	recCommit  string
+	recProv    string
+	recNonce   string
+	recExp     time.Time
 }
 
 func (v *fakeNodeView) LookupNodeKey(id uint32) ([]byte, bool) {
@@ -68,47 +69,52 @@ func (v *fakeNodeView) VerifyHeartbeatSignature([]byte, string, map[string]inter
 	return nil
 }
 func (v *fakeNodeView) Now() time.Time { return time.Now() }
-
-func (v *fakeNodeView) SubmitBadge(id uint32, badge, badgeSig, provider string, now time.Time) bool {
+func (v *fakeNodeView) SubmitBadge(id uint32, badge, badgeSig, provider string, at time.Time) bool {
 	n, ok := v.nodes[id]
 	if !ok {
 		return false
 	}
-	n.badge = badge
-	n.badgeSig = badgeSig
-	n.provider = provider
+	n.badge, n.badgeSig, n.provider, n.verifiedAt = badge, badgeSig, provider, at
 	v.nodes[id] = n
 	return true
 }
-
 func (v *fakeNodeView) SetRecoveryEnrollment(id uint32, commitment, provider string) bool {
 	n, ok := v.nodes[id]
 	if !ok {
 		return false
 	}
-	n.recCommit = commitment
-	n.recProvider = provider
+	n.recCommit, n.recProv = commitment, provider
 	v.nodes[id] = n
 	return true
 }
-
-func (v *fakeNodeView) GetRecoveryEnrollment(id uint32) (commitment, provider string, ok bool) {
-	n, exists := v.nodes[id]
-	if !exists || n.recCommit == "" {
+func (v *fakeNodeView) GetRecoveryEnrollment(id uint32) (string, string, bool) {
+	n, ok := v.nodes[id]
+	if !ok || n.recCommit == "" {
 		return "", "", false
 	}
-	return n.recCommit, n.recProvider, true
+	return n.recCommit, n.recProv, true
 }
-
-func (v *fakeNodeView) ForceRotateKey(id uint32, newPubKey []byte, now time.Time) (string, error) {
+func (v *fakeNodeView) ConsumeRecoveryNonce(id uint32, nonce string, exp time.Time) (bool, bool) {
 	n, ok := v.nodes[id]
 	if !ok {
-		return "", fmt.Errorf("node %d not found", id)
+		return false, false
 	}
-	oldPubKeyB64 := base64.StdEncoding.EncodeToString(n.pubKey)
+	if nonce != "" && n.recNonce == nonce {
+		return false, true
+	}
+	n.recNonce, n.recExp = nonce, exp
+	v.nodes[id] = n
+	return true, true
+}
+func (v *fakeNodeView) ForceRotateKey(id uint32, newPubKey []byte, at time.Time) (string, error) {
+	n, ok := v.nodes[id]
+	if !ok {
+		return "", nil
+	}
+	old := string(n.pubKey)
 	n.pubKey = newPubKey
 	v.nodes[id] = n
-	return oldPubKeyB64, nil
+	return old, nil
 }
 
 func newTestStore() *Store {
@@ -117,7 +123,7 @@ func newTestStore() *Store {
 		Audit:               func(string, ...any) {},
 		IncKeyRotations:     func() {},
 		IncIDPVerifications: func() {},
-		RecordWAL:           func(uint32, string, string) {},
+		RecordWAL:           func(uint32, string, string, bool) {},
 		OnKeyRotated:        func(uint32, string, string) {},
 	})
 }

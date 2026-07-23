@@ -110,10 +110,17 @@ func (s *Server) SetMaxNodes(n int) {
 	s.mu.Unlock()
 }
 
+// SetStrictDirectoryAuth toggles WS2 strict directory authorization. When
+// enabled, private-node directory RPCs (lookup/resolve/resolve_hostname/
+// list_nodes/punch/check_trust/list_networks) require the requester to prove
+// trust or shared-network membership. Default off for wire-compatibility.
 func (s *Server) SetStrictDirectoryAuth(enabled bool) {
 	s.strictDirectoryAuth.Store(enabled)
 }
 
+// StrictDirectoryAuth reports whether WS2 strict directory authorization is
+// enforced. Wired into the trust/membership/directory/routing sub-packages as
+// a callback so gating stays lock-free on the hot path.
 func (s *Server) StrictDirectoryAuth() bool {
 	return s.strictDirectoryAuth.Load()
 }
@@ -213,6 +220,58 @@ func (s *Server) BreakerAllow(name string) (bool, string) {
 		return true, ""
 	}
 	return false, s.breakers.Reason(name)
+}
+
+// HealthSnapshot returns the operator-facing process health bundle
+// served by /api/health. Mostly atomic-field loads, plus a few
+// subsystem queries — WAL size, the breaker snapshot, and
+// replMgr.SubCount(). Those queries take their own short subsystem
+// locks (the WAL mutex, the breaker mutex, the replication manager's
+// sub lock), all uncontended fast paths — but the probe does NOT take
+// the hot registry mutex (s.mu), so it never blocks behind a save in
+// flight. Missing subsystems (no WAL, no replication) are omitted
+// from the payload entirely.
+func (s *Server) HealthSnapshot() map[string]any {
+	out := map[string]any{
+		"snapshots_total":          s.snapshotsTotal.Load(),
+		"snapshots_failed":         s.snapshotsFailed.Load(),
+		"max_snapshot_duration_ms": s.maxSnapshotDurMs.Load(),
+		"server_time":              time.Now().Unix(),
+	}
+	if ms := s.lastSnapshotUnixMs.Load(); ms > 0 {
+		out["last_snapshot_at"] = ms
+	}
+	if ms := s.lastSnapshotDurMs.Load(); ms > 0 {
+		out["last_snapshot_duration_ms"] = ms
+	}
+	if b := s.lastSnapshotSizeB.Load(); b > 0 {
+		out["last_snapshot_size_bytes"] = b
+	}
+	if ms := s.lastSnapshotRLockMs.Load(); ms > 0 {
+		out["last_snapshot_rlock_ms"] = ms
+	}
+	if s.walStore != nil {
+		if w := s.walStore.WAL(); w != nil {
+			out["wal_size_bytes"] = w.Size()
+		}
+	}
+	if s.breakers != nil {
+		// Use ParseState round-trip to surface the canonical name.
+		// We don't call Allow here because Allow increments counters
+		// and a health probe shouldn't pollute the gate metrics.
+		state := "closed"
+		for _, b := range s.breakers.Snapshot() {
+			if b.Name == "snapshot.write" {
+				state = b.StateString
+				break
+			}
+		}
+		out["snapshot_write_breaker"] = state
+	}
+	if s.replMgr != nil {
+		out["replication_subscribers"] = s.replMgr.SubCount()
+	}
+	return out
 }
 
 // SetBreakersPath registers the on-disk breakers.json path so the
@@ -588,11 +647,12 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		Audit:               s.audit,
 		IncKeyRotations:     s.metrics.KeyRotations.Inc,
 		IncIDPVerifications: s.metrics.IdpVerifications.Inc,
-		RecordWAL: func(nodeID uint32, newPubKeyB64, rotatedAt string) {
+		RecordWAL: func(nodeID uint32, newPubKeyB64, rotatedAt string, clearBadge bool) {
 			s.recordWAL(DeltaKeyRotation, nodeID, keyRotationDelta{
 				NodeID:       nodeID,
 				NewPublicKey: newPubKeyB64,
 				RotatedAt:    rotatedAt,
+				ClearBadge:   clearBadge,
 			})
 		},
 		OnKeyRotated: func(nodeID uint32, oldPubKeyB64, newPubKeyB64 string) {
@@ -1011,10 +1071,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			s.mu.RUnlock()
 			return out
 		},
-		RequestCount:    s.requestCount.Load,
-		StartTime:       func() time.Time { return s.startTime },
-		NodeCount:       func() int { s.mu.RLock(); n := len(s.nodes); s.mu.RUnlock(); return n },
-		OnlineCount:     s.onlineCount,
+		RequestCount: s.requestCount.Load,
+		StartTime:    func() time.Time { return s.startTime },
+		NodeCount:    func() int { s.mu.RLock(); n := len(s.nodes); s.mu.RUnlock(); return n },
+		OnlineCount:  s.onlineCount,
 		TotalEverRegistered: func() int64 {
 			s.mu.RLock()
 			defer s.mu.RUnlock()
@@ -1023,7 +1083,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			}
 			return int64(s.nextNode - 1)
 		},
-		BuildInfo: s.BuildInfo,
+		BuildInfo:       s.BuildInfo,
 		StaleThreshold:  s.StaleNodeThreshold,
 		TriggerSnapshot: s.TriggerSnapshot,
 		UpdateGauges:    func() { s.updateGauges(s.metrics) },
@@ -1048,6 +1108,7 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 		BreakerList:       s.BreakerList,
 		BreakerSet:        s.BreakerSet,
 		BreakerDelete:     s.BreakerDelete,
+		HealthSnapshot:    s.HealthSnapshot,
 		VerifyRequest: func(canonical, sigB64 string) interface{} {
 			return s.VerifyRequest(canonical, sigB64)
 		},
@@ -1063,10 +1124,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			}}
 		},
 		ReplicationStatus: replSnap,
-		NetworksList: s.AdminListNetworks,
-		MembersList:  s.AdminListMembers,
-		MemberKick:   s.AdminKickMember,
-		MemberRole:   s.AdminSetMemberRole,
+		NetworksList:      s.AdminListNetworks,
+		MembersList:       s.AdminListMembers,
+		MemberKick:        s.AdminKickMember,
+		MemberRole:        s.AdminSetMemberRole,
 		AuditRecent: func(n int) []dashpkg.AuditEntrySnapshot {
 			s.auditMu.Lock()
 			ring := make([]AuditEntry, len(s.auditLog))

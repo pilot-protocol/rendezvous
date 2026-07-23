@@ -156,6 +156,15 @@ func (st *Store) HandleRecoverIdentity(msg map[string]interface{}) (map[string]i
 		return nil, fmt.Errorf("recovery is not bound to this new key")
 	}
 
+	// Bound the authorization lifetime. The single-use nonce ledger is
+	// in-memory, so a far-future Exp would let a captured, already-used
+	// authorization be replayed after a registry restart (the ledger resets).
+	// Legitimate recoveries are minutes-valid; reject anything longer.
+	const maxRecoveryWindow = 30 * time.Minute
+	if time.Unix(r.Exp, 0).After(time.Now().Add(maxRecoveryWindow)) {
+		return nil, fmt.Errorf("recovery authorization expiry too far in the future (max %s)", maxRecoveryWindow)
+	}
+
 	// The re-proven identity's commitment must match what was enrolled.
 	storedCommitment, provider, ok := st.nodes.GetRecoveryEnrollment(nodeID)
 	if !ok {
@@ -166,7 +175,20 @@ func (st *Store) HandleRecoverIdentity(msg map[string]interface{}) (map[string]i
 	}
 
 	// Single-use nonce: reject replays.
+	//
+	// Two layers must both pass: the in-memory ledger catches replays within
+	// a single process lifetime (including concurrent submissions), and the
+	// per-node persisted nonce (ConsumeRecoveryNonce) catches replays that
+	// survive a registry restart or standby failover, where the in-memory
+	// ledger has been lost.
 	if !st.consumeNonce(r.Nonce, time.Unix(r.Exp, 0)) {
+		return nil, fmt.Errorf("recovery authorization already used")
+	}
+	recorded, nodeOK := st.nodes.ConsumeRecoveryNonce(nodeID, r.Nonce, time.Unix(r.Exp, 0))
+	if !nodeOK {
+		return nil, fmt.Errorf("node %d: %w", nodeID, protocol.ErrNodeNotFound)
+	}
+	if !recorded {
 		return nil, fmt.Errorf("recovery authorization already used")
 	}
 
@@ -177,8 +199,10 @@ func (st *Store) HandleRecoverIdentity(msg map[string]interface{}) (map[string]i
 	if st.cb.OnKeyRotated != nil {
 		st.cb.OnKeyRotated(nodeID, oldPubKeyB64, newPubKeyB64)
 	}
+	// Recovery rotates to a NEW holder, so the prior badge must be cleared on
+	// replay too (ForceRotateKey already cleared it in-memory). clearBadge=true.
 	if st.cb.RecordWAL != nil {
-		st.cb.RecordWAL(nodeID, newPubKeyB64, st.nodes.Now().UTC().Format(time.RFC3339))
+		st.cb.RecordWAL(nodeID, newPubKeyB64, st.nodes.Now().UTC().Format(time.RFC3339), true)
 	}
 	if st.cb.Save != nil {
 		st.cb.Save()
