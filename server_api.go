@@ -122,8 +122,7 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 		case uint32:
 			nodeID = v
 		}
-		if nodeID > 0 {
-			s.mu.RLock()
+		if nodeID > 0 && s.mu.TryRLock() {
 			if node, exists := s.nodes[nodeID]; exists {
 				nets := node.Networks
 				for _, netID := range nets {
@@ -147,9 +146,7 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 	}()
 
 	// Standby mode: reject write operations, allow reads
-	s.mu.RLock()
 	isStandby := s.walStore.IsStandby()
-	s.mu.RUnlock()
 	if isStandby {
 		switch msgType {
 		case "lookup", "resolve", "list_networks", "list_nodes", "heartbeat", "poll_handshakes", "poll_invites", "resolve_hostname", "beacon_list",
