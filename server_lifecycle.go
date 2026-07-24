@@ -125,6 +125,14 @@ func (s *Server) StrictDirectoryAuth() bool {
 	return s.strictDirectoryAuth.Load()
 }
 
+func (s *Server) SetStrictRegistrationAuth(enabled bool) {
+	s.strictRegistrationAuth.Store(enabled)
+}
+
+func (s *Server) StrictRegistrationAuth() bool {
+	return s.strictRegistrationAuth.Load()
+}
+
 // SetDashboardToken gates per-network stats on the dashboard.
 // Empty string restricts the dashboard to global aggregates only.
 func (s *Server) SetDashboardToken(token string) {
@@ -941,7 +949,8 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				}
 				return nets
 			},
-			StrictDirectoryAuth: s.StrictDirectoryAuth,
+			StrictDirectoryAuth:    s.StrictDirectoryAuth,
+			StrictRegistrationAuth: s.StrictRegistrationAuth,
 		},
 	)
 
@@ -1105,10 +1114,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			allow, _ := s.breakers.Allow(name)
 			return allow, s.breakers.Reason(name)
 		},
-		BreakerList:       s.BreakerList,
-		BreakerSet:        s.BreakerSet,
-		BreakerDelete:     s.BreakerDelete,
-		HealthSnapshot:    s.HealthSnapshot,
+		BreakerList:    s.BreakerList,
+		BreakerSet:     s.BreakerSet,
+		BreakerDelete:  s.BreakerDelete,
+		HealthSnapshot: s.HealthSnapshot,
 		VerifyRequest: func(canonical, sigB64 string) interface{} {
 			return s.VerifyRequest(canonical, sigB64)
 		},
