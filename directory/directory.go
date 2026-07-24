@@ -10,6 +10,7 @@
 package directory
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -236,6 +237,7 @@ type Callbacks struct {
 	// a reaped node reclaims its old identity. Caller holds mu.Lock.
 	ScanNetworkMemberships func(nodeID uint32) []uint16
 	StrictDirectoryAuth    func() bool
+	StrictRegistrationAuth func() bool
 }
 
 // --------------------------------------------------------------------------
@@ -718,6 +720,24 @@ func (st *Store) HandleRegister(
 	pubKeyB64, ok := msg["public_key"].(string)
 	if !ok || pubKeyB64 == "" {
 		return nil, fmt.Errorf("registration requires public_key")
+	}
+
+	sigB64, _ := msg["signature"].(string)
+	strictReg := st.cb.StrictRegistrationAuth != nil && st.cb.StrictRegistrationAuth()
+	if sigB64 != "" {
+		pubKey, err := crypto.DecodePublicKey(pubKeyB64)
+		if err != nil {
+			return nil, fmt.Errorf("registration: invalid public_key")
+		}
+		sig, err := base64.StdEncoding.DecodeString(sigB64)
+		if err != nil {
+			return nil, fmt.Errorf("registration: invalid signature encoding")
+		}
+		if !crypto.Verify(pubKey, []byte(fmt.Sprintf("register:%s:%s", clientAddr, pubKeyB64)), sig) {
+			return nil, fmt.Errorf("registration: signature verification failed")
+		}
+	} else if strictReg {
+		return nil, fmt.Errorf("registration: signature required")
 	}
 
 	if hostname != "" {
