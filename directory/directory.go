@@ -812,21 +812,24 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 	}
 
 	// PPA-003 ratchet: once a key has registered with a valid proof-of-
-	// possession (SigVerified), an unsigned registration may not relocate its
-	// endpoint. Unsigned / first-seen keys are unaffected, so no old agent
-	// breaks; protection grows as the fleet signs.
+	// possession (SigVerified), no unsigned registration for that key is
+	// honored — it can neither relocate the endpoint nor rewrite the record
+	// (hostname, relay flag, LAN addrs, version). A signing daemon signs every
+	// registration, so a legitimate re-register never lands here; unsigned /
+	// first-seen keys are unaffected, so no old agent breaks and protection
+	// grows as the fleet signs.
 	if !sigVerified {
 		st.mu.RLock()
 		if exID, known := st.pubKeyIdx[pubKeyB64]; known {
 			if n, ok := st.nodes[exID]; ok {
 				sh := &st.nodeShards[exID%NumNodeShards]
 				sh.RLock()
-				reject := n.SigVerified && listenAddr != n.RealAddr
+				reject := n.SigVerified
 				sh.RUnlock()
 				if reject {
 					st.mu.RUnlock()
 					st.cb.Audit("node.register_ratchet_rejected", "node_id", exID)
-					return nil, fmt.Errorf("node %d: unsigned registration cannot relocate the endpoint of a signature-verified key", exID)
+					return nil, fmt.Errorf("node %d: unsigned registration cannot modify a signature-verified key", exID)
 				}
 			}
 		}

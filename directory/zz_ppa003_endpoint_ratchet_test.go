@@ -52,8 +52,11 @@ func TestRegisterEndpointRatchet(t *testing.T) {
 	if e := reg(pub, "10.0.0.2:6000", sign("10.0.0.2:6000")); e != nil {
 		t.Fatalf("legitimate signed endpoint move rejected: %v", e)
 	}
-	if e := reg(pub, "10.0.0.2:6000", ""); e != nil {
-		t.Fatalf("unsigned same-endpoint refresh rejected: %v", e)
+	// An unsigned registration for a signature-verified key is refused even at
+	// the same endpoint — a signing daemon always signs, so this only ever
+	// arrives from an attacker.
+	if e := reg(pub, "10.0.0.2:6000", ""); e == nil {
+		t.Fatal("unsigned re-register of a signature-verified key was accepted")
 	}
 
 	// Compat: a key that never signed must still be able to move (old agents).
