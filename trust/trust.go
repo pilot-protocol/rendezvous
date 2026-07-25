@@ -8,9 +8,9 @@ package trust
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -69,27 +69,23 @@ type Callbacks struct {
 //
 // LOCK ORDERING
 //
-//	mu (RWMutex) — protects trustPairs.
+//	trustPairs — sharded internally, one RWMutex per shard.
 //	handshakeMu (Mutex) — protects handshakeInbox, handshakeResponses,
 //	                       and pendingHandshakes.
 //
-// These two locks are independent; neither may be acquired while holding
+// These locks are independent; neither may be acquired while holding
 // the other. No code path needs both simultaneously.
 type Store struct {
 	nodes NodeView
 	cb    Callbacks
 
-	mu         sync.RWMutex
-	trustPairs map[string]bool
+	trustPairs *trustPairSet
 
-	handshakeMu        sync.Mutex
-	handshakeInbox     map[uint32][]*HandshakeRelayMsg
-	handshakeResponses map[uint32][]*HandshakeResponseMsg
-	// pendingHandshakes tracks requests that have been sent but not yet
-	// responded to.  Unlike handshakeInbox it is NOT cleared by poll, so
-	// respond_handshake can verify a prior request existed even after the
-	// recipient has polled the inbox.  Keyed as [responderID][requesterID].
-	pendingHandshakes map[uint32]map[uint32]struct{}
+	// handshakes holds the relay inboxes, responses and pending-request
+	// tracking, sharded by node id. Pending requests are NOT cleared by
+	// poll, so respond_handshake can verify a prior request existed even
+	// after the recipient has polled its inbox.
+	handshakes *handshakeState
 }
 
 // NewStore creates an empty, ready-to-use Store.
@@ -97,10 +93,8 @@ func NewStore(nodes NodeView, cb Callbacks) *Store {
 	return &Store{
 		nodes:              nodes,
 		cb:                 cb,
-		trustPairs:         make(map[string]bool),
-		handshakeInbox:     make(map[uint32][]*HandshakeRelayMsg),
-		handshakeResponses: make(map[uint32][]*HandshakeResponseMsg),
-		pendingHandshakes:  make(map[uint32]map[uint32]struct{}),
+		trustPairs: newTrustPairSet(),
+		handshakes: newHandshakeState(),
 	}
 }
 
@@ -108,17 +102,13 @@ func NewStore(nodes NodeView, cb Callbacks) *Store {
 
 // Count returns the total number of trust pairs currently stored.
 func (st *Store) Count() int {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	return len(st.trustPairs)
+	return st.trustPairs.count()
 }
 
 // IsTrusted reports whether nodes a and b have an established trust pair.
 // The relation is symmetric: IsTrusted(a, b) == IsTrusted(b, a).
 func (st *Store) IsTrusted(a, b uint32) bool {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	return st.trustPairs[pairKey(a, b)]
+	return st.trustPairs.has(pairKey(a, b))
 }
 
 // --- Snapshot / restore ---
@@ -126,20 +116,14 @@ func (st *Store) IsTrusted(a, b uint32) bool {
 // Pairs returns a snapshot of all trust-pair keys for serialisation.
 // Each key is of the form "min:max" where min <= max.
 func (st *Store) Pairs() []string {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	out := make([]string, 0, len(st.trustPairs))
-	for k := range st.trustPairs {
-		out = append(out, k)
-	}
-	return out
+	return st.trustPairs.keys()
 }
 
 // RestorePairs loads trust pairs from a snapshot during startup. It is
 // NOT safe for concurrent use — call it before serving requests.
 func (st *Store) RestorePairs(keys []string) {
 	for _, key := range keys {
-		st.trustPairs[key] = true
+		st.trustPairs.addUnlocked(key)
 	}
 }
 
@@ -149,22 +133,7 @@ func (st *Store) InboxSnapshot() (
 	inbox map[uint32][]*HandshakeRelayMsg,
 	responses map[uint32][]*HandshakeResponseMsg,
 ) {
-	st.handshakeMu.Lock()
-	defer st.handshakeMu.Unlock()
-
-	if len(st.handshakeInbox) > 0 {
-		inbox = make(map[uint32][]*HandshakeRelayMsg, len(st.handshakeInbox))
-		for id, msgs := range st.handshakeInbox {
-			inbox[id] = msgs
-		}
-	}
-	if len(st.handshakeResponses) > 0 {
-		responses = make(map[uint32][]*HandshakeResponseMsg, len(st.handshakeResponses))
-		for id, msgs := range st.handshakeResponses {
-			responses[id] = msgs
-		}
-	}
-	return
+	return st.handshakes.snapshot()
 }
 
 // RestoreInbox loads handshake inboxes from a snapshot during startup.
@@ -173,36 +142,15 @@ func (st *Store) RestoreInbox(
 	inbox map[uint32][]*HandshakeRelayMsg,
 	responses map[uint32][]*HandshakeResponseMsg,
 ) {
-	st.handshakeMu.Lock()
-	defer st.handshakeMu.Unlock()
-	for id, msgs := range inbox {
-		st.handshakeInbox[id] = msgs
-		// Rebuild pendingHandshakes from the restored inbox so that
-		// respond_handshake validation works correctly after a restart.
-		for _, msg := range msgs {
-			if st.pendingHandshakes[id] == nil {
-				st.pendingHandshakes[id] = make(map[uint32]struct{})
-			}
-			st.pendingHandshakes[id][msg.FromNodeID] = struct{}{}
-		}
-	}
-	for id, msgs := range responses {
-		st.handshakeResponses[id] = msgs
-	}
+	// Pending state is rebuilt from the restored requests so that
+	// respond_handshake validation works correctly after a restart.
+	st.handshakes.restore(inbox, responses)
 }
 
 // InboxSize returns the total number of pending handshake requests and
 // responses (for metrics gauges).
 func (st *Store) InboxSize() (requests, responses int) {
-	st.handshakeMu.Lock()
-	defer st.handshakeMu.Unlock()
-	for _, msgs := range st.handshakeInbox {
-		requests += len(msgs)
-	}
-	for _, msgs := range st.handshakeResponses {
-		responses += len(msgs)
-	}
-	return
+	return st.handshakes.size()
 }
 
 // --- Handlers ---
@@ -240,9 +188,7 @@ func (st *Store) HandleReportTrust(req map[string]interface{}) (map[string]inter
 	}
 
 	key := pairKey(nodeA, nodeB)
-	st.mu.Lock()
-	st.trustPairs[key] = true
-	st.mu.Unlock()
+	st.trustPairs.add(key)
 
 	st.cb.Save()
 	st.cb.IncTrustReports()
@@ -278,13 +224,9 @@ func (st *Store) HandleRevokeTrust(req map[string]interface{}) (map[string]inter
 	}
 
 	key := pairKey(nodeA, nodeB)
-	st.mu.Lock()
-	if !st.trustPairs[key] {
-		st.mu.Unlock()
+	if !st.trustPairs.remove(key) {
 		return nil, fmt.Errorf("no trust pair between %d and %d", nodeA, nodeB)
 	}
-	delete(st.trustPairs, key)
-	st.mu.Unlock()
 
 	st.cb.Save()
 	st.cb.IncTrustRevocations()
@@ -318,9 +260,7 @@ func (st *Store) HandleCheckTrust(req map[string]interface{}) (map[string]interf
 		}
 	}
 
-	st.mu.RLock()
-	trusted := st.trustPairs[pairKey(nodeA, nodeB)]
-	st.mu.RUnlock()
+	trusted := st.trustPairs.has(pairKey(nodeA, nodeB))
 
 	if !trusted {
 		_, netsA, okA := st.nodes.LookupNode(nodeA)
@@ -390,28 +330,13 @@ func (st *Store) HandleRequestHandshake(req map[string]interface{}) (map[string]
 		return nil, fmt.Errorf("node %d: %w", toNodeID, protocol.ErrNodeNotFound)
 	}
 
-	// Phase 3b: inbox mutation under handshakeMu
-	st.handshakeMu.Lock()
-	defer st.handshakeMu.Unlock()
-
-	if len(st.handshakeInbox[toNodeID]) >= maxHandshakeInbox {
+	// Phase 3b: inbox mutation, sharded by recipient node id
+	switch err := st.handshakes.relay(toNodeID, fromNodeID, justification, maxHandshakeInbox); {
+	case errors.Is(err, errInboxFull):
 		return nil, fmt.Errorf("handshake inbox full for node %d", toNodeID)
+	case errors.Is(err, errAlreadyPending):
+		return nil, fmt.Errorf("handshake request already pending from node %d", fromNodeID)
 	}
-	for _, existing := range st.handshakeInbox[toNodeID] {
-		if existing.FromNodeID == fromNodeID {
-			return nil, fmt.Errorf("handshake request already pending from node %d", fromNodeID)
-		}
-	}
-
-	st.handshakeInbox[toNodeID] = append(st.handshakeInbox[toNodeID], &HandshakeRelayMsg{
-		FromNodeID:    fromNodeID,
-		Justification: justification,
-		Timestamp:     time.Now(),
-	})
-	if st.pendingHandshakes[toNodeID] == nil {
-		st.pendingHandshakes[toNodeID] = make(map[uint32]struct{})
-	}
-	st.pendingHandshakes[toNodeID][fromNodeID] = struct{}{}
 
 	st.cb.IncHandshakeRequests()
 
@@ -443,13 +368,8 @@ func (st *Store) HandlePollHandshakes(req map[string]interface{}) (map[string]in
 		return nil, err
 	}
 
-	// Phase 3: handshakeMu protects only handshake state
-	st.handshakeMu.Lock()
-	inbox := st.handshakeInbox[nodeID]
-	delete(st.handshakeInbox, nodeID)
-	respInbox := st.handshakeResponses[nodeID]
-	delete(st.handshakeResponses, nodeID)
-	st.handshakeMu.Unlock()
+	// Phase 3: drain this node's shard only
+	inbox, respInbox := st.handshakes.pop(nodeID)
 
 	requests := make([]map[string]interface{}, len(inbox))
 	for i, r := range inbox {
@@ -524,24 +444,12 @@ func (st *Store) HandleRespondHandshake(req map[string]interface{}) (map[string]
 	// pendingHandshakes is populated by HandleRequestHandshake and survives
 	// poll drains, so this check holds even after the recipient has polled.
 	if accept {
-		st.handshakeMu.Lock()
-		pending := st.pendingHandshakes[nodeID]
-		_, found := pending[peerID]
-		if found {
-			delete(pending, peerID)
-			if len(pending) == 0 {
-				delete(st.pendingHandshakes, nodeID)
-			}
-		}
-		st.handshakeMu.Unlock()
-		if !found {
+		if !st.handshakes.takePending(nodeID, peerID) {
 			return nil, fmt.Errorf("no pending handshake request from node %d", peerID)
 		}
 
 		key := pairKey(nodeID, peerID)
-		st.mu.Lock()
-		st.trustPairs[key] = true
-		st.mu.Unlock()
+		st.trustPairs.add(key)
 		st.cb.Save()
 		slog.Info("handshake approved via relay, trust pair created", "node", nodeID, "peer", peerID)
 	} else {
@@ -549,14 +457,12 @@ func (st *Store) HandleRespondHandshake(req map[string]interface{}) (map[string]
 	}
 	st.cb.Audit("handshake.responded", "node_id", nodeID, "peer_id", peerID, "accept", accept)
 
-	// Phase 3c: response inbox append under handshakeMu
-	st.handshakeMu.Lock()
-	st.handshakeResponses[peerID] = append(st.handshakeResponses[peerID], &HandshakeResponseMsg{
+	// Phase 3c: response inbox append, sharded by recipient node id
+	st.handshakes.appendResponse(peerID, &HandshakeResponseMsg{
 		FromNodeID: nodeID,
 		Accept:     accept,
 		Timestamp:  time.Now(),
 	})
-	st.handshakeMu.Unlock()
 
 	return map[string]interface{}{
 		"type":    "respond_handshake_ok",
