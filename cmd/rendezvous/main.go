@@ -125,6 +125,13 @@ func main() {
 	r.SetBuildInfo(buildInfo)
 	r.SetStaleNodeThreshold(*staleThreshold)
 	r.SetBeaconStats(b)
+	b.SetAuthoritativeKeyLookup(func(nodeID uint32) (ed25519.PublicKey, bool) {
+		raw, ok := r.LookupPublicKey(nodeID)
+		if !ok {
+			return nil, false
+		}
+		return ed25519.PublicKey(raw), true
+	})
 	if *strictDirectoryAuth || os.Getenv("RENDEZVOUS_STRICT_DIRECTORY_AUTH") == "1" {
 		r.SetStrictDirectoryAuth(true)
 		slog.Info("strict directory authorization enabled (WS2)")
