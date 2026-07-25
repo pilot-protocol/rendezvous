@@ -235,8 +235,9 @@ type Callbacks struct {
 	// ScanNetworkMemberships returns the set of non-backbone networkIDs that
 	// still list nodeID as a member. Used to restore network memberships after
 	// a reaped node reclaims its old identity. Caller holds mu.Lock.
-	ScanNetworkMemberships func(nodeID uint32) []uint16
-	StrictDirectoryAuth    func() bool
+	ScanNetworkMemberships   func(nodeID uint32) []uint16
+	StrictDirectoryAuth      func() bool
+	RequireRegisterSignature func() bool
 }
 
 // --------------------------------------------------------------------------
@@ -737,6 +738,26 @@ func (st *Store) HandleRegister(
 	pubKeyB64, ok := msg["public_key"].(string)
 	if !ok || pubKeyB64 == "" {
 		return nil, fmt.Errorf("registration requires public_key")
+	}
+
+	// PPA-003 proof-of-possession. Verify-if-present is wire-compatible: a
+	// daemon that sends no signature still registers, so old fleets are
+	// unaffected; a present-but-invalid signature is always rejected. Flipping
+	// RequireRegisterSignature (default off) makes the signature mandatory once
+	// the signing client has rolled out — do NOT default it on.
+	if sigB64, _ := msg["signature"].(string); sigB64 != "" {
+		pubKeyBytes, decErr := crypto.DecodePublicKey(pubKeyB64)
+		if decErr != nil {
+			return nil, fmt.Errorf("registration: invalid public_key: %w", decErr)
+		}
+		challenge := fmt.Sprintf("register:%s:%s", clientAddr, pubKeyB64)
+		if st.cb.VerifyNodeSignature != nil {
+			if err := st.cb.VerifyNodeSignature(pubKeyBytes, "", msg, challenge); err != nil {
+				return nil, fmt.Errorf("registration signature verification failed: %w", err)
+			}
+		}
+	} else if st.cb.RequireRegisterSignature != nil && st.cb.RequireRegisterSignature() {
+		return nil, fmt.Errorf("registration requires a signature")
 	}
 
 	if hostname != "" {

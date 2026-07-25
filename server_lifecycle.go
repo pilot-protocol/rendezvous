@@ -125,6 +125,20 @@ func (s *Server) StrictDirectoryAuth() bool {
 	return s.strictDirectoryAuth.Load()
 }
 
+// SetRequireRegisterSignature toggles PPA-003 mandatory registration
+// proof-of-possession. Default off for wire-compatibility: unsigned
+// registrations are accepted (a present signature is always verified). Enable
+// only after the signing client has rolled out fleet-wide.
+func (s *Server) SetRequireRegisterSignature(enabled bool) {
+	s.requireRegisterSignature.Store(enabled)
+}
+
+// RequireRegisterSignature reports whether registration signatures are
+// mandatory. Wired into the directory sub-package as a callback.
+func (s *Server) RequireRegisterSignature() bool {
+	return s.requireRegisterSignature.Load()
+}
+
 // SetDashboardToken gates per-network stats on the dashboard.
 // Empty string restricts the dashboard to global aggregates only.
 func (s *Server) SetDashboardToken(token string) {
@@ -941,7 +955,8 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				}
 				return nets
 			},
-			StrictDirectoryAuth: s.StrictDirectoryAuth,
+			StrictDirectoryAuth:      s.StrictDirectoryAuth,
+			RequireRegisterSignature: s.RequireRegisterSignature,
 		},
 	)
 
@@ -1105,10 +1120,10 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			allow, _ := s.breakers.Allow(name)
 			return allow, s.breakers.Reason(name)
 		},
-		BreakerList:       s.BreakerList,
-		BreakerSet:        s.BreakerSet,
-		BreakerDelete:     s.BreakerDelete,
-		HealthSnapshot:    s.HealthSnapshot,
+		BreakerList:    s.BreakerList,
+		BreakerSet:     s.BreakerSet,
+		BreakerDelete:  s.BreakerDelete,
+		HealthSnapshot: s.HealthSnapshot,
 		VerifyRequest: func(canonical, sigB64 string) interface{} {
 			return s.VerifyRequest(canonical, sigB64)
 		},

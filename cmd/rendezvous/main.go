@@ -67,6 +67,7 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "TLS key file")
 	enableTLS := flag.Bool("tls", false, "enable TLS for registry connections")
 	strictDirectoryAuth := flag.Bool("strict-directory-auth", false, "WS2: require trust/shared-network authorization on directory RPCs (lookup/resolve/punch/list_*/check_trust). Default false (not enforcing, wire-compatible with old agents). Env: RENDEZVOUS_STRICT_DIRECTORY_AUTH=1.")
+	requireRegisterSignature := flag.Bool("require-register-signature", false, "PPA-003: require a valid proof-of-possession signature on registration. Default false (present signatures are still verified; unsigned registrations accepted for wire-compatibility). Enable only after the signing client has rolled out. Env: RENDEZVOUS_REQUIRE_REGISTER_SIGNATURE=1.")
 	standbyPrimary := flag.String("standby", "", "run as hot standby replicating from the given primary address (e.g. primary:9000)")
 	httpAddr := flag.String("http", "", "HTTP dashboard listen address (e.g. :3000)")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
@@ -127,6 +128,10 @@ func main() {
 	if *strictDirectoryAuth || os.Getenv("RENDEZVOUS_STRICT_DIRECTORY_AUTH") == "1" {
 		r.SetStrictDirectoryAuth(true)
 		slog.Info("strict directory authorization enabled (WS2)")
+	}
+	if *requireRegisterSignature || os.Getenv("RENDEZVOUS_REQUIRE_REGISTER_SIGNATURE") == "1" {
+		r.SetRequireRegisterSignature(true)
+		slog.Info("registration signature required (PPA-003)")
 	}
 	// Plumb the breaker manager into the in-process beacon so
 	// beacon.punch / beacon.relay / beacon.discover can be flipped from
