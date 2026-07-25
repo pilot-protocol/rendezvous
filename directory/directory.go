@@ -25,6 +25,7 @@ import (
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/registry/wire"
+	"github.com/pilot-protocol/rendezvous/authz"
 )
 
 // --------------------------------------------------------------------------
@@ -626,13 +627,12 @@ func (st *Store) AdminListNodesCached() ([]byte, error) {
 
 // ReapStaleNodes removes nodes whose last heartbeat is older than threshold.
 func (st *Store) ReapStaleNodes(threshold time.Time) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
+	st.mu.RLock()
 	nodeIDs := make([]uint32, 0, len(st.nodes))
 	for id := range st.nodes {
 		nodeIDs = append(nodeIDs, id)
 	}
+	st.mu.RUnlock()
 	sort.Slice(nodeIDs, func(i, j int) bool { return nodeIDs[i] < nodeIDs[j] })
 
 	startIdx := 0
@@ -641,15 +641,34 @@ func (st *Store) ReapStaleNodes(threshold time.Time) {
 	}
 
 	processed := 0
-	reaped := false
+	cursor := *st.reapCursor
+	var stale []uint32
+	st.mu.RLock()
 	for i := 0; i < len(nodeIDs) && processed < ReapChunkSize; i++ {
 		idx := (startIdx + i) % len(nodeIDs)
 		id := nodeIDs[idx]
 		processed++
 
-		node := st.nodes[id]
-		lastSeen := node.GetLastSeen()
-		if lastSeen.Before(threshold) {
+		if node, ok := st.nodes[id]; ok && node.GetLastSeen().Before(threshold) {
+			stale = append(stale, id)
+		}
+
+		cursor = id + 1
+	}
+	st.mu.RUnlock()
+
+	reaped := false
+	if len(stale) > 0 {
+		st.mu.Lock()
+		for _, id := range stale {
+			node, ok := st.nodes[id]
+			if !ok {
+				continue
+			}
+			lastSeen := node.GetLastSeen()
+			if !lastSeen.Before(threshold) {
+				continue
+			}
 			staleDuration := time.Since(lastSeen).Round(time.Second)
 			slog.Info("registry reaping stale node", "node_id", id, "last_seen_ago", staleDuration)
 			st.cb.Audit("node.reaped", "node_id", id, "reason", "stale_heartbeat",
@@ -662,10 +681,10 @@ func (st *Store) ReapStaleNodes(threshold time.Time) {
 			st.cb.InvalidateAdminListNodesCache()
 			reaped = true
 		}
-
-		*st.reapCursor = id + 1
+		st.mu.Unlock()
 	}
 
+	*st.reapCursor = cursor
 	if processed >= len(nodeIDs) {
 		*st.reapCursor = 0
 	}
@@ -1401,7 +1420,7 @@ func (st *Store) HandleBinaryResolve(conn net.Conn, payload []byte) {
 		return
 	}
 	challenge := fmt.Sprintf("resolve:%d:%d", requesterID, nodeID)
-	if !crypto.Verify(requesterPubKey, []byte(challenge), sig) {
+	if !authz.VerifyCached(requesterPubKey, []byte(challenge), sig) {
 		st.cb.IncErrorsTotal("resolve")
 		wire.WriteFrame(conn, wire.MsgError, wire.EncodeError("signature verification failed"))
 		return
@@ -2022,7 +2041,7 @@ func (st *Store) HandleBinaryHeartbeat(conn net.Conn, payload []byte) {
 			return
 		}
 		challenge := fmt.Sprintf("heartbeat:%d", req.NodeID)
-		if !crypto.Verify(pubKey, []byte(challenge), req.Signature[:]) {
+		if !authz.VerifyCached(pubKey, []byte(challenge), req.Signature[:]) {
 			st.cb.IncErrorsTotal("heartbeat")
 			wire.WriteFrame(conn, wire.MsgError, wire.EncodeError("signature verification failed"))
 			return

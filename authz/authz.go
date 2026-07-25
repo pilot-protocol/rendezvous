@@ -10,9 +10,11 @@
 package authz
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -197,6 +199,44 @@ func (c *Checker) IsEnterpriseNode(nodeID uint32, nodes NodeReader, nr NetworkRe
 // pre-copied value of the global admin token (copy it before releasing
 // the server mutex).  msg must contain a "signature" field (base64).
 // challenge is the pre-image string that was signed.
+const (
+	sigCacheShardCount = 64
+	sigCacheShardCap   = 8192
+)
+
+type sigCacheShard struct {
+	mu sync.Mutex
+	m  map[[32]byte]struct{}
+}
+
+var sigCacheShards [sigCacheShardCount]sigCacheShard
+
+func VerifyCached(pubKey, message, sig []byte) bool {
+	h := sha256.New()
+	h.Write(pubKey)
+	h.Write(message)
+	h.Write(sig)
+	var key [32]byte
+	h.Sum(key[:0])
+	sh := &sigCacheShards[key[0]%sigCacheShardCount]
+	sh.mu.Lock()
+	_, hit := sh.m[key]
+	sh.mu.Unlock()
+	if hit {
+		return true
+	}
+	if !crypto.Verify(pubKey, message, sig) {
+		return false
+	}
+	sh.mu.Lock()
+	if sh.m == nil || len(sh.m) >= sigCacheShardCap {
+		sh.m = make(map[[32]byte]struct{}, sigCacheShardCap)
+	}
+	sh.m[key] = struct{}{}
+	sh.mu.Unlock()
+	return true
+}
+
 func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interface{}, challenge string) error {
 	if pubKey == nil {
 		// No key on file — fall back to admin token auth.
@@ -213,7 +253,7 @@ func VerifyNodeSignature(pubKey []byte, adminToken string, msg map[string]interf
 	if err != nil {
 		return fmt.Errorf("invalid signature encoding: %w", err)
 	}
-	ok := crypto.Verify(pubKey, []byte(challenge), sig)
+	ok := VerifyCached(pubKey, []byte(challenge), sig)
 	if fn := loadSigVerifyHook(); fn != nil {
 		fn(ok)
 	}

@@ -504,39 +504,27 @@ func readMessage(r io.Reader) (map[string]interface{}, error) {
 }
 
 func writeMessage(w io.Writer, msg map[string]interface{}) error {
+	var body []byte
 	if raw, ok := msg[rawResponseKey].([]byte); ok && raw != nil {
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(raw)))
-		if c, ok := w.(net.Conn); ok {
-			_ = c.SetWriteDeadline(time.Now().Add(writeMessageDeadline))
-			defer c.SetWriteDeadline(time.Time{})
+		body = raw
+	} else {
+		var err error
+		body, err = json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("json encode: %w", err)
 		}
-		if _, err := w.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		if _, err := w.Write(raw); err != nil {
-			return err
-		}
-		return nil
 	}
 
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("json encode: %w", err)
-	}
-
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(body)))
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
+	copy(frame[4:], body)
 
 	if c, ok := w.(net.Conn); ok {
 		_ = c.SetWriteDeadline(time.Now().Add(writeMessageDeadline))
 		defer c.SetWriteDeadline(time.Time{})
 	}
 
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return err
-	}
-	if _, err := w.Write(body); err != nil {
+	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return nil
