@@ -14,12 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           path: rendezvous
 
       - name: Checkout web4
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: pilot-protocol/pilotprotocol
           path: web4
