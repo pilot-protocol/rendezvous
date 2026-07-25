@@ -140,7 +140,7 @@ func TestHandleReRegister_FastPathRefreshesEndpoint(t *testing.T) {
 
 	// Re-register with same owner + hostname → fast-path endpoint refresh.
 	resp, err := st.HandleReRegister(pubKeyB64, "10.0.0.2:4000", "alice", "host1",
-		[]string{"192.168.1.5:4000"}, "1.7.2", false)
+		[]string{"192.168.1.5:4000"}, "1.7.2", false, false)
 	if err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestHandleReRegister_SlowPathNewOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Re-register with new owner triggers slow path.
-	resp, err := st.HandleReRegister(pubKeyB64, "10.0.0.2:4000", "newowner", "", nil, "", false)
+	resp, err := st.HandleReRegister(pubKeyB64, "10.0.0.2:4000", "newowner", "", nil, "", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestHandleReRegister_SlowPathNewOwner(t *testing.T) {
 func TestHandleReRegister_BadPubKey(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	_, err := st.HandleReRegister("not-base64!", "10.0.0.1:4000", "", "", nil, "", false)
+	_, err := st.HandleReRegister("not-base64!", "10.0.0.1:4000", "", "", nil, "", false, false)
 	if err == nil || !strings.Contains(err.Error(), "invalid public key") {
 		t.Fatalf("%v", err)
 	}

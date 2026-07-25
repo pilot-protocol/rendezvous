@@ -19,14 +19,14 @@ func TestReRegister_SameKey_NoRegression(t *testing.T) {
 	st := newTestStore(t)
 	pubKey := genPubKeyB64(t)
 
-	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false)
+	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false, false)
 	if err != nil {
 		t.Fatalf("first register: %v", err)
 	}
 	nodeID := resp1["node_id"].(uint32)
 
 	// Same owner, same key, new address — must succeed, same node_id.
-	resp2, err := st.HandleReRegister(pubKey, "10.0.0.2:4000", "alice", "host1", nil, "2.0.0", false)
+	resp2, err := st.HandleReRegister(pubKey, "10.0.0.2:4000", "alice", "host1", nil, "2.0.0", false, false)
 	if err != nil {
 		t.Fatalf("same-key re-register rejected (regression!): %v", err)
 	}
@@ -46,7 +46,7 @@ func TestReRegister_DifferentKey_OwnerReclaim_Rejected(t *testing.T) {
 	st := newTestStore(t)
 
 	origPubKeyB64 := genPubKeyB64(t)
-	resp1, err := st.HandleReRegister(origPubKeyB64, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false)
+	resp1, err := st.HandleReRegister(origPubKeyB64, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false, false)
 	if err != nil {
 		t.Fatalf("first register: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestReRegister_DifferentKey_OwnerReclaim_Rejected(t *testing.T) {
 	if attackerPubKeyB64 == origPubKeyB64 {
 		t.Fatal("test setup: keys collided")
 	}
-	_, err = st.HandleReRegister(attackerPubKeyB64, "6.6.6.6:4000", "alice", "host1", nil, "9.9.9", false)
+	_, err = st.HandleReRegister(attackerPubKeyB64, "6.6.6.6:4000", "alice", "host1", nil, "9.9.9", false, false)
 	if err == nil {
 		t.Fatal("owner-reclaim with a different key must be REJECTED")
 	}
@@ -103,7 +103,7 @@ func TestReRegister_ReapedOwnerNode_ReclaimAllowed(t *testing.T) {
 	st := newTestStore(t)
 
 	pubKey := genPubKeyB64(t)
-	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false)
+	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", nil, "1.0.0", false, false)
 	if err != nil {
 		t.Fatalf("first register: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestReRegister_ReapedOwnerNode_ReclaimAllowed(t *testing.T) {
 	delete(st.pubKeyIdx, pubKey)
 
 	newPubKey := genPubKeyB64(t)
-	resp2, err := st.HandleReRegister(newPubKey, "10.0.0.9:4000", "alice", "host1", nil, "2.0.0", false)
+	resp2, err := st.HandleReRegister(newPubKey, "10.0.0.9:4000", "alice", "host1", nil, "2.0.0", false, false)
 	if err != nil {
 		t.Fatalf("reaped-node owner reclaim should succeed: %v", err)
 	}
