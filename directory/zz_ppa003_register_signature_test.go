@@ -90,3 +90,50 @@ func TestHandleRegisterSignatureVerifyIfPresent(t *testing.T) {
 		}
 	})
 }
+
+func TestHandleRegisterEndpointRatchet(t *testing.T) {
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := crypto.EncodePublicKey(id.PublicKey)
+	sign := func(addr string) string {
+		return base64.StdEncoding.EncodeToString(id.Sign([]byte("register:" + addr + ":" + pub)))
+	}
+	st := ppa003Store(t, false)
+	reg := func(pk, addr, remote, sig string) error {
+		m := map[string]interface{}{"public_key": pk, "listen_addr": addr}
+		if sig != "" {
+			m["signature"] = sig
+		}
+		_, e := st.HandleRegister(m, remote, nil, nil)
+		return e
+	}
+
+	// 1. signed registration latches SigVerified
+	if e := reg(pub, "10.0.0.1:5000", "10.0.0.1:5000", sign("10.0.0.1:5000")); e != nil {
+		t.Fatalf("signed register: %v", e)
+	}
+	// 2. ATTACK: unsigned re-register of that key from a different endpoint — REJECTED
+	if e := reg(pub, "10.9.9.9:5000", "10.9.9.9:5000", ""); e == nil {
+		t.Fatal("unsigned endpoint relocation of a signature-verified key was ALLOWED (ratchet failed)")
+	}
+	// 3. legit signed move — allowed
+	if e := reg(pub, "10.0.0.2:6000", "10.0.0.2:6000", sign("10.0.0.2:6000")); e != nil {
+		t.Fatalf("signed endpoint move rejected: %v", e)
+	}
+	// 4. unsigned same-endpoint refresh — allowed (harmless)
+	if e := reg(pub, "10.0.0.2:6000", "10.0.0.2:6000", ""); e != nil {
+		t.Fatalf("unsigned same-endpoint refresh rejected: %v", e)
+	}
+
+	// 5. COMPAT: a key that never signed can still relocate unsigned (old agent)
+	id2, _ := crypto.GenerateIdentity()
+	pub2 := crypto.EncodePublicKey(id2.PublicKey)
+	if e := reg(pub2, "10.1.1.1:5000", "10.1.1.1:5000", ""); e != nil {
+		t.Fatalf("unsigned new node: %v", e)
+	}
+	if e := reg(pub2, "10.2.2.2:5000", "10.2.2.2:5000", ""); e != nil {
+		t.Fatalf("unsigned old-agent endpoint change BLOCKED (compat break): %v", e)
+	}
+}

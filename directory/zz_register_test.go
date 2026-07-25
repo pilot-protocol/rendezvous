@@ -98,7 +98,7 @@ func TestHandleRegister_InvalidHostnameStillRegisters(t *testing.T) {
 func TestHandleReRegister_InvalidPubKey(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	_, err := st.HandleReRegister("!!!", "10.0.0.1:4000", "alice", "", nil, "1.0.0", false)
+	_, err := st.HandleReRegister("!!!", "10.0.0.1:4000", "alice", "", nil, "1.0.0", false, false)
 	if err == nil {
 		t.Error("expected invalid-pubkey error")
 	}
@@ -109,14 +109,14 @@ func TestHandleReRegister_ExistingNodeUpdatesFields(t *testing.T) {
 	st := newTestStore(t)
 	pubKey := genPubKeyB64(t)
 	// First register.
-	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", []string{"192.168.1.5:4000"}, "1.0.0", false)
+	resp1, err := st.HandleReRegister(pubKey, "10.0.0.1:4000", "alice", "host1", []string{"192.168.1.5:4000"}, "1.0.0", false, false)
 	if err != nil {
 		t.Fatalf("first register: %v", err)
 	}
 	nodeID1 := resp1["node_id"].(uint32)
 
 	// Re-register with same pubkey — should return same node_id (fast path).
-	resp2, err := st.HandleReRegister(pubKey, "10.0.0.2:4000", "alice", "host2", []string{"192.168.1.6:4000"}, "2.0.0", false)
+	resp2, err := st.HandleReRegister(pubKey, "10.0.0.2:4000", "alice", "host2", []string{"192.168.1.6:4000"}, "2.0.0", false, false)
 	if err != nil {
 		t.Fatalf("re-register: %v", err)
 	}

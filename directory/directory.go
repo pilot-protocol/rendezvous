@@ -75,6 +75,12 @@ type NodeInfo struct {
 	Version    string
 	RelayOnly  bool
 
+	// SigVerified latches true once this key has registered with a valid
+	// proof-of-possession signature. Once true, an unsigned registration may
+	// not relocate the node's endpoint (PPA-003 ratchet) — closes registry
+	// endpoint hijack for every signing node without breaking unsigned ones.
+	SigVerified bool `json:"sig_verified,omitempty"`
+
 	// Verified-address badge (offline-verifiable; carries no raw identity).
 	Badge                string
 	BadgeSig             string
@@ -745,6 +751,7 @@ func (st *Store) HandleRegister(
 	// unaffected; a present-but-invalid signature is always rejected. Flipping
 	// RequireRegisterSignature (default off) makes the signature mandatory once
 	// the signing client has rolled out — do NOT default it on.
+	sigVerified := false
 	if sigB64, _ := msg["signature"].(string); sigB64 != "" {
 		pubKeyBytes, decErr := crypto.DecodePublicKey(pubKeyB64)
 		if decErr != nil {
@@ -755,6 +762,7 @@ func (st *Store) HandleRegister(
 			if err := st.cb.VerifyNodeSignature(pubKeyBytes, "", msg, challenge); err != nil {
 				return nil, fmt.Errorf("registration signature verification failed: %w", err)
 			}
+			sigVerified = true
 		}
 	} else if st.cb.RequireRegisterSignature != nil && st.cb.RequireRegisterSignature() {
 		return nil, fmt.Errorf("registration requires a signature")
@@ -762,7 +770,7 @@ func (st *Store) HandleRegister(
 
 	if hostname != "" {
 		if err := ValidateHostname(hostname); err != nil {
-			resp, regErr := st.HandleReRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion, relayOnly)
+			resp, regErr := st.HandleReRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion, relayOnly, sigVerified)
 			if regErr != nil {
 				return resp, regErr
 			}
@@ -774,7 +782,7 @@ func (st *Store) HandleRegister(
 		}
 	}
 
-	resp, err := st.HandleReRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion, relayOnly)
+	resp, err := st.HandleReRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion, relayOnly, sigVerified)
 	if err == nil {
 		st.cb.IncRegistrations()
 		resp["observed_addr"] = listenAddr
@@ -798,10 +806,32 @@ func (st *Store) HandleRegister(
 
 // HandleReRegister handles a node presenting an existing public key.
 // Fast path for known-key reconnects; slow path for new nodes and index mutations.
-func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string, relayOnly bool) (map[string]interface{}, error) {
+func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string, relayOnly bool, sigVerified bool) (map[string]interface{}, error) {
 	pubKey, err := crypto.DecodePublicKey(pubKeyB64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid public key: %w", err)
+	}
+
+	// PPA-003 ratchet: once a key has registered with a valid proof-of-
+	// possession (SigVerified), an unsigned registration may not relocate its
+	// endpoint. Unsigned/first-seen keys are unaffected (wire-compatible), so
+	// no old agent breaks; coverage grows as the fleet signs.
+	if !sigVerified {
+		st.mu.RLock()
+		if exID, known := st.pubKeyIdx[pubKeyB64]; known {
+			if n, ok := st.nodes[exID]; ok {
+				sh := &st.nodeShards[exID%NumNodeShards]
+				sh.RLock()
+				reject := n.SigVerified && listenAddr != n.RealAddr
+				sh.RUnlock()
+				if reject {
+					st.mu.RUnlock()
+					st.cb.Audit("node.register_ratchet_rejected", "node_id", exID)
+					return nil, fmt.Errorf("node %d: unsigned registration cannot relocate the endpoint of a signature-verified key", exID)
+				}
+			}
+		}
+		st.mu.RUnlock()
 	}
 
 	// FAST PATH: shard-locked endpoint refresh for the common case.
@@ -837,6 +867,9 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 				fpNode.Version = version
 			}
 			fpNode.RelayOnly = relayOnly
+			if sigVerified {
+				fpNode.SigVerified = true
+			}
 			shard.Unlock()
 
 			addr := protocol.Addr{Network: 0, Node: fpNodeID}
@@ -872,6 +905,9 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 				node.Version = version
 			}
 			node.RelayOnly = relayOnly
+			if sigVerified {
+				node.SigVerified = true
+			}
 			if owner != "" && node.Owner == "" {
 				node.Owner = owner
 				st.ownerIdx[owner] = nodeID
@@ -903,16 +939,17 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 		}
 		now := time.Now()
 		node := &NodeInfo{
-			ID:        nodeID,
-			Owner:     owner,
-			PublicKey: pubKey,
-			RealAddr:  listenAddr,
-			Networks:  networks,
-			LastSeen:  now,
-			LANAddrs:  lanAddrs,
-			KeyMeta:   KeyInfo{CreatedAt: now},
-			Version:   version,
-			RelayOnly: relayOnly,
+			ID:          nodeID,
+			Owner:       owner,
+			PublicKey:   pubKey,
+			RealAddr:    listenAddr,
+			Networks:    networks,
+			LastSeen:    now,
+			LANAddrs:    lanAddrs,
+			KeyMeta:     KeyInfo{CreatedAt: now},
+			Version:     version,
+			RelayOnly:   relayOnly,
+			SigVerified: sigVerified,
 		}
 		node.LastSeenNano.Store(now.UnixNano())
 		st.nodes[nodeID] = node
@@ -964,16 +1001,17 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 			st.pubKeyIdx[pubKeyB64] = existingID
 			now := time.Now()
 			node := &NodeInfo{
-				ID:        existingID,
-				Owner:     owner,
-				PublicKey: pubKey,
-				RealAddr:  listenAddr,
-				Networks:  []uint16{0},
-				LastSeen:  now,
-				LANAddrs:  lanAddrs,
-				KeyMeta:   KeyInfo{CreatedAt: now},
-				Version:   version,
-				RelayOnly: relayOnly,
+				ID:          existingID,
+				Owner:       owner,
+				PublicKey:   pubKey,
+				RealAddr:    listenAddr,
+				Networks:    []uint16{0},
+				LastSeen:    now,
+				LANAddrs:    lanAddrs,
+				KeyMeta:     KeyInfo{CreatedAt: now},
+				Version:     version,
+				RelayOnly:   relayOnly,
+				SigVerified: sigVerified,
 			}
 			node.LastSeenNano.Store(now.UnixNano())
 			st.nodes[existingID] = node
@@ -1014,16 +1052,17 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 
 	now := time.Now()
 	node := &NodeInfo{
-		ID:        nodeID,
-		Owner:     owner,
-		PublicKey: pubKey,
-		RealAddr:  listenAddr,
-		Networks:  []uint16{0},
-		LastSeen:  now,
-		LANAddrs:  lanAddrs,
-		KeyMeta:   KeyInfo{CreatedAt: now},
-		Version:   version,
-		RelayOnly: relayOnly,
+		ID:          nodeID,
+		Owner:       owner,
+		PublicKey:   pubKey,
+		RealAddr:    listenAddr,
+		Networks:    []uint16{0},
+		LastSeen:    now,
+		LANAddrs:    lanAddrs,
+		KeyMeta:     KeyInfo{CreatedAt: now},
+		Version:     version,
+		RelayOnly:   relayOnly,
+		SigVerified: sigVerified,
 	}
 	node.LastSeenNano.Store(now.UnixNano())
 	st.nodes[nodeID] = node
