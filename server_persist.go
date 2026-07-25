@@ -12,7 +12,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pilot-protocol/common/fsutil"
@@ -21,6 +23,14 @@ import (
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
 )
+
+const (
+	maxPooledSaveBuf    = 128 << 20
+	scavengeIntervalMs  = 180_000
+	scavengeMinSnapshot = 64 << 20
+)
+
+var lastScavengeMs atomic.Int64
 
 // flushSaveBufPool reuses the bytes buffer that backs the snapshot JSON
 // across save ticks. After the first few saves the pool returns a
@@ -38,6 +48,20 @@ var flushSaveBufPool = sync.Pool{
 		b := make([]byte, 0, 1*1024*1024)
 		return &b
 	},
+}
+
+func putSaveBuf(bp *[]byte) {
+	if cap(*bp) <= maxPooledSaveBuf {
+		flushSaveBufPool.Put(bp)
+	}
+}
+
+func shouldScavenge(dataLen int, nowMs int64) bool {
+	if dataLen < scavengeMinSnapshot {
+		return false
+	}
+	last := lastScavengeMs.Load()
+	return nowMs-last >= scavengeIntervalMs && lastScavengeMs.CompareAndSwap(last, nowMs)
 }
 
 // rawNodeCopy holds raw node fields copied under RLock (no encoding).
@@ -502,7 +526,7 @@ func (s *Server) flushSave() (retErr error) {
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(snap); err != nil {
 		*bp = buf.Bytes()[:0]
-		flushSaveBufPool.Put(bp)
+		putSaveBuf(bp)
 		slog.Error("registry save encode error", "err", err)
 		return fmt.Errorf("encode snapshot: %w", err)
 	}
@@ -517,7 +541,7 @@ func (s *Server) flushSave() (retErr error) {
 	// always produces a JSON object ending with '}' (after newline trim).
 	if len(data) == 0 || data[len(data)-1] != '}' {
 		*bp = buf.Bytes()[:0]
-		flushSaveBufPool.Put(bp)
+		putSaveBuf(bp)
 		return fmt.Errorf("encode snapshot: unexpected JSON format (expected trailing '}')")
 	}
 	data = append(data[:len(data)-1], []byte(`,"checksum":"`+checksum+`"}`)...)
@@ -525,7 +549,7 @@ func (s *Server) flushSave() (retErr error) {
 		// Return the (possibly grown) underlying buffer to the pool. AtomicWrite
 		// has copied data to disk by this point, so it is safe to release.
 		*bp = data[:0]
-		flushSaveBufPool.Put(bp)
+		putSaveBuf(bp)
 	}()
 
 	// Persist to disk atomically
@@ -535,6 +559,9 @@ func (s *Server) flushSave() (retErr error) {
 			return fmt.Errorf("write snapshot: %w", err)
 		}
 		s.lastSnapshotSizeB.Store(int64(len(data)))
+		if shouldScavenge(len(data), time.Now().UnixMilli()) {
+			go debug.FreeOSMemory()
+		}
 		// Truncate WAL after successful snapshot (compaction).
 		if w := s.walStore.WAL(); w != nil {
 			if err := w.Truncate(); err != nil {
