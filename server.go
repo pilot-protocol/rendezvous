@@ -286,6 +286,13 @@ type Server struct {
 
 	strictDirectoryAuth    atomic.Bool
 	strictRegistrationAuth atomic.Bool
+
+	// strictHeartbeatFreshness requires heartbeats to bind a recent
+	// timestamp into the signed challenge. strictExpiryBinding requires
+	// set_key_expiry challenges to bind the requested expires_at. Both
+	// change what a client must sign, so both default off.
+	strictHeartbeatFreshness atomic.Bool
+	strictExpiryBinding      atomic.Bool
 }
 
 // listNodesCacheState is defined in the directory sub-package (R4.2).

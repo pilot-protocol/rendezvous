@@ -194,6 +194,12 @@ type Callbacks struct {
 
 	// Bus is the event bus used to publish "key.rotated" events.
 	Bus events.Bus
+
+	// StrictExpiryBinding reports whether set_key_expiry challenges must
+	// bind the requested expires_at value. Nil or false keeps the
+	// original challenge, which covers only the node id — see
+	// HandleSetKeyExpiry.
+	StrictExpiryBinding func() bool
 }
 
 // Store holds the mutable identity and key-lifecycle state.
@@ -524,6 +530,27 @@ func (st *Store) HandleRotateKey(msg map[string]interface{}) (map[string]interfa
 	}, nil
 }
 
+// setKeyExpiryChallenge returns the string a set_key_expiry request must
+// be signed over.
+//
+// The default form covers only the node id, so one signature authorizes
+// any expiry value for that node — including a later request that
+// substitutes a different expires_at. The bound form appends the
+// requested value, the way HandleRotateKey's challenge appends the new
+// public key, so a signature authorizes exactly the value it was
+// produced for.
+//
+// The bound form is what a signer must produce, so switching it changes
+// what an existing client's signature verifies against. It is therefore
+// gated on Callbacks.StrictExpiryBinding and off by default; enable it
+// once every client in the deployment signs the bound form.
+func (st *Store) setKeyExpiryChallenge(nodeID uint32, expiresAtStr string) string {
+	if st.cb.StrictExpiryBinding != nil && st.cb.StrictExpiryBinding() {
+		return fmt.Sprintf("set_key_expiry:%d:%s", nodeID, expiresAtStr)
+	}
+	return fmt.Sprintf("set_key_expiry:%d", nodeID)
+}
+
 // HandleSetKeyExpiry implements the "set_key_expiry" protocol command.
 func (st *Store) HandleSetKeyExpiry(msg map[string]interface{}) (map[string]interface{}, error) {
 	nodeID := jsonUint32(msg, "node_id")
@@ -554,7 +581,7 @@ func (st *Store) HandleSetKeyExpiry(msg map[string]interface{}) (map[string]inte
 	adminToken := st.nodes.AdminToken()
 
 	// Phase 2 — verify signature outside the lock.
-	sigErr := st.nodes.VerifyHeartbeatSignature(currentPubKey, adminToken, msg, fmt.Sprintf("set_key_expiry:%d", nodeID))
+	sigErr := st.nodes.VerifyHeartbeatSignature(currentPubKey, adminToken, msg, st.setKeyExpiryChallenge(nodeID, expiresAtStr))
 	if sigErr != nil {
 		if err := st.nodes.CheckAdminToken(msg); err != nil {
 			return nil, sigErr

@@ -5,9 +5,13 @@
 //
 // The WAL closes the data-loss window between snapshot saves. flushSave runs
 // on saveLoopInterval (5s); a crash between saves would otherwise drop every
-// mutation in that window. Each low-frequency mutation records a delta to the
+// mutation in that window. Each low-frequency mutation writes a delta to the
 // WAL synchronously. On startup the snapshot is loaded, then any post-snapshot
 // WAL entries are replayed on top.
+//
+// The fsync behind those writes is batched, not per-entry — see the
+// walSyncInterval / walSyncBatch constants. So the log survives a process
+// crash in full, and survives host power loss up to a bounded tail.
 package wal
 
 import (
@@ -83,6 +87,10 @@ type WAL struct {
 	syncDone  chan struct{}
 }
 
+// Appends are fsync'd in batches rather than one at a time: whichever of
+// these two thresholds is reached first triggers the flush, so the
+// power-loss window is bounded by walSyncInterval of wall time or
+// walSyncBatch of un-fsync'd entries. Close flushes whatever is pending.
 const (
 	walSyncInterval = 200 * time.Millisecond
 	walSyncBatch    = 200
@@ -142,8 +150,15 @@ func (w *WAL) syncLoop() {
 	}
 }
 
-// Append writes a delta entry to the WAL. The entry is fsync'd to ensure
-// durability. Returns an error if the write fails.
+// Append writes a delta entry to the WAL. Returns an error if the write
+// fails.
+//
+// The write(2) is synchronous, so the entry is visible to Replay and to
+// any other reader of the file as soon as Append returns. The fsync is
+// not: it is batched, so a host that loses power (as opposed to a
+// process that crashes) can lose entries appended within the last
+// walSyncInterval or fewer than walSyncBatch back. Close flushes the
+// pending tail, so an orderly shutdown loses nothing.
 func (w *WAL) Append(entry DeltaEntry) error {
 	if w == nil {
 		return nil

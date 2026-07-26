@@ -245,6 +245,12 @@ type Callbacks struct {
 	ScanNetworkMemberships func(nodeID uint32) []uint16
 	StrictDirectoryAuth    func() bool
 	StrictRegistrationAuth func() bool
+
+	// StrictHeartbeatFreshness reports whether heartbeats must carry a
+	// recent timestamp bound into the signed challenge. Nil or false
+	// keeps the original challenge, which covers only the node id — see
+	// heartbeatChallenge.
+	StrictHeartbeatFreshness func() bool
 }
 
 // --------------------------------------------------------------------------
@@ -358,6 +364,17 @@ func jsonUint32(msg map[string]interface{}, key string) uint32 {
 		return uint32(v)
 	}
 	return 0
+}
+
+// jsonInt64 reads a JSON number as an int64. ok is false when the key is
+// absent or not a number, which the caller distinguishes from a present
+// zero.
+func jsonInt64(msg map[string]interface{}, key string) (int64, bool) {
+	v, ok := msg[key].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int64(v), true
 }
 
 func jsonUint16(msg map[string]interface{}, key string) uint16 {
@@ -1962,6 +1979,52 @@ func (st *Store) HandleDeregister(msg map[string]interface{}) (map[string]interf
 // Handler: heartbeat
 // --------------------------------------------------------------------------
 
+// heartbeatMaxSkew is how far a heartbeat's timestamp may sit from the
+// registry's clock, in either direction, when freshness is enforced. It
+// is wide enough to absorb ordinary clock drift and request latency and
+// narrow enough that a captured heartbeat stops being usable quickly.
+const heartbeatMaxSkew = 60 * time.Second
+
+// heartbeatVerifyCacheTTL is how long a successful signature check is
+// reused for subsequent heartbeats from the same node.
+const heartbeatVerifyCacheTTL = 120 * time.Second
+
+// strictHeartbeatFreshness reports whether the freshness gate is active.
+func (st *Store) strictHeartbeatFreshness() bool {
+	return st.cb.StrictHeartbeatFreshness != nil && st.cb.StrictHeartbeatFreshness()
+}
+
+// heartbeatChallenge returns the string a heartbeat must be signed over,
+// and the timestamp it is bound to.
+//
+// The default form covers only the node id, so one signature is valid
+// for that node forever: replaying a captured heartbeat keeps refreshing
+// LastSeen, and the node keeps reading as online after it is gone. The
+// bound form appends a caller-supplied unix timestamp, which the caller
+// must also have signed, so a captured heartbeat stops being accepted
+// once it falls outside heartbeatMaxSkew.
+//
+// The bound form changes what a signer must produce, so it is gated on
+// Callbacks.StrictHeartbeatFreshness and off by default; enable it once
+// every client in the deployment sends and signs a "ts" field.
+func (st *Store) heartbeatChallenge(msg map[string]interface{}, nodeID uint32, now time.Time) (string, error) {
+	if !st.strictHeartbeatFreshness() {
+		return fmt.Sprintf("heartbeat:%d", nodeID), nil
+	}
+	ts, ok := jsonInt64(msg, "ts")
+	if !ok {
+		return "", fmt.Errorf("heartbeat requires a ts field")
+	}
+	skew := now.Unix() - ts
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > int64(heartbeatMaxSkew/time.Second) {
+		return "", fmt.Errorf("heartbeat ts is %ds from registry time (max %ds)", skew, int64(heartbeatMaxSkew/time.Second))
+	}
+	return fmt.Sprintf("heartbeat:%d:%d", nodeID, ts), nil
+}
+
 // HandleHeartbeat handles a JSON heartbeat message.
 func (st *Store) HandleHeartbeat(msg map[string]interface{}) (map[string]interface{}, error) {
 	nodeID := jsonUint32(msg, "node_id")
@@ -1979,11 +2042,20 @@ func (st *Store) HandleHeartbeat(msg map[string]interface{}) (map[string]interfa
 
 	now := st.cb.Now()
 
+	// The verify cache reuses one successful signature check for the
+	// following heartbeatVerifyCacheTTL, which would let a heartbeat
+	// through on the strength of an earlier one. When freshness is being
+	// enforced, every heartbeat is checked on its own merits.
 	lastVerified := node.LastVerifiedNano.Load()
-	skipVerify := lastVerified > 0 && (now.UnixNano()-lastVerified) < int64(120*time.Second)
+	skipVerify := !st.strictHeartbeatFreshness() &&
+		lastVerified > 0 && (now.UnixNano()-lastVerified) < int64(heartbeatVerifyCacheTTL)
 
 	if !skipVerify {
-		if err := st.cb.VerifyNodeSignature(pubKey, adminToken, msg, fmt.Sprintf("heartbeat:%d", nodeID)); err != nil {
+		challenge, err := st.heartbeatChallenge(msg, nodeID, now)
+		if err != nil {
+			return nil, err
+		}
+		if err := st.cb.VerifyNodeSignature(pubKey, adminToken, msg, challenge); err != nil {
 			return nil, err
 		}
 		node.LastVerifiedNano.Store(now.UnixNano())
@@ -2019,6 +2091,19 @@ func (st *Store) HandleBinaryHeartbeat(conn net.Conn, payload []byte) {
 	defer func() {
 		st.cb.ObserveRequestDuration("heartbeat", time.Since(start).Seconds())
 	}()
+
+	// The binary heartbeat payload is a fixed node id + signature with no
+	// field for a timestamp, so there is nowhere to carry the freshness
+	// value the challenge would bind. Leaving this path open while the
+	// JSON path enforces freshness would make the gate decorative — a
+	// caller would simply use this encoding instead — so when freshness
+	// is being enforced this encoding is refused outright. Carrying a
+	// timestamp here needs a registry wire-format revision.
+	if st.strictHeartbeatFreshness() {
+		st.cb.IncErrorsTotal("heartbeat")
+		wire.WriteFrame(conn, wire.MsgError, wire.EncodeError("binary heartbeat encoding carries no timestamp; use the JSON heartbeat while freshness is enforced"))
+		return
+	}
 
 	st.mu.RLock()
 	node, ok := st.nodes[req.NodeID]
