@@ -7,6 +7,7 @@
 package trust
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -516,13 +517,16 @@ func verifyHeartbeatSignature(pubKey []byte, adminToken string, msg map[string]i
 	return nil
 }
 
-// checkAdminToken validates the "admin_token" field against the expected value.
+// checkAdminToken validates the "admin_token" field against the expected
+// value. The comparison runs in time independent of how far the supplied
+// token matches, matching every other admin-token check in the repo
+// (authz, membership, dashboard, accept).
 func checkAdminToken(msg map[string]interface{}, adminToken string) error {
 	if adminToken == "" {
 		return fmt.Errorf("no admin token configured")
 	}
 	token, _ := msg["admin_token"].(string)
-	if token != adminToken {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
 		return fmt.Errorf("invalid admin token")
 	}
 	return nil

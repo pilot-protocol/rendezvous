@@ -68,6 +68,8 @@ func main() {
 	enableTLS := flag.Bool("tls", false, "enable TLS for registry connections")
 	strictDirectoryAuth := flag.Bool("strict-directory-auth", false, "WS2: require trust/shared-network authorization on directory RPCs (lookup/resolve/punch/list_*/check_trust). Default false (not enforcing, wire-compatible with old agents). Env: RENDEZVOUS_STRICT_DIRECTORY_AUTH=1.")
 	strictRegistrationAuth := flag.Bool("strict-registration-auth", false, "require a valid proof-of-possession signature on registrations that submit a public_key. Default false (signatures verified when present, but unsigned registrations from old agents are still accepted). Env: RENDEZVOUS_STRICT_REGISTRATION_AUTH=1.")
+	strictHeartbeatFreshness := flag.Bool("strict-heartbeat-freshness", false, "require heartbeats to carry a recent ts field and bind it into the signed challenge, and refuse the binary heartbeat encoding (which has no timestamp field). Default false (challenge covers only the node id, so a captured heartbeat stays replayable). Enable only once every client signs the bound form. Env: RENDEZVOUS_STRICT_HEARTBEAT_FRESHNESS=1.")
+	strictExpiryBinding := flag.Bool("strict-expiry-binding", false, "bind the requested expires_at into the set_key_expiry signed challenge, so a signature authorizes exactly the expiry it was produced for. Default false (challenge covers only the node id). Enable only once every client signs the bound form. Env: RENDEZVOUS_STRICT_EXPIRY_BINDING=1.")
 	standbyPrimary := flag.String("standby", "", "run as hot standby replicating from the given primary address (e.g. primary:9000)")
 	httpAddr := flag.String("http", "", "HTTP dashboard listen address (e.g. :3000)")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
@@ -139,6 +141,14 @@ func main() {
 	if *strictRegistrationAuth || os.Getenv("RENDEZVOUS_STRICT_REGISTRATION_AUTH") == "1" {
 		r.SetStrictRegistrationAuth(true)
 		slog.Info("strict registration authorization enabled")
+	}
+	if *strictHeartbeatFreshness || os.Getenv("RENDEZVOUS_STRICT_HEARTBEAT_FRESHNESS") == "1" {
+		r.SetStrictHeartbeatFreshness(true)
+		slog.Info("heartbeat freshness enforcement enabled", "binary_heartbeat", "refused")
+	}
+	if *strictExpiryBinding || os.Getenv("RENDEZVOUS_STRICT_EXPIRY_BINDING") == "1" {
+		r.SetStrictExpiryBinding(true)
+		slog.Info("set_key_expiry challenge binding enabled")
 	}
 	// Plumb the breaker manager into the in-process beacon so
 	// beacon.punch / beacon.relay / beacon.discover can be flipped from

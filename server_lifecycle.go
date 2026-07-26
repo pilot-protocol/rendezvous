@@ -133,6 +133,40 @@ func (s *Server) StrictRegistrationAuth() bool {
 	return s.strictRegistrationAuth.Load()
 }
 
+// SetStrictHeartbeatFreshness enables the heartbeat freshness gate: a
+// heartbeat must carry a "ts" field within heartbeatMaxSkew of registry
+// time, that value is bound into the signed challenge, and the
+// signature-verification cache is bypassed so every heartbeat stands on
+// its own. It also refuses the binary heartbeat encoding, which has no
+// field for a timestamp.
+//
+// This changes what clients must sign, so it defaults off. Enable it
+// only once every client in the deployment sends and signs "ts".
+func (s *Server) SetStrictHeartbeatFreshness(enabled bool) {
+	s.strictHeartbeatFreshness.Store(enabled)
+}
+
+// StrictHeartbeatFreshness reports whether the heartbeat freshness gate
+// is enforced.
+func (s *Server) StrictHeartbeatFreshness() bool {
+	return s.strictHeartbeatFreshness.Load()
+}
+
+// SetStrictExpiryBinding enables binding the requested expires_at value
+// into the set_key_expiry challenge, so a signature authorizes exactly
+// the expiry it was produced for rather than any expiry for that node.
+//
+// This changes what clients must sign, so it defaults off.
+func (s *Server) SetStrictExpiryBinding(enabled bool) {
+	s.strictExpiryBinding.Store(enabled)
+}
+
+// StrictExpiryBinding reports whether set_key_expiry challenges bind the
+// requested expires_at value.
+func (s *Server) StrictExpiryBinding() bool {
+	return s.strictExpiryBinding.Load()
+}
+
 // SetDashboardToken gates per-network stats on the dashboard.
 // Empty string restricts the dashboard to global aggregates only.
 func (s *Server) SetDashboardToken(token string) {
@@ -669,7 +703,8 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 			s.pubKeyIdx[newPubKeyB64] = nodeID
 			s.mu.Unlock()
 		},
-		Bus: s.bus,
+		Bus:                 s.bus,
+		StrictExpiryBinding: s.StrictExpiryBinding,
 	})
 	s.policy = policypkg.NewStore( // R2.4: policy sub-package
 		func(netID uint16) (policypkg.NetworkState, error) {
@@ -949,8 +984,9 @@ func NewWithStore(beaconAddr, storePath string) *Server {
 				}
 				return nets
 			},
-			StrictDirectoryAuth:    s.StrictDirectoryAuth,
-			StrictRegistrationAuth: s.StrictRegistrationAuth,
+			StrictDirectoryAuth:      s.StrictDirectoryAuth,
+			StrictRegistrationAuth:   s.StrictRegistrationAuth,
+			StrictHeartbeatFreshness: s.StrictHeartbeatFreshness,
 		},
 	)
 
