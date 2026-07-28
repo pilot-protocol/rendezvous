@@ -883,6 +883,29 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 			// bypasses both the global cap and the per-connection
 			// abusive-rate throttle. See handleBinaryConn comment.
 			if !a.rateLimiter.IsWhitelisted(host) {
+				// Per-IP cap. This is what NewRateLimiter(100, 1s, 50_000)
+				// was built for, and until now Allow had ZERO production
+				// call sites — only Cleanup/IsWhitelisted/SetWhitelist/
+				// WhitelistSize were ever invoked. The whole per-IP tier
+				// was dead code, so a single IP was bounded only by the
+				// PROCESS-WIDE globalBucket it shares with every other
+				// client, and could starve the entire fleet on its own.
+				//
+				// It also meant pilot_ratelimit_denied_total{kind="ip"}
+				// was structurally always zero — the dashboard read "no
+				// abuse" because nothing could ever increment it.
+				//
+				// Allow is whitelist-aware internally (elevated per-bucket
+				// rate, exempt from the maxBuckets cap) and honours the
+				// PILOT_REGISTRY_NORATELIMIT=1 escape hatch, so this can be
+				// disabled without a redeploy if it ever misfires.
+				if !a.rateLimiter.Allow(host) {
+					fireOnDeny("ip")
+					slog.Warn("per-IP rate limit exceeded, closing connection",
+						"remote", conn.RemoteAddr())
+					return
+				}
+
 				// Process-level global rate cap: reject when total
 				// request rate across all connections exceeds the
 				// global ceiling.
@@ -980,6 +1003,17 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 			// reloaded atomically on file change, and only ever contains
 			// IPs the operator has explicitly added.
 			if !a.rateLimiter.IsWhitelisted(host) {
+				// Per-IP cap — see the matching comment on the text path.
+				// Allow had no production call sites at all, so this tier
+				// never ran and a single IP was bounded only by the shared
+				// process-wide globalBucket.
+				if !a.rateLimiter.Allow(host) {
+					fireOnDeny("ip")
+					slog.Warn("per-IP rate limit exceeded, closing binary connection",
+						"remote", conn.RemoteAddr())
+					return
+				}
+
 				// Process-level global rate cap: reject when total
 				// request rate across all connections exceeds the
 				// global ceiling.

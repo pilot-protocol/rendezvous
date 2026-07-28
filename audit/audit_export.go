@@ -190,23 +190,28 @@ func (ae *AuditExporter) send(entry *Entry) {
 		return
 	}
 
-	req, err := http.NewRequest("POST", ae.config.Endpoint, bytes.NewReader(body))
-	if err != nil {
-		slog.Warn("audit export request error", "error", err)
-		return
-	}
-	req.Header.Set("Content-Type", contentType)
-
-	// Splunk HEC requires Authorization header
-	if ae.config.Token != "" {
-		req.Header.Set("Authorization", "Splunk "+ae.config.Token)
-	}
-
 	backoff := time.Second
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			time.Sleep(backoff)
 			backoff *= 2
+		}
+
+		// Build the request INSIDE the loop. It was previously constructed
+		// once above and reused, but bytes.NewReader is drained by the first
+		// Do() — so every retry sent an empty body and failed. The retry
+		// logic looked correct and was guaranteed never to succeed, silently
+		// dropping audit batches whenever the first attempt failed.
+		req, err := http.NewRequest("POST", ae.config.Endpoint, bytes.NewReader(body))
+		if err != nil {
+			slog.Warn("audit export request error", "error", err)
+			return
+		}
+		req.Header.Set("Content-Type", contentType)
+
+		// Splunk HEC requires Authorization header
+		if ae.config.Token != "" {
+			req.Header.Set("Authorization", "Splunk "+ae.config.Token)
 		}
 
 		resp, err := ae.client.Do(req)
