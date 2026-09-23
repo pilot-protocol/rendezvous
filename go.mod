@@ -1,8 +1,8 @@
 module github.com/pilot-protocol/rendezvous
 
-go 1.25.12
+go 1.25.13
 
-require github.com/pilot-protocol/common v0.5.13
+require github.com/pilot-protocol/common v0.5.14
 
 require (
 	github.com/coder/websocket v1.8.15 // indirect
