@@ -95,7 +95,8 @@ jobs:
         env:
           GOWORK: off
         run: |
-          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          # Keep the scanner compatible with the repository Go 1.25 toolchain.
+          go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   gitleaks:
     name: gitleaks secret scan
