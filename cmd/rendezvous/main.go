@@ -127,6 +127,12 @@ func main() {
 	r.SetBuildInfo(buildInfo)
 	r.SetStaleNodeThreshold(*staleThreshold)
 	r.SetBeaconStats(b)
+	// Relayed trust handshakes: have the beacon prompt the recipient to
+	// poll. Asserted rather than called so this builds against a beacon
+	// release that predates NotifyNode (the hook is then simply not wired).
+	if n, ok := interface{}(b).(interface{ NotifyNode(uint32) error }); ok {
+		r.SetHandshakeNotifier(func(nodeID uint32) { _ = n.NotifyNode(nodeID) })
+	}
 	b.SetAuthoritativeKeyLookup(func(nodeID uint32) (ed25519.PublicKey, bool) {
 		raw, ok := r.LookupPublicKey(nodeID)
 		if !ok {

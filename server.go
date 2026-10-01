@@ -186,6 +186,11 @@ type Server struct {
 	// without coupling the registry directly to pkg/beacon.
 	beaconStats BeaconStatsProvider
 
+	// handshakeNotifier, when set by the host (cmd/rendezvous), is told
+	// which node a relayed handshake request or answer was just parked
+	// for, so the co-located beacon can prompt that node to poll now.
+	handshakeNotifier atomic.Pointer[func(nodeID uint32)]
+
 	// Delta log for incremental replication
 	deltaLog *deltaLog
 
