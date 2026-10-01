@@ -834,6 +834,25 @@ func (a *Acceptor) handleConn(conn net.Conn) {
 	a.handleJSONConn(conn, reader)
 }
 
+// replyRateLimited preserves the session on temporary load shedding. A silent
+// close made well-behaved clients reconnect, re-register, and re-enter the
+// five-second grace window, adding work exactly when the registry was full.
+// The rejected request is never dispatched. Pace refusals and bound writes
+// so a client that ignores backpressure cannot spin or pin a writer forever.
+func (a *Acceptor) replyRateLimited(conn net.Conn, binary bool, scope string) bool {
+	if log, _ := a.logSampler.shouldLog("rate-limit:" + scope); log {
+		slog.Warn("registry request rate limited", "scope", scope, "remote", conn.RemoteAddr())
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetWriteDeadline(time.Time{})
+	const message = "rate limited: retry after 1s"
+	if binary {
+		return wire.WriteFrame(conn, wire.MsgError, wire.EncodeError(message)) == nil
+	}
+	return writeMessage(conn, map[string]interface{}{"type": "error", "error": message, "retry_after_ms": 1000}) == nil
+}
+
 // handleJSONConn handles a JSON-protocol connection. reader must include the
 // first 4-byte length prefix (prepended via io.MultiReader if consumed during
 // protocol detection).
@@ -900,10 +919,10 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 				// PILOT_REGISTRY_NORATELIMIT=1 escape hatch, so this can be
 				// disabled without a redeploy if it ever misfires.
 				if !a.rateLimiter.Allow(host) {
-					fireOnDeny("ip")
-					slog.Warn("per-IP rate limit exceeded, closing connection",
-						"remote", conn.RemoteAddr())
-					return
+					if !a.replyRateLimited(conn, false, "ip") {
+						return
+					}
+					continue
 				}
 
 				// Process-level global rate cap: reject when total
@@ -911,9 +930,10 @@ func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 				// global ceiling.
 				if !a.globalBucket.allow(time.Now()) {
 					fireOnDeny("global")
-					slog.Warn("global rate limit exceeded, closing connection",
-						"remote", conn.RemoteAddr())
-					return
+					if !a.replyRateLimited(conn, false, "global") {
+						return
+					}
+					continue
 				}
 
 				rate := float64(connReqCount) / elapsed
@@ -1008,10 +1028,10 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 				// never ran and a single IP was bounded only by the shared
 				// process-wide globalBucket.
 				if !a.rateLimiter.Allow(host) {
-					fireOnDeny("ip")
-					slog.Warn("per-IP rate limit exceeded, closing binary connection",
-						"remote", conn.RemoteAddr())
-					return
+					if !a.replyRateLimited(conn, true, "ip") {
+						return
+					}
+					continue
 				}
 
 				// Process-level global rate cap: reject when total
@@ -1019,9 +1039,10 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 				// global ceiling.
 				if !a.globalBucket.allow(time.Now()) {
 					fireOnDeny("global")
-					slog.Warn("global rate limit exceeded, closing binary connection",
-						"remote", conn.RemoteAddr())
-					return
+					if !a.replyRateLimited(conn, true, "global") {
+						return
+					}
+					continue
 				}
 
 				rate := float64(connReqCount) / elapsed
