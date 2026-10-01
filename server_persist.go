@@ -9,15 +9,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pilot-protocol/common/fsutil"
 	"github.com/pilot-protocol/common/registry/wire"
 	"github.com/pilot-protocol/common/urlvalidate"
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
@@ -25,35 +24,41 @@ import (
 )
 
 const (
-	maxPooledSaveBuf    = 128 << 20
 	scavengeIntervalMs  = 180_000
 	scavengeMinSnapshot = 64 << 20
 )
 
 var lastScavengeMs atomic.Int64
 
-// flushSaveBufPool reuses the bytes buffer that backs the snapshot JSON
-// across save ticks. After the first few saves the pool returns a
-// buffer at peak capacity, so subsequent saves do zero allocation in
-// the encode path. Eliminates the ~1 GB live `bytes.growSlice` heap
-// that was driving GC STW pauses in fleet-scale production.
-//
-// Starts at 1 MB; bytes.Buffer grows organically up to whatever the
-// real snapshot needs. Production fleet (~50-100 MB JSON) hits steady
-// state within a few saves; CI runners with empty registries stay at
-// 1 MB. The 128 MB pre-grow that lived here previously caused CI OOM
-// flakes under 4-way parallel integration tests.
-var flushSaveBufPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, 0, 1*1024*1024)
-		return &b
-	},
+// trimTrailingNewlineWriter forwards every byte it is given except the final
+// one. json.Encoder.Encode terminates its output with '\n', but the snapshot
+// checksum is defined over the encoded value WITHOUT that newline (load()
+// strips it before recomputing too). Holding back the last byte yields a file
+// and hash of `{...}` while writing straight to disk — no full-size buffer.
+type trimTrailingNewlineWriter struct {
+	w       io.Writer
+	held    byte
+	hasHeld bool
 }
 
-func putSaveBuf(bp *[]byte) {
-	if cap(*bp) <= maxPooledSaveBuf {
-		flushSaveBufPool.Put(bp)
+func (t *trimTrailingNewlineWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
 	}
+	if t.hasHeld {
+		if _, err := t.w.Write([]byte{t.held}); err != nil {
+			return 0, err
+		}
+		t.hasHeld = false
+	}
+	if len(p) > 1 {
+		if _, err := t.w.Write(p[:len(p)-1]); err != nil {
+			return 0, err
+		}
+	}
+	t.held = p[len(p)-1]
+	t.hasHeld = true
+	return len(p), nil
 }
 
 func shouldScavenge(dataLen int, nowMs int64) bool {
@@ -62,6 +67,42 @@ func shouldScavenge(dataLen int, nowMs int64) bool {
 	}
 	last := lastScavengeMs.Load()
 	return nowMs-last >= scavengeIntervalMs && lastScavengeMs.CompareAndSwap(last, nowMs)
+}
+
+// atomicWriteStream writes path atomically via a temp file + rename, but
+// streams the content: fn receives the open *os.File and may write
+// incrementally (and Seek/WriteAt to backfill a trailer) instead of the
+// whole payload being materialized in a buffer first. Durability protocol
+// matches AtomicWrite: fsync the file, close, rename, best-effort dir fsync.
+// On fn error the temp file is removed and path is left untouched.
+func atomicWriteStream(path string, fn func(f *os.File) error) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if err := fn(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 // rawNodeCopy holds raw node fields copied under RLock (no encoding).
@@ -510,56 +551,58 @@ func (s *Server) flushSave() (retErr error) {
 	}
 	s.auditMu.Unlock()
 
-	// Compute checksum: encode once without checksum (omitempty omits it), hash,
-	// then inject the checksum into the JSON without a second encode.
+	// Stream-encode straight to the temp file: no full-size in-memory buffer
+	// and no second copy through AtomicWrite. The body is hashed as it is
+	// written, then the checksum is backfilled as a trailing JSON member.
 	//
-	// 2026-05-14: switched from json.Marshal (one-shot allocate) to json.Encoder
-	// writing into a pooled bytes.Buffer. At 170k+ active nodes the snapshot is
-	// ~50-100 MB and was the dominant heap allocator (~1 GB live, GC pressure
-	// causing kernel UDP drops during STW pauses). The pooled buffer is reused
-	// across save ticks — the underlying slice grows once and stays at peak,
-	// no per-tick allocation thereafter.
+	// At 170k+ nodes the old path materialized a ~50-100 MB pooled buffer and
+	// was the dominant heap allocator (~1 GB live, GC STW pauses causing UDP
+	// drops). Streaming writes the same bytes directly to disk instead.
+	//
+	// Checksum invariant: load() re-encodes the struct with Checksum omitted
+	// and hashes those bytes (newline stripped). So the hash here must cover
+	// exactly the encoder output minus its trailing '\n' — which
+	// trimTrailingNewlineWriter guarantees by withholding the final byte.
 	snap.Checksum = ""
-	bp := flushSaveBufPool.Get().(*[]byte)
-	buf := bytes.NewBuffer((*bp)[:0])
-	enc := json.NewEncoder(buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(snap); err != nil {
-		*bp = buf.Bytes()[:0]
-		putSaveBuf(bp)
-		slog.Error("registry save encode error", "err", err)
-		return fmt.Errorf("encode snapshot: %w", err)
-	}
-	data := buf.Bytes()
-	// json.Encoder.Encode appends a newline; drop it to match prior Marshal output.
-	if len(data) > 0 && data[len(data)-1] == '\n' {
-		data = data[:len(data)-1]
-	}
-	hash := sha256.Sum256(data)
-	checksum := hex.EncodeToString(hash[:])
-	// Insert "checksum":"<hex>" before the closing brace. json.Encoder of a struct
-	// always produces a JSON object ending with '}' (after newline trim).
-	if len(data) == 0 || data[len(data)-1] != '}' {
-		*bp = buf.Bytes()[:0]
-		putSaveBuf(bp)
-		return fmt.Errorf("encode snapshot: unexpected JSON format (expected trailing '}')")
-	}
-	data = append(data[:len(data)-1], []byte(`,"checksum":"`+checksum+`"}`)...)
-	defer func() {
-		// Return the (possibly grown) underlying buffer to the pool. AtomicWrite
-		// has copied data to disk by this point, so it is safe to release.
-		*bp = data[:0]
-		putSaveBuf(bp)
-	}()
-
-	// Persist to disk atomically
+	var written int64
 	if s.storePath != "" {
-		if err := fsutil.AtomicWrite(s.storePath, data); err != nil {
+		err := atomicWriteStream(s.storePath, func(f *os.File) error {
+			h := sha256.New()
+			enc := json.NewEncoder(&trimTrailingNewlineWriter{w: io.MultiWriter(f, h)})
+			enc.SetEscapeHTML(false)
+			if err := enc.Encode(snap); err != nil {
+				return fmt.Errorf("encode snapshot: %w", err)
+			}
+			// The encoded object ends with '}' (the trailing newline was
+			// withheld). Replace that '}' with the checksum trailer so the
+			// on-disk file is `{...` + `,"checksum":"<hex>"}`.
+			end, err := f.Seek(0, io.SeekEnd)
+			if err != nil {
+				return fmt.Errorf("seek snapshot temp: %w", err)
+			}
+			var last [1]byte
+			if end == 0 {
+				return fmt.Errorf("encode snapshot: empty output")
+			}
+			if _, err := f.ReadAt(last[:], end-1); err != nil {
+				return fmt.Errorf("read snapshot tail: %w", err)
+			}
+			if last[0] != '}' {
+				return fmt.Errorf("encode snapshot: unexpected JSON format (expected trailing '}')")
+			}
+			trailer := `,"checksum":"` + hex.EncodeToString(h.Sum(nil)) + `"}`
+			if _, err := f.WriteAt([]byte(trailer), end-1); err != nil {
+				return fmt.Errorf("write checksum trailer: %w", err)
+			}
+			written = end - 1 + int64(len(trailer))
+			return nil
+		})
+		if err != nil {
 			slog.Error("registry save error", "err", err)
 			return fmt.Errorf("write snapshot: %w", err)
 		}
-		s.lastSnapshotSizeB.Store(int64(len(data)))
-		if shouldScavenge(len(data), time.Now().UnixMilli()) {
+		s.lastSnapshotSizeB.Store(written)
+		if shouldScavenge(int(written), time.Now().UnixMilli()) {
 			go debug.FreeOSMemory()
 		}
 		// Truncate WAL after successful snapshot (compaction).
