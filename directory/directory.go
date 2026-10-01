@@ -1553,15 +1553,25 @@ func (st *Store) HandleResolveHostname(msg map[string]interface{}) (map[string]i
 		return nil, fmt.Errorf("hostname %q maps to missing node %d", hostname, nodeID)
 	}
 
+	// A hostname stays bound to its node until the node deregisters or is
+	// reaped, so a name can resolve to a node that stopped heartbeating a
+	// while ago. last_seen_unix (additive, same field as lookup) lets the
+	// caller tell; the binding itself is not affected by liveness.
+	lastSeenUnix := int64(0)
+	if ls := node.GetLastSeen(); !ls.IsZero() {
+		lastSeenUnix = ls.Unix()
+	}
+
 	if node.Public {
 		nid, npub, nhost := node.ID, node.Public, node.Hostname
 		st.mu.RUnlock()
 		return map[string]interface{}{
-			"type":     "resolve_hostname_ok",
-			"node_id":  nid,
-			"address":  protocol.Addr{Network: 0, Node: nid}.String(),
-			"public":   npub,
-			"hostname": nhost,
+			"type":           "resolve_hostname_ok",
+			"node_id":        nid,
+			"address":        protocol.Addr{Network: 0, Node: nid}.String(),
+			"public":         npub,
+			"hostname":       nhost,
+			"last_seen_unix": lastSeenUnix,
 		}, nil
 	}
 
@@ -1611,11 +1621,12 @@ func (st *Store) HandleResolveHostname(msg map[string]interface{}) (map[string]i
 	}
 
 	return map[string]interface{}{
-		"type":     "resolve_hostname_ok",
-		"node_id":  nid,
-		"address":  protocol.Addr{Network: 0, Node: nid}.String(),
-		"public":   npub,
-		"hostname": nhost,
+		"type":           "resolve_hostname_ok",
+		"node_id":        nid,
+		"address":        protocol.Addr{Network: 0, Node: nid}.String(),
+		"public":         npub,
+		"hostname":       nhost,
+		"last_seen_unix": lastSeenUnix,
 	}, nil
 }
 
