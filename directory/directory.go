@@ -1820,9 +1820,12 @@ func (st *Store) HandleSetHostname(msg map[string]interface{}) (map[string]inter
 	if hostname != "" {
 		st.hostnameIdx[hostname] = nodeID
 	}
-	st.cb.Save()
 	sh.Unlock()
 	st.mu.Unlock()
+
+	// Signal the save outside the write lock — Save is a non-blocking
+	// trigger, so holding the global lock across it just adds contention.
+	st.cb.Save()
 
 	slog.Debug("hostname set", "node_id", nodeID, "hostname", hostname)
 	st.cb.Audit("hostname.changed", "node_id", nodeID, "old_hostname", oldHostname, "new_hostname", hostname)
