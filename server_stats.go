@@ -118,6 +118,21 @@ type BeaconStatsProvider = dashpkg.BeaconStatsProvider
 // DashboardStats is an alias for dashpkg.DashboardStats (moved in R5.2).
 type DashboardStats = dashpkg.DashboardStats
 
+// SetHandshakeNotifier installs the hook called with the node ID a relayed
+// handshake request or answer was just stored for. The host wires it to the
+// beacon, which prompts that node to poll instead of leaving the handshake
+// parked until the node's next once-a-minute poll. The hook must not block;
+// it is told only the recipient's node ID.
+func (s *Server) SetHandshakeNotifier(fn func(nodeID uint32)) {
+	s.handshakeNotifier.Store(&fn)
+}
+
+func (s *Server) notifyHandshake(nodeID uint32) {
+	if fn := s.handshakeNotifier.Load(); fn != nil && *fn != nil && nodeID != 0 {
+		(*fn)(nodeID)
+	}
+}
+
 // SetBeaconStats wires a BeaconStatsProvider into the registry so
 // /api/stats can return relay-forward counts. Also installs the metrics-side
 // adapter so pilot_beacon_relay_forwarded_total / _dropped_total /

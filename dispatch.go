@@ -123,13 +123,21 @@ var handlers = map[string]Handler{
 		return s.trust.HandleCheckTrust(msg)
 	},
 	"request_handshake": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
-		return s.trust.HandleRequestHandshake(msg)
+		resp, err := s.trust.HandleRequestHandshake(msg)
+		if err == nil {
+			s.notifyHandshake(jsonUint32(msg, "to_node_id"))
+		}
+		return resp, err
 	},
 	"poll_handshakes": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
 		return s.trust.HandlePollHandshakes(msg)
 	},
 	"respond_handshake": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
-		return s.trust.HandleRespondHandshake(msg)
+		resp, err := s.trust.HandleRespondHandshake(msg)
+		if err == nil {
+			s.notifyHandshake(jsonUint32(msg, "peer_id"))
+		}
+		return resp, err
 	},
 	"heartbeat": func(s *Server, msg map[string]interface{}, _ string) (map[string]interface{}, error) {
 		return s.directory.HandleHeartbeat(msg)
