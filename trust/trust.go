@@ -14,8 +14,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/crypto"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // maxHandshakeInbox limits the number of pending handshake requests per node.
@@ -92,8 +92,8 @@ type Store struct {
 // NewStore creates an empty, ready-to-use Store.
 func NewStore(nodes NodeView, cb Callbacks) *Store {
 	return &Store{
-		nodes:              nodes,
-		cb:                 cb,
+		nodes:      nodes,
+		cb:         cb,
 		trustPairs: newTrustPairSet(),
 		handshakes: newHandshakeState(),
 	}
@@ -104,6 +104,13 @@ func NewStore(nodes NodeView, cb Callbacks) *Store {
 // Count returns the total number of trust pairs currently stored.
 func (st *Store) Count() int {
 	return st.trustPairs.count()
+}
+
+// Revision returns a counter that increments whenever the trust-pair set
+// actually changes (a new pair is added or one is removed). It is a cheap
+// cache key for consumers that serialize Pairs(): same revision ⇒ same set.
+func (st *Store) Revision() uint64 {
+	return st.trustPairs.revision()
 }
 
 // IsTrusted reports whether nodes a and b have an established trust pair.

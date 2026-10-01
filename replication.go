@@ -155,8 +155,12 @@ func (s *Server) snapshotJSON() []byte {
 		snap.Networks[fmt.Sprintf("%d", id)] = sn
 	}
 
-	// Include trust pairs via the trust sub-package (R2.1).
-	snap.TrustPairs = s.trust.Pairs()
+	// Include trust pairs via the trust sub-package (R2.1), served from the
+	// same revision-keyed cache flushSave uses so replication doesn't pay the
+	// full re-encode either.
+	if tp, err := s.trustPairsCache.encode(s.trust.Revision(), s.trust.Pairs, trustPairsEncodeCacheTTL); err == nil {
+		snap.TrustPairs = tp
+	}
 
 	// Include handshake inboxes via the trust sub-package (R2.1).
 	inbox, responses := s.trust.InboxSnapshot()
@@ -476,8 +480,14 @@ func (s *Server) applySnapshot(data []byte) error {
 
 	// --- Phase 3: side state under their own locks ---
 
-	// Trust pairs and handshake state are owned by s.trust (R2.1).
-	s.trust.RestorePairs(snap.TrustPairs)
+	// Trust pairs and handshake state are owned by s.trust (R2.1). TrustPairs
+	// arrives as a pre-encoded JSON array (RawMessage).
+	if len(snap.TrustPairs) > 0 {
+		var pairs []string
+		if err := json.Unmarshal(snap.TrustPairs, &pairs); err == nil {
+			s.trust.RestorePairs(pairs)
+		}
+	}
 	s.trust.RestoreInbox(newHandshakeInbox, newHandshakeResponses)
 
 	if len(snap.AuditLog) > 0 {

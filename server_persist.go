@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/pilot-protocol/common/urlvalidate"
 	dashpkg "github.com/pilot-protocol/rendezvous/dashboard"
 	trustpkg "github.com/pilot-protocol/rendezvous/trust"
+	walpkg "github.com/pilot-protocol/rendezvous/wal"
 )
 
 const (
@@ -30,43 +32,62 @@ const (
 
 var lastScavengeMs atomic.Int64
 
-// trimTrailingNewlineWriter forwards every byte it is given except the final
-// one. json.Encoder.Encode terminates its output with '\n', but the snapshot
-// checksum is defined over the encoded value WITHOUT that newline (load()
-// strips it before recomputing too). Holding back the last byte yields a file
-// and hash of `{...}` while writing straight to disk — no full-size buffer.
-type trimTrailingNewlineWriter struct {
-	w       io.Writer
-	held    byte
-	hasHeld bool
-}
-
-func (t *trimTrailingNewlineWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if t.hasHeld {
-		if _, err := t.w.Write([]byte{t.held}); err != nil {
-			return 0, err
-		}
-		t.hasHeld = false
-	}
-	if len(p) > 1 {
-		if _, err := t.w.Write(p[:len(p)-1]); err != nil {
-			return 0, err
-		}
-	}
-	t.held = p[len(p)-1]
-	t.hasHeld = true
-	return len(p), nil
-}
-
 func shouldScavenge(dataLen int, nowMs int64) bool {
 	if dataLen < scavengeMinSnapshot {
 		return false
 	}
 	last := lastScavengeMs.Load()
 	return nowMs-last >= scavengeIntervalMs && lastScavengeMs.CompareAndSwap(last, nowMs)
+}
+
+// trustPairsEncodeCacheTTL bounds how long a cached trust-pairs encoding is
+// served without re-encoding, independent of the revision. The revision
+// invalidation is exact; this is a belt-and-braces safety net so a missed
+// mutation can't wedge a stale list indefinitely.
+const trustPairsEncodeCacheTTL = 10 * time.Minute
+
+// trustPairsEncodeCache memoizes the JSON array of trust-pair keys. The set
+// (millions of entries at fleet scale) is near-static, so reusing the bytes
+// across saves removes the dominant cost of snapshot encoding while
+// producing output byte-identical to encoding the slice directly.
+type trustPairsEncodeCache struct {
+	mu  sync.Mutex
+	rev uint64
+	at  time.Time
+	b   json.RawMessage
+}
+
+// encode returns the JSON array for pairs, reusing the cached bytes while
+// rev is unchanged and the TTL hasn't elapsed. pairs is only invoked on a
+// cache miss. An empty list returns nil so the omitempty tag still drops the
+// field, matching the previous []string behaviour.
+func (c *trustPairsEncodeCache) encode(rev uint64, pairs func() []string, ttl time.Duration) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.b != nil && c.rev == rev && time.Since(c.at) < ttl {
+		return c.b, nil
+	}
+	p := pairs()
+	if len(p) == 0 {
+		c.b = nil
+		c.rev = rev
+		c.at = time.Now()
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(p); err != nil {
+		return nil, err
+	}
+	b := buf.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	c.b = append(c.b[:0], b...)
+	c.rev = rev
+	c.at = time.Now()
+	return c.b, nil
 }
 
 // atomicWriteStream writes path atomically via a temp file + rename, but
@@ -307,8 +328,9 @@ func (s *Server) flushSave() (retErr error) {
 		}
 	}
 
-	// Copy trust pairs and handshake inboxes from the trust sub-package.
-	trustPairs := s.trust.Pairs()
+	// Handshake inboxes are copied here; the trust-pair list is encoded in
+	// Phase 2 through the revision-keyed cache (it is near-static and by far
+	// the most expensive part to serialize).
 	handshakeInbox, handshakeResponses := s.trust.InboxSnapshot()
 	var inviteInbox map[uint32][]*NetworkInvite
 	if len(s.inviteInbox) > 0 {
@@ -457,7 +479,11 @@ func (s *Server) flushSave() (retErr error) {
 	}
 
 	snap.PubKeyIdx = pubKeyIdx
-	snap.TrustPairs = trustPairs
+	tp, tpErr := s.trustPairsCache.encode(s.trust.Revision(), s.trust.Pairs, trustPairsEncodeCacheTTL)
+	if tpErr != nil {
+		return fmt.Errorf("encode trust pairs: %w", tpErr)
+	}
+	snap.TrustPairs = tp
 
 	// Handshake inboxes
 	if len(handshakeInbox) > 0 {
@@ -551,52 +577,35 @@ func (s *Server) flushSave() (retErr error) {
 	}
 	s.auditMu.Unlock()
 
-	// Stream-encode straight to the temp file: no full-size in-memory buffer
-	// and no second copy through AtomicWrite. The body is hashed as it is
-	// written, then the checksum is backfilled as a trailing JSON member.
-	//
-	// At 170k+ nodes the old path materialized a ~50-100 MB pooled buffer and
-	// was the dominant heap allocator (~1 GB live, GC STW pauses causing UDP
-	// drops). Streaming writes the same bytes directly to disk instead.
-	//
-	// Checksum invariant: load() re-encodes the struct with Checksum omitted
-	// and hashes those bytes (newline stripped). So the hash here must cover
-	// exactly the encoder output minus its trailing '\n' — which
-	// trimTrailingNewlineWriter guarantees by withholding the final byte.
+	// Encode with the hand-written, reflection-free encoder (wal.AppendSnapshot)
+	// into a buffer reused across saves. It is byte-identical to encoding/json
+	// (differential-tested), so the checksum and load() parity are unchanged,
+	// but it skips the reflection + per-node allocation that dominated saves at
+	// fleet scale. The body is hashed, then the checksum is written as a
+	// trailing JSON member by replacing the final '}'.
 	snap.Checksum = ""
 	var written int64
 	if s.storePath != "" {
+		s.snapshotEncodeMu.Lock()
+		body := walpkg.AppendSnapshot(s.snapshotBuf[:0], &snap)
+		s.snapshotBuf = body
+		if len(body) == 0 || body[len(body)-1] != '}' {
+			s.snapshotEncodeMu.Unlock()
+			return fmt.Errorf("encode snapshot: unexpected JSON format (expected trailing '}')")
+		}
+		sum := sha256.Sum256(body)
+		trailer := `,"checksum":"` + hex.EncodeToString(sum[:]) + `"}`
 		err := atomicWriteStream(s.storePath, func(f *os.File) error {
-			h := sha256.New()
-			enc := json.NewEncoder(&trimTrailingNewlineWriter{w: io.MultiWriter(f, h)})
-			enc.SetEscapeHTML(false)
-			if err := enc.Encode(snap); err != nil {
-				return fmt.Errorf("encode snapshot: %w", err)
+			if _, err := f.Write(body[:len(body)-1]); err != nil {
+				return fmt.Errorf("write snapshot body: %w", err)
 			}
-			// The encoded object ends with '}' (the trailing newline was
-			// withheld). Replace that '}' with the checksum trailer so the
-			// on-disk file is `{...` + `,"checksum":"<hex>"}`.
-			end, err := f.Seek(0, io.SeekEnd)
-			if err != nil {
-				return fmt.Errorf("seek snapshot temp: %w", err)
-			}
-			var last [1]byte
-			if end == 0 {
-				return fmt.Errorf("encode snapshot: empty output")
-			}
-			if _, err := f.ReadAt(last[:], end-1); err != nil {
-				return fmt.Errorf("read snapshot tail: %w", err)
-			}
-			if last[0] != '}' {
-				return fmt.Errorf("encode snapshot: unexpected JSON format (expected trailing '}')")
-			}
-			trailer := `,"checksum":"` + hex.EncodeToString(h.Sum(nil)) + `"}`
-			if _, err := f.WriteAt([]byte(trailer), end-1); err != nil {
+			if _, err := io.WriteString(f, trailer); err != nil {
 				return fmt.Errorf("write checksum trailer: %w", err)
 			}
-			written = end - 1 + int64(len(trailer))
+			written = int64(len(body) - 1 + len(trailer))
 			return nil
 		})
+		s.snapshotEncodeMu.Unlock()
 		if err != nil {
 			slog.Error("registry save error", "err", err)
 			return fmt.Errorf("write snapshot: %w", err)
@@ -893,10 +902,15 @@ func (s *Server) load() error {
 		s.networks[n.ID] = net
 	}
 
-	// Restore trust pairs (delegated to the trust sub-package).
-	s.trust.RestorePairs(snap.TrustPairs)
+	// Restore trust pairs (delegated to the trust sub-package). TrustPairs is
+	// a pre-encoded JSON array (RawMessage) so flushSave can cache it.
 	if len(snap.TrustPairs) > 0 {
-		slog.Info("loaded trust pairs", "count", len(snap.TrustPairs))
+		var pairs []string
+		if err := json.Unmarshal(snap.TrustPairs, &pairs); err != nil {
+			return fmt.Errorf("decode trust_pairs: %w", err)
+		}
+		s.trust.RestorePairs(pairs)
+		slog.Info("loaded trust pairs", "count", len(pairs))
 	}
 
 	// Restore persisted pubKeyIdx (entries for reaped nodes that aren't in snap.Nodes)
