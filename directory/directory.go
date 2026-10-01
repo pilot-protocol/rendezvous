@@ -784,9 +784,17 @@ func (st *Store) HandleRegister(
 		return nil, fmt.Errorf("registration: signature required")
 	}
 
+	// An operator may hand a reaped node's id to a new key (see the
+	// owner-based reclaim in reRegister). Only checked when a token is
+	// present, so ordinary registrations stay off the admin-token path.
+	adminAuthorized := false
+	if tok, _ := msg["admin_token"].(string); tok != "" && st.cb.RequireAdminToken != nil {
+		adminAuthorized = st.cb.RequireAdminToken(msg) == nil
+	}
+
 	if hostname != "" {
 		if err := ValidateHostname(hostname); err != nil {
-			resp, regErr := st.HandleReRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion, relayOnly, sigVerified)
+			resp, regErr := st.reRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion, relayOnly, sigVerified, adminAuthorized)
 			if regErr != nil {
 				return resp, regErr
 			}
@@ -798,7 +806,7 @@ func (st *Store) HandleRegister(
 		}
 	}
 
-	resp, err := st.HandleReRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion, relayOnly, sigVerified)
+	resp, err := st.reRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion, relayOnly, sigVerified, adminAuthorized)
 	if err == nil {
 		st.cb.IncRegistrations()
 		resp["observed_addr"] = listenAddr
@@ -823,6 +831,14 @@ func (st *Store) HandleRegister(
 // HandleReRegister handles a node presenting an existing public key.
 // Fast path for known-key reconnects; slow path for new nodes and index mutations.
 func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string, relayOnly bool, sigVerified bool) (map[string]interface{}, error) {
+	return st.reRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, version, relayOnly, sigVerified, false)
+}
+
+// reRegister is HandleReRegister plus adminAuthorized: whether the
+// registration carried a valid global admin token. That is the only thing
+// that lets a key the registry has never seen take over the node_id a
+// reaped node's owner string is still bound to.
+func (st *Store) reRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string, relayOnly bool, sigVerified bool, adminAuthorized bool) (map[string]interface{}, error) {
 	pubKey, err := crypto.DecodePublicKey(pubKeyB64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid public key: %w", err)
@@ -1016,7 +1032,28 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 				return nil, fmt.Errorf("owner %q is already bound to node %d with a different key; use recover_identity to rotate the key", owner, existingID)
 			}
 
-			// Owner node reaped — reclaim with new key
+			// Owner node reaped. Reaping keeps everything keyed on the
+			// node_id — network roles, trust pairs, handshake inboxes — so
+			// the id can be resumed, and the same H2/H3 reasoning applies as
+			// for a live node: an owner string is not a credential, and a
+			// key the registry has never seen proves nothing about who held
+			// the id. The original key resumes it through the pubKeyIdx
+			// branch above and never reaches here. A different key is only
+			// given the id on the operator's say-so (the global admin
+			// token); recover_identity cannot help once the record is gone,
+			// because the recovery enrollment was stored on it.
+			if !adminAuthorized {
+				st.cb.Audit("node.rebind_rejected", "node_id", existingID, "owner", owner, "reaped", true)
+				return nil, fmt.Errorf("owner %q is already bound to node %d (offline) with a different key; re-register with the original key, or have the registry operator reassign the node with the admin token", owner, existingID)
+			}
+
+			// Operator-authorized reclaim with a new key. The previous key
+			// no longer speaks for this id.
+			for k, id := range st.pubKeyIdx {
+				if id == existingID {
+					delete(st.pubKeyIdx, k)
+				}
+			}
 			st.pubKeyIdx[pubKeyB64] = existingID
 			now := time.Now()
 			node := &NodeInfo{
@@ -1048,8 +1085,8 @@ func (st *Store) HandleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 			}
 			st.setNodeHostname(node, hostname, resp)
 			st.cb.Save()
-			slog.Debug("registered node", "node_id", existingID, "listen", listenAddr, "addr", addr, "mode", "owner_reclaim")
-			st.cb.Audit("node.re_registered", "node_id", existingID, "mode", "owner_reclaim")
+			slog.Info("reaped node reassigned to a new key by admin token", "node_id", existingID, "listen", listenAddr, "addr", addr)
+			st.cb.Audit("node.re_registered", "node_id", existingID, "mode", "owner_reclaim", "admin", true)
 			return resp, nil
 		}
 	}

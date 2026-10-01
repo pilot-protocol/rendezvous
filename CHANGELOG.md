@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`authz.NetworkRoleChallenge`). Previously the `node_id` was taken on trust.
   Nodes registered without a key need an admin token. Admin-token callers are
   unaffected.
+- A reaped node's id is no longer handed to a new key on the strength of its
+  owner string. Reaping keeps the id's network roles and trust pairs so the
+  node can resume; previously any `register` presenting the same `owner`
+  with a different key resumed it. Such a registration is now refused unless
+  it carries the global admin token. Re-registering with the original key is
+  unchanged.
 
 ### Added
 
