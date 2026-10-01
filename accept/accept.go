@@ -168,8 +168,11 @@ type RateLimiter struct {
 	rate       int
 	window     time.Duration
 	maxBuckets int
-	whitelist  []whitelistRule
-	now        func() time.Time
+	// whitelist is read on every connection/message (IsWhitelisted) but
+	// written rarely (operator). Copy-on-write via an atomic pointer keeps
+	// the hot path lock-free instead of contending with the bucket mutex.
+	whitelist atomic.Pointer[[]whitelistRule]
+	now       func() time.Time
 }
 
 // WhitelistEntry pairs a CIDR with its elevated per-window rate. Operator-
@@ -259,7 +262,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	if !ok {
 		// Whitelist lookup at bucket-creation time: matched IPs get an
 		// elevated per-bucket rate and bypass the maxBuckets cap.
-		bucketRate, whitelisted := rl.whitelistRateLocked(ip)
+		bucketRate, whitelisted := rl.whitelistRate(ip)
 		if !whitelisted {
 			bucketRate = rl.rate
 			if rl.maxBuckets > 0 && len(rl.buckets) >= rl.maxBuckets {
@@ -310,23 +313,23 @@ func (rl *RateLimiter) Allow(ip string) bool {
 // in handleBinaryConn / handleTextConn for operator-trusted internal
 // infrastructure). Safe for concurrent use.
 func (rl *RateLimiter) IsWhitelisted(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	_, ok := rl.whitelistRateLocked(ip)
+	_, ok := rl.whitelistRate(ip)
 	return ok
 }
 
-// whitelistRateLocked returns the elevated rate for ip if any whitelist
-// CIDR contains it, else (0, false). Caller must hold rl.mu.
-func (rl *RateLimiter) whitelistRateLocked(ip string) (int, bool) {
-	if len(rl.whitelist) == 0 {
+// whitelistRate returns the elevated rate for ip if any whitelist CIDR
+// contains it, else (0, false). Lock-free: the whitelist is immutable once
+// published (copy-on-write), so no mutex is needed on this hot path.
+func (rl *RateLimiter) whitelistRate(ip string) (int, bool) {
+	wl := rl.whitelist.Load()
+	if wl == nil || len(*wl) == 0 {
 		return 0, false
 	}
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
 		return 0, false
 	}
-	for _, w := range rl.whitelist {
+	for _, w := range *wl {
 		if w.net.Contains(parsed) {
 			return w.rate, true
 		}
@@ -373,18 +376,18 @@ func (rl *RateLimiter) SetWhitelist(entries []WhitelistEntry) error {
 		}
 		parsed = append(parsed, whitelistRule{net: ipnet, rate: e.Rate})
 	}
-	rl.mu.Lock()
-	rl.whitelist = parsed
-	rl.mu.Unlock()
+	rl.whitelist.Store(&parsed)
 	return nil
 }
 
 // WhitelistSize returns the number of installed whitelist rules (for testing
 // and operator-facing introspection).
 func (rl *RateLimiter) WhitelistSize() int {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	return len(rl.whitelist)
+	wl := rl.whitelist.Load()
+	if wl == nil {
+		return 0
+	}
+	return len(*wl)
 }
 
 // Cleanup removes stale buckets. Call periodically.
@@ -476,6 +479,15 @@ func SanitizeListenAddr(remoteAddr, clientAddr string) string {
 // rawResponseKey is a sentinel used by writeMessage: when the response map
 // contains this key with a []byte value, writeMessage writes the bytes verbatim
 // (skipping json.Marshal). Mirrors the same constant in the server package.
+// connectionReadTimeout bounds how long a connection may sit idle between
+// messages. readDeadlineRefresh throttles re-arming that deadline so busy
+// connections don't touch the runtime timer on every message; the effective
+// idle window is connectionReadTimeout..connectionReadTimeout+refresh.
+const (
+	connectionReadTimeout = 5 * time.Minute
+	readDeadlineRefresh   = 1 * time.Minute
+)
+
 const rawResponseKey = "_pilot_raw_body"
 
 // writeMessageDeadline bounds how long a single response write can block.
@@ -803,7 +815,7 @@ func (a *Acceptor) handleConn(conn net.Conn) {
 	// Binary clients send magic 0x50494C54 ("PILT"). JSON clients send a
 	// 4-byte big-endian length prefix which is always < 64 KB, while the magic
 	// value (~1.3 billion) is orders of magnitude larger.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
 	var peek [4]byte
 	if _, err := io.ReadFull(conn, peek[:]); err != nil {
 		if err != io.EOF {
@@ -859,9 +871,18 @@ func (a *Acceptor) replyRateLimited(conn net.Conn, binary bool, scope string) bo
 func (a *Acceptor) handleJSONConn(conn net.Conn, reader io.Reader) {
 	var connReqCount int64
 	connStart := time.Now()
+	deadlineSet := time.Now()
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// Refresh the idle deadline at most once per readDeadlineRefresh.
+		// Re-arming a 5-minute deadline on every message cost a runtime
+		// timer modification per request (~43k/s at fleet scale); the
+		// deadline always stays at least connectionReadTimeout-refresh in
+		// the future, so idle-connection semantics are unchanged.
+		if time.Since(deadlineSet) >= readDeadlineRefresh {
+			deadlineSet = time.Now()
+			conn.SetReadDeadline(deadlineSet.Add(connectionReadTimeout))
+		}
 		msg, err := readMessage(reader)
 		if err != nil {
 			if err != io.EOF {
@@ -1003,9 +1024,13 @@ func (a *Acceptor) handleBinaryConn(conn net.Conn) {
 	connStart := time.Now()
 	remoteAddr := conn.RemoteAddr().String()
 	host, _, _ := net.SplitHostPort(remoteAddr)
+	deadlineSet := time.Now()
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		if time.Since(deadlineSet) >= readDeadlineRefresh {
+			deadlineSet = time.Now()
+			conn.SetReadDeadline(deadlineSet.Add(connectionReadTimeout))
+		}
 		msgType, payload, err := wire.ReadFrame(conn)
 		if err != nil {
 			if err != io.EOF {
