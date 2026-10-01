@@ -505,41 +505,85 @@ func (s *Server) reapLoop() {
 // reapChunkSize is how many nodes to process per reap tick.
 const reapChunkSize = 10000
 
+// reapDeleteBatch bounds how many stale nodes are deleted per write-lock
+// acquisition, keeping each critical section short.
+const reapDeleteBatch = 128
+
 func (s *Server) reapStaleNodes() {
 	threshold := s.now().Add(-s.StaleNodeThreshold())
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
+	// Phase 1: snapshot the node ids under a read lock (cheap), then sort them
+	// WITHOUT the lock. Previously this built and sorted a 200k-entry slice
+	// while holding the global write lock every 10s — stalling every concurrent
+	// heartbeat/register for the duration (top mutex-contention site).
+	s.mu.RLock()
+	if len(s.nodes) == 0 {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		s.reapCursor = 0
+		s.mu.Unlock()
+		return
+	}
 	nodeIDs := make([]uint32, 0, len(s.nodes))
 	for id := range s.nodes {
 		nodeIDs = append(nodeIDs, id)
 	}
+	startCursor := s.reapCursor
+	s.mu.RUnlock()
+
 	sort.Slice(nodeIDs, func(i, j int) bool { return nodeIDs[i] < nodeIDs[j] })
 
 	startIdx := 0
-	for startIdx < len(nodeIDs) && nodeIDs[startIdx] < s.reapCursor {
+	for startIdx < len(nodeIDs) && nodeIDs[startIdx] < startCursor {
 		startIdx++
 	}
 
+	// Phase 2: scan one chunk under a read lock, collecting stale candidates.
+	// No mutation, no logging here.
+	type reapedNode struct {
+		id       uint32
+		hostname string
+		lastSeen time.Time
+		networks int
+	}
+	cands := make([]reapedNode, 0, reapChunkSize)
 	processed := 0
-	reaped := false
+	var lastProcessed uint32
+	s.mu.RLock()
 	for i := 0; i < len(nodeIDs) && processed < reapChunkSize; i++ {
-		idx := (startIdx + i) % len(nodeIDs)
-		id := nodeIDs[idx]
+		id := nodeIDs[(startIdx+i)%len(nodeIDs)]
 		processed++
+		lastProcessed = id
+		node, ok := s.nodes[id]
+		if !ok {
+			continue
+		}
+		if ls := node.GetLastSeen(); ls.Before(threshold) {
+			cands = append(cands, reapedNode{id: id, hostname: node.Hostname, lastSeen: ls, networks: len(node.Networks)})
+		}
+	}
+	s.mu.RUnlock()
 
-		node := s.nodes[id]
-		lastSeen := node.GetLastSeen()
-		if lastSeen.Before(threshold) {
-			staleDuration := time.Since(lastSeen).Round(time.Second)
-			slog.Info("registry reaping stale node", "node_id", id, "last_seen_ago", staleDuration)
-			s.audit("node.reaped", "node_id", id, "reason", "stale_heartbeat",
-				"last_seen_ago", staleDuration.String(), "networks", len(node.Networks))
+	// Phase 3: delete candidates in short write-locked batches, re-checking
+	// staleness — a node may have heartbeated between the scan and now.
+	reapedAny := false
+	done := make([]reapedNode, 0, len(cands))
+	for start := 0; start < len(cands); start += reapDeleteBatch {
+		end := start + reapDeleteBatch
+		if end > len(cands) {
+			end = len(cands)
+		}
+		s.mu.Lock()
+		for _, c := range cands[start:end] {
+			node, ok := s.nodes[c.id]
+			if !ok || !node.GetLastSeen().Before(threshold) {
+				continue
+			}
 			// Backbone membership is removed. Non-backbone memberships are kept
 			// so re-registration can restore the node to its prior networks.
 			if net, ok := s.networks[0]; ok {
 				for j, m := range net.Members {
-					if m == id {
+					if m == c.id {
 						net.Members = append(net.Members[:j], net.Members[j+1:]...)
 						break
 					}
@@ -547,23 +591,35 @@ func (s *Server) reapStaleNodes() {
 			}
 			// pubKeyIdx and ownerIdx are intentionally preserved so re-registration
 			// reclaims the same node_id rather than allocating a new one.
-			if node.Hostname != "" {
-				delete(s.hostnameIdx, node.Hostname)
+			if c.hostname != "" {
+				delete(s.hostnameIdx, c.hostname)
 			}
-			s.cleanupNode(id)
-			delete(s.nodes, id)
+			s.cleanupNode(c.id)
+			delete(s.nodes, c.id)
 			s.invalidateAdminListNodesCache()
-			reaped = true
+			reapedAny = true
+			done = append(done, c)
 		}
-
-		s.reapCursor = id + 1
+		s.mu.Unlock()
 	}
 
+	// Phase 4: advance the cursor, then log/audit OUTSIDE the lock.
+	s.mu.Lock()
 	if processed >= len(nodeIDs) {
 		s.reapCursor = 0
+	} else {
+		s.reapCursor = lastProcessed + 1
+	}
+	s.mu.Unlock()
+
+	for _, c := range done {
+		d := time.Since(c.lastSeen).Round(time.Second)
+		slog.Info("registry reaping stale node", "node_id", c.id, "last_seen_ago", d)
+		s.audit("node.reaped", "node_id", c.id, "reason", "stale_heartbeat",
+			"last_seen_ago", d.String(), "networks", c.networks)
 	}
 
-	if reaped {
+	if reapedAny {
 		s.save()
 	}
 }
