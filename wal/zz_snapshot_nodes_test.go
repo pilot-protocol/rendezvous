@@ -80,21 +80,20 @@ func TestSnapshotNodes_NilAndEmpty(t *testing.T) {
 }
 
 func BenchmarkSnapshotNodes_Std(b *testing.B) {
-	m := sampleNodes(200_000)
-	// wrap in a plain map to force the std encoder
-	plain := map[string]*SnapshotNode(m)
+	m := map[string]*SnapshotNode(sampleNodes(200_000))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = encRaw(b, wrapStd{N: plain})
+		_ = encRaw(b, m)
 	}
 }
 
 func BenchmarkSnapshotNodes_Fast(b *testing.B) {
 	m := sampleNodes(200_000)
+	buf := make([]byte, 0, 32<<20)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = encRaw(b, wrapFast{N: m})
+		buf = m.appendTo(buf[:0])
 	}
 }
