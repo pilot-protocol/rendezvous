@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -67,6 +68,56 @@ func shouldScavenge(dataLen int, nowMs int64) bool {
 	}
 	last := lastScavengeMs.Load()
 	return nowMs-last >= scavengeIntervalMs && lastScavengeMs.CompareAndSwap(last, nowMs)
+}
+
+// trustPairsEncodeCacheTTL bounds how long a cached trust-pairs encoding is
+// served without re-encoding, independent of the revision. The revision
+// invalidation is exact; this is a belt-and-braces safety net so a missed
+// mutation can't wedge a stale list indefinitely.
+const trustPairsEncodeCacheTTL = 10 * time.Minute
+
+// trustPairsEncodeCache memoizes the JSON array of trust-pair keys. The set
+// (millions of entries at fleet scale) is near-static, so reusing the bytes
+// across saves removes the dominant cost of snapshot encoding while
+// producing output byte-identical to encoding the slice directly.
+type trustPairsEncodeCache struct {
+	mu  sync.Mutex
+	rev uint64
+	at  time.Time
+	b   json.RawMessage
+}
+
+// encode returns the JSON array for pairs, reusing the cached bytes while
+// rev is unchanged and the TTL hasn't elapsed. pairs is only invoked on a
+// cache miss. An empty list returns nil so the omitempty tag still drops the
+// field, matching the previous []string behaviour.
+func (c *trustPairsEncodeCache) encode(rev uint64, pairs func() []string, ttl time.Duration) (json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.b != nil && c.rev == rev && time.Since(c.at) < ttl {
+		return c.b, nil
+	}
+	p := pairs()
+	if len(p) == 0 {
+		c.b = nil
+		c.rev = rev
+		c.at = time.Now()
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(p); err != nil {
+		return nil, err
+	}
+	b := buf.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	c.b = append(c.b[:0], b...)
+	c.rev = rev
+	c.at = time.Now()
+	return c.b, nil
 }
 
 // atomicWriteStream writes path atomically via a temp file + rename, but
@@ -307,8 +358,9 @@ func (s *Server) flushSave() (retErr error) {
 		}
 	}
 
-	// Copy trust pairs and handshake inboxes from the trust sub-package.
-	trustPairs := s.trust.Pairs()
+	// Handshake inboxes are copied here; the trust-pair list is encoded in
+	// Phase 2 through the revision-keyed cache (it is near-static and by far
+	// the most expensive part to serialize).
 	handshakeInbox, handshakeResponses := s.trust.InboxSnapshot()
 	var inviteInbox map[uint32][]*NetworkInvite
 	if len(s.inviteInbox) > 0 {
@@ -457,7 +509,11 @@ func (s *Server) flushSave() (retErr error) {
 	}
 
 	snap.PubKeyIdx = pubKeyIdx
-	snap.TrustPairs = trustPairs
+	tp, tpErr := s.trustPairsCache.encode(s.trust.Revision(), s.trust.Pairs, trustPairsEncodeCacheTTL)
+	if tpErr != nil {
+		return fmt.Errorf("encode trust pairs: %w", tpErr)
+	}
+	snap.TrustPairs = tp
 
 	// Handshake inboxes
 	if len(handshakeInbox) > 0 {
@@ -893,10 +949,15 @@ func (s *Server) load() error {
 		s.networks[n.ID] = net
 	}
 
-	// Restore trust pairs (delegated to the trust sub-package).
-	s.trust.RestorePairs(snap.TrustPairs)
+	// Restore trust pairs (delegated to the trust sub-package). TrustPairs is
+	// a pre-encoded JSON array (RawMessage) so flushSave can cache it.
 	if len(snap.TrustPairs) > 0 {
-		slog.Info("loaded trust pairs", "count", len(snap.TrustPairs))
+		var pairs []string
+		if err := json.Unmarshal(snap.TrustPairs, &pairs); err != nil {
+			return fmt.Errorf("decode trust_pairs: %w", err)
+		}
+		s.trust.RestorePairs(pairs)
+		slog.Info("loaded trust pairs", "count", len(pairs))
 	}
 
 	// Restore persisted pubKeyIdx (entries for reaped nodes that aren't in snap.Nodes)

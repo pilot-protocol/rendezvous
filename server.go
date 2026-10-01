@@ -97,6 +97,11 @@ type Server struct {
 	lastSnapshotRLockMs atomic.Int64 // s.mu.RLock hold time in phase 1
 	maxSnapshotDurMs    atomic.Int64 // worst-ever save duration
 
+	// trustPairsCache memoizes the JSON encoding of the trust-pair list
+	// across saves (see server_persist.go). The set is near-static at fleet
+	// scale, so this avoids re-encoding millions of strings every save.
+	trustPairsCache trustPairsEncodeCache
+
 	// buildInfo carries the build-time identity surfaced on
 	// /api/public-stats for code-verification (version, git commit, ISO
 	// build time, SHA256 of /proc/self/exe, Go runtime version). Set

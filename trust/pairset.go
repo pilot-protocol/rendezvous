@@ -2,7 +2,10 @@
 
 package trust
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // trustPairShards is the shard count for the trust-pair set. A power of two
 // so the index is a mask. Sized well above the registry's request
@@ -27,7 +30,14 @@ type trustPairSet struct {
 		mu sync.RWMutex
 		m  map[string]bool
 	}
+	// rev ticks on every mutation that actually changes the set (new add or
+	// real remove). Consumers can use it as a cache key: an unchanged rev
+	// means the serialized pair list is unchanged.
+	rev atomic.Uint64
 }
+
+// revision returns the set's mutation counter.
+func (s *trustPairSet) revision() uint64 { return s.rev.Load() }
 
 func newTrustPairSet() *trustPairSet {
 	s := &trustPairSet{}
@@ -47,7 +57,10 @@ func (s *trustPairSet) has(key string) bool {
 func (s *trustPairSet) add(key string) {
 	sh := &s.shards[trustShardIdx(key)]
 	sh.mu.Lock()
-	sh.m[key] = true
+	if !sh.m[key] {
+		sh.m[key] = true
+		s.rev.Add(1)
+	}
 	sh.mu.Unlock()
 }
 
@@ -60,6 +73,7 @@ func (s *trustPairSet) remove(key string) bool {
 		return false
 	}
 	delete(sh.m, key)
+	s.rev.Add(1)
 	return true
 }
 
@@ -89,5 +103,9 @@ func (s *trustPairSet) keys() []string {
 
 // addUnlocked inserts without locking — for startup restore before serving.
 func (s *trustPairSet) addUnlocked(key string) {
-	s.shards[trustShardIdx(key)].m[key] = true
+	m := s.shards[trustShardIdx(key)].m
+	if !m[key] {
+		m[key] = true
+		s.rev.Add(1)
+	}
 }
