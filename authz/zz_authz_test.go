@@ -3,7 +3,10 @@
 package authz_test
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/pilot-protocol/common/protocol"
@@ -13,6 +16,7 @@ import (
 // --- stubs ---
 
 type stubNetworkReader struct {
+	keys     map[uint32][]byte
 	networks map[uint16]struct {
 		adminToken string
 		enterprise bool
@@ -50,6 +54,30 @@ func (s *stubNetworkReader) GetMemberRole(netID uint16, nodeID uint32) (authz.Ro
 	}
 	role, has := n.roles[nodeID]
 	return role, has
+}
+
+// GetNodePublicKey makes the stub an authz.NodeKeyReader.
+func (s *stubNetworkReader) GetNodePublicKey(nodeID uint32) ([]byte, bool) {
+	k, ok := s.keys[nodeID]
+	return k, ok
+}
+
+// signedClaim gives nodeID a fresh key in the stub and returns a
+// delete_network request for netID signed with it.
+func (s *stubNetworkReader) signedClaim(t *testing.T, nodeID uint32, netID uint16) map[string]interface{} {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.keys == nil {
+		s.keys = make(map[uint32][]byte)
+	}
+	s.keys[nodeID] = pub
+	msg := map[string]interface{}{"type": "delete_network", "node_id": float64(nodeID)}
+	msg["signature"] = base64.StdEncoding.EncodeToString(
+		ed25519.Sign(priv, []byte(authz.NetworkRoleChallenge(msg, nodeID, netID))))
+	return msg
 }
 
 func (s *stubNetworkReader) IsEnterpriseNetwork(netID uint16) (bool, bool) {
@@ -146,10 +174,8 @@ func TestRequireNetworkRole_RBAC_Pass(t *testing.T) {
 	nr := newStubNetworkReader()
 	nr.addNetwork(2, "", false, map[uint32]authz.Role{7: authz.RoleAdmin})
 
-	msg := map[string]interface{}{
-		"admin_token": "wrongtoken",
-		"node_id":     float64(7),
-	}
+	msg := nr.signedClaim(t, 7, 2)
+	msg["admin_token"] = "wrongtoken"
 	if err := c.RequireNetworkRole(msg, 2, nr, authz.RoleOwner, authz.RoleAdmin); err != nil {
 		t.Fatalf("admin role should be authorized: %v", err)
 	}
@@ -161,13 +187,11 @@ func TestRequireNetworkRole_RBAC_Fail_InsufficientRole(t *testing.T) {
 	nr := newStubNetworkReader()
 	nr.addNetwork(2, "", false, map[uint32]authz.Role{7: authz.RoleMember})
 
-	msg := map[string]interface{}{
-		"admin_token": "wrongtoken",
-		"node_id":     float64(7),
-	}
+	msg := nr.signedClaim(t, 7, 2)
+	msg["admin_token"] = "wrongtoken"
 	err := c.RequireNetworkRole(msg, 2, nr, authz.RoleOwner, authz.RoleAdmin)
-	if err == nil {
-		t.Fatal("member should not be authorized for owner/admin operations")
+	if err == nil || !strings.Contains(err.Error(), "requires one of") {
+		t.Fatalf("member should not be authorized for owner/admin operations: %v", err)
 	}
 }
 

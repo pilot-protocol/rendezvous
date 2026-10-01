@@ -69,6 +69,7 @@ func main() {
 	strictRegistrationAuth := flag.Bool("strict-registration-auth", false, "require a valid proof-of-possession signature on registrations that submit a public_key. Default false (signatures verified when present, but unsigned registrations from old agents are still accepted). Env: RENDEZVOUS_STRICT_REGISTRATION_AUTH=1.")
 	strictHeartbeatFreshness := flag.Bool("strict-heartbeat-freshness", false, "require heartbeats to carry a recent ts field and bind it into the signed challenge, and refuse the binary heartbeat encoding (which has no timestamp field). Default false (challenge covers only the node id, so a captured heartbeat stays replayable). Enable only once every client signs the bound form. Env: RENDEZVOUS_STRICT_HEARTBEAT_FRESHNESS=1.")
 	strictExpiryBinding := flag.Bool("strict-expiry-binding", false, "bind the requested expires_at into the set_key_expiry signed challenge, so a signature authorizes exactly the expiry it was produced for. Default false (challenge covers only the node id). Enable only once every client signs the bound form. Env: RENDEZVOUS_STRICT_EXPIRY_BINDING=1.")
+	allowUnsignedNetworkRoleAuth := flag.Bool("allow-unsigned-network-role-auth", false, "MIGRATION ONLY: accept role-based network administration (delete/rename/kick/promote/demote/transfer_ownership/set_member_tags/set_network_policy/set_expr_policy) on an unsigned node_id, as before signatures were required. Default false (a role claim must be signed by the claimed node's registered key; admin-token callers are unaffected). While on, anyone who can reach the registry can act as any network owner whose node has not yet signed a role operation. Env: RENDEZVOUS_ALLOW_UNSIGNED_NETWORK_ROLE_AUTH=1.")
 	standbyPrimary := flag.String("standby", "", "run as hot standby replicating from the given primary address (e.g. primary:9000)")
 	httpAddr := flag.String("http", "", "HTTP dashboard listen address (e.g. :3000)")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
@@ -154,6 +155,10 @@ func main() {
 	if *strictExpiryBinding || os.Getenv("RENDEZVOUS_STRICT_EXPIRY_BINDING") == "1" {
 		r.SetStrictExpiryBinding(true)
 		slog.Info("set_key_expiry challenge binding enabled")
+	}
+	if *allowUnsignedNetworkRoleAuth || os.Getenv("RENDEZVOUS_ALLOW_UNSIGNED_NETWORK_ROLE_AUTH") == "1" {
+		r.SetAllowUnsignedNetworkRoleAuth(true)
+		slog.Warn("INSECURE: unsigned network role claims are accepted (-allow-unsigned-network-role-auth); any caller can administer a network by naming its owner's node_id. Turn this off once role-path clients sign.")
 	}
 	// Plumb the breaker manager into the in-process beacon so
 	// beacon.punch / beacon.relay / beacon.discover can be flipped from

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Role-based network administration now requires proof of identity. A
+  `delete_network`, `rename_network`, `kick_member`, `promote_member`,
+  `demote_member`, `transfer_ownership`, `set_member_tags`,
+  `set_network_policy` or `set_expr_policy` request that is authorized by the
+  role of its `node_id` (rather than by the global or per-network admin token)
+  must carry a `signature` by that node's registered Ed25519 key over a
+  challenge binding the operation, node, network and argument
+  (`authz.NetworkRoleChallenge`). Previously the `node_id` was taken on trust.
+  Nodes registered without a key need an admin token. Admin-token callers are
+  unaffected.
+
 ### Added
 
 - Relayed trust handshakes no longer wait for the recipient's next poll. When
@@ -20,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports, so a caller can tell a hostname held by a node that has stopped
   heartbeating from a live one. Additive; hostname claimability and
   resolution are unchanged.
+- `-allow-unsigned-network-role-auth` (env
+  `RENDEZVOUS_ALLOW_UNSIGNED_NETWORK_ROLE_AUTH=1`), off by default: a
+  migration escape hatch that accepts unsigned role claims again for nodes
+  that have not yet signed one. It restores the insecure behaviour and logs a
+  warning at startup and on every unsigned acceptance.
 
 ## [v0.1.0]
 

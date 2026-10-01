@@ -43,7 +43,8 @@ func (s *Server) checkAdminToken(msg map[string]interface{}, adminToken string) 
 }
 
 // requireNetworkRole checks if the message sender has one of the allowed roles
-// in the specified network. Delegates to s.authz.RequireNetworkRole. Caller
+// in the specified network. Delegates to s.authz.RequireNetworkRole, which
+// requires a claimed node_id to be backed by that node's signature. Caller
 // must NOT hold s.mu.
 func (s *Server) requireNetworkRole(msg map[string]interface{}, netID uint16, allowedRoles ...Role) error {
 	strRoles := make([]authzpkg.Role, len(allowedRoles))
@@ -80,6 +81,12 @@ func (r *serverNetworkReader) GetMemberRole(netID uint16, nodeID uint32) (authzp
 	role, has := net.MemberRoles[nodeID]
 	s.mu.RUnlock()
 	return authzpkg.Role(role), has
+}
+
+// GetNodePublicKey satisfies authzpkg.NodeKeyReader, so requireNetworkRole
+// can authenticate the node_id a role claim is made for.
+func (r *serverNetworkReader) GetNodePublicKey(nodeID uint32) ([]byte, bool) {
+	return (*Server)(r).LookupPublicKey(nodeID)
 }
 
 func (r *serverNetworkReader) IsEnterpriseNetwork(netID uint16) (bool, bool) {

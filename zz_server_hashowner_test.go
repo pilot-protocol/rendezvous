@@ -339,13 +339,24 @@ func TestRequireNetworkRoleRequiresNodeID(t *testing.T) {
 	}
 }
 
+// signedRoleClaim registers nodeID with a fresh key and returns a
+// delete_network request for netID signed by it — the RBAC path of
+// requireNetworkRole only considers a node_id that is backed by a signature.
+func signedRoleClaim(t *testing.T, s *Server, nodeID uint32, netID uint16) map[string]interface{} {
+	t.Helper()
+	id, _ := seedNodeWithIdentity(t, s, nodeID, "")
+	msg := map[string]interface{}{"type": "delete_network", "node_id": float64(nodeID), "network_id": float64(netID)}
+	signRole(id, msg, nodeID, netID)
+	return msg
+}
+
 func TestRequireNetworkRoleNodeWithoutRoleRejected(t *testing.T) {
 	t.Parallel()
 	s := newTestServer(t, "global")
 	s.mu.Lock()
 	s.networks[1] = &NetworkInfo{ID: 1, MemberRoles: map[uint32]Role{}}
 	s.mu.Unlock()
-	err := s.requireNetworkRole(map[string]interface{}{"node_id": float64(42)}, 1, RoleAdmin)
+	err := s.requireNetworkRole(signedRoleClaim(t, s, 42, 1), 1, RoleAdmin)
 	if err == nil || !strings.Contains(err.Error(), "has no role") {
 		t.Fatalf("%v", err)
 	}
@@ -360,7 +371,7 @@ func TestRequireNetworkRoleAllowedRoleGrants(t *testing.T) {
 		MemberRoles: map[uint32]Role{42: RoleAdmin},
 	}
 	s.mu.Unlock()
-	err := s.requireNetworkRole(map[string]interface{}{"node_id": float64(42)}, 1, RoleAdmin, RoleOwner)
+	err := s.requireNetworkRole(signedRoleClaim(t, s, 42, 1), 1, RoleAdmin, RoleOwner)
 	if err != nil {
 		t.Fatalf("admin in allowed list should grant: %v", err)
 	}
@@ -375,7 +386,7 @@ func TestRequireNetworkRoleDisallowedRoleRejects(t *testing.T) {
 		MemberRoles: map[uint32]Role{42: RoleMember},
 	}
 	s.mu.Unlock()
-	err := s.requireNetworkRole(map[string]interface{}{"node_id": float64(42)}, 1, RoleAdmin, RoleOwner)
+	err := s.requireNetworkRole(signedRoleClaim(t, s, 42, 1), 1, RoleAdmin, RoleOwner)
 	if err == nil || !strings.Contains(err.Error(), "requires one of") {
 		t.Fatalf("member should not have admin role: %v", err)
 	}
