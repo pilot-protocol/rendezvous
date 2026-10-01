@@ -83,11 +83,11 @@ type SnapshotNet struct {
 // and read by load. Version 0 is the legacy (pre-checksum) format; version 1
 // includes the Checksum field for integrity verification.
 type Snapshot struct {
-	Version  int                      `json:"version"`
-	NextNode uint32                   `json:"next_node"`
-	NextNet  uint16                   `json:"next_net"`
-	Nodes    map[string]*SnapshotNode `json:"nodes"`
-	Networks map[string]*SnapshotNet  `json:"networks"`
+	Version  int                     `json:"version"`
+	NextNode uint32                  `json:"next_node"`
+	NextNet  uint16                  `json:"next_net"`
+	Nodes    SnapshotNodes           `json:"nodes"`
+	Networks map[string]*SnapshotNet `json:"networks"`
 	// TrustPairs carries the pre-encoded JSON array of "min:max" pair keys as
 	// a RawMessage so flushSave can serve it from a revision-keyed cache
 	// (the set is near-static at fleet scale) instead of re-encoding ~8.3M

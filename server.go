@@ -102,6 +102,12 @@ type Server struct {
 	// scale, so this avoids re-encoding millions of strings every save.
 	trustPairsCache trustPairsEncodeCache
 
+	// snapshotBuf is the reused buffer for the hand-written snapshot encoder
+	// (wal.AppendSnapshot). snapshotEncodeMu guards it against concurrent
+	// flushSave callers (saveLoop and a rare replication-triggered flush).
+	snapshotEncodeMu sync.Mutex
+	snapshotBuf      []byte
+
 	// buildInfo carries the build-time identity surfaced on
 	// /api/public-stats for code-verification (version, git commit, ISO
 	// build time, SHA256 of /proc/self/exe, Go runtime version). Set
