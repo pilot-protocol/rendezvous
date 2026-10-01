@@ -18,7 +18,6 @@ import (
 
 	"github.com/pilot-protocol/beacon"
 	"github.com/pilot-protocol/common/config"
-	"github.com/pilot-protocol/common/logging"
 	registry "github.com/pilot-protocol/rendezvous"
 	"github.com/pilot-protocol/rendezvous/breakers"
 	dashpkgPub "github.com/pilot-protocol/rendezvous/dashboard"
@@ -97,7 +96,7 @@ func main() {
 		config.ApplyToFlags(cfg)
 	}
 
-	logging.Setup(*logLevel, *logFormat)
+	setupLogging(*logLevel, *logFormat)
 
 	// Enable mutex + block profiling early so contention from startup paths
 	// is captured. Net runtime cost at the chosen rates is ~1% CPU; the
@@ -306,7 +305,7 @@ func main() {
 		func(level string) error {
 			switch strings.ToLower(level) {
 			case "debug", "info", "warn", "warning", "error":
-				logging.Setup(level, *logFormat)
+				setupLogging(level, *logFormat)
 				currentLogLevel = strings.ToLower(level)
 				slog.Info("log level changed", "level", currentLogLevel)
 				return nil
