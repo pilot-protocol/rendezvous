@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -67,6 +68,49 @@ func TestSnapshotNodes_MarshalByteIdentical(t *testing.T) {
 		}
 		lo := max(0, i-30)
 		t.Fatalf("mismatch at byte %d:\n got=%q\nwant=%q", i, got[lo:min(i+30, len(got))], want[lo:min(i+30, len(want))])
+	}
+}
+
+// Every string field is stuffed with adversarial values (HTML, quotes,
+// backslashes, control chars, U+2028/2029, unicode, emoji, invalid UTF-8,
+// very long, whitespace) — the hand-written encoder must match encoding/json
+// byte-for-byte. This is the "funky hostname" guard.
+func TestSnapshotNodes_FunkyStrings(t *testing.T) {
+	funky := []string{
+		"", " ", "  lead/trail  ",
+		`a"b`, `a\b`, `a\\b`, "a<b>&c",
+		"x\u2028y", "x\u2029y", "t\tb", "n\nl", "r\rb",
+		"\x00\x01\x1f", "\x7f", "\xff\xfe-invalid", "héllo.wörld", "😀-emoji",
+		"日本.example", "МОСКВА.рф", "USER@Host", "a:b/c%d?e=f",
+		strings.Repeat("long", 200),
+	}
+	m := SnapshotNodes{}
+	for i, s := range funky {
+		m[strconv.Itoa(i)] = &SnapshotNode{
+			ID: uint32(i), Owner: s, PublicKey: s, RealAddr: s, Hostname: s,
+			Tags: []string{s, "t"}, LANAddrs: []string{s}, Version: s, Badge: s,
+			BadgeSig: s, VerificationProvider: s, ExternalID: s, LastSeen: s,
+			KeyCreated: s, RecoveryCommitment: s,
+		}
+	}
+	// funky *map keys* too (hostname-index-ish keys)
+	for i, s := range funky {
+		m["k"+s+strconv.Itoa(i)] = &SnapshotNode{ID: 1, PublicKey: "p", Networks: []uint16{0}}
+	}
+
+	got := m.appendTo(nil)
+	want := encRaw(t, map[string]*SnapshotNode(m))
+	if !bytes.Equal(got, want) {
+		n := min(len(got), len(want))
+		i := 0
+		for i < n && got[i] == want[i] {
+			i++
+		}
+		lo := max(0, i-30)
+		t.Fatalf("funky-string mismatch at %d:\n got=%q\nwant=%q", i, got[lo:min(i+30, len(got))], want[lo:min(i+30, len(want))])
+	}
+	if !json.Valid(got) {
+		t.Fatal("hand-written encoder produced invalid JSON")
 	}
 }
 

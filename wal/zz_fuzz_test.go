@@ -42,6 +42,11 @@ func FuzzAppendJSONString(f *testing.F) {
 
 func FuzzSnapshotNodes_MarshalParity(f *testing.F) {
 	f.Add("1", "own", "pub", "10.0.0.1:1", "host", "a,b", "/lan", "v1", "badge", uint32(1), 2, true, true, true)
+	// funky hostname / strings seeds
+	f.Add(`a"b`, "own", "pub", "10.0.0.1:1", `a\b`, "a,b", "/lan", "v1", "b", uint32(2), 0, false, false, false)
+	f.Add("x\u2028y", "own", "pub", "10.0.0.1:1", "héllo.😀", "a,b", "/lan", "v1", "b", uint32(3), 0, false, false, false)
+	f.Add("<h>&'", "own", "pub", "10.0.0.1:1", "\x00\x1f\x7f", "a,b", "/lan", "v1", "b", uint32(4), 0, false, false, false)
+	f.Add("日本.рф", "own", "pub", "10.0.0.1:1", "USER@Host:/x?y", "a,b", "/lan", "v1", "b", uint32(5), 0, false, false, false)
 	f.Fuzz(func(t *testing.T, key, owner, pub, addr, host, tags, lan, version, badge string, id uint32, rot int, public, relay, task bool) {
 		var tagList, lanList []string
 		if tags != "" {
@@ -74,6 +79,8 @@ func FuzzSnapshotNodes_MarshalParity(f *testing.F) {
 
 func FuzzAppendSnapshot_MarshalParity(f *testing.F) {
 	f.Add("own", "pub", "host", "2026-01-01T00:00:00Z", "start", uint32(1), int64(5), uint64(2), true)
+	f.Add(`a"b`, "pub", `h\st`, "x\u2028y", "héllo.😀", uint32(2), int64(0), uint64(0), false)
+	f.Add("\x00\x1f", "pub", "日本.рф", "t\tb", "<h>&'", uint32(3), int64(-1), uint64(7), false)
 	f.Fuzz(func(t *testing.T, owner, pub, host, lastseen, start string, id uint32, hb int64, term uint64, omit bool) {
 		s := &Snapshot{
 			Version:    1,
