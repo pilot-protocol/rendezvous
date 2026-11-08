@@ -3,6 +3,7 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -277,8 +278,8 @@ func (s *Server) applySnapshot(data []byte) error {
 
 	for _, n := range snap.Nodes {
 		pubKey, err := base64Decode(n.PublicKey)
-		if err != nil {
-			continue
+		if err != nil || len(pubKey) != ed25519.PublicKeySize {
+			continue // a node without a valid key is never loaded (server_persist.go)
 		}
 		lastSeen := time.Now()
 		if n.LastSeen != "" {

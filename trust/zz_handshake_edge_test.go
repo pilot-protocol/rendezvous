@@ -16,6 +16,7 @@ func TestHandleRequestHandshake_UnknownFromNode(t *testing.T) {
 	_, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	})
 	if err == nil {
 		t.Error("expected error for unknown from_node")
@@ -29,6 +30,7 @@ func TestHandleRequestHandshake_UnknownToNode(t *testing.T) {
 	_, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	})
 	if err == nil {
 		t.Error("expected error for unknown to_node")
@@ -43,6 +45,7 @@ func TestHandleRequestHandshake_TooLongJustification(t *testing.T) {
 		"from_node_id":  float64(1),
 		"to_node_id":    float64(2),
 		"justification": strings.Repeat("x", 100000),
+		"admin_token":   "secret", // keyless test nodes act through the operator
 	})
 	if err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Errorf("expected too-large error, got %v", err)
@@ -58,6 +61,7 @@ func TestHandleRequestHandshake_DuplicatePendingRejected(t *testing.T) {
 	if _, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	}); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
@@ -65,6 +69,7 @@ func TestHandleRequestHandshake_DuplicatePendingRejected(t *testing.T) {
 	_, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	})
 	if err == nil || !strings.Contains(err.Error(), "already pending") {
 		t.Errorf("expected 'already pending' error, got %v", err)
@@ -76,9 +81,10 @@ func TestHandleRespondHandshake_UnknownNode(t *testing.T) {
 	nodes := newFakeNodes("secret") // no nodes
 	st := trust.NewStore(nodes, noopCallbacks())
 	_, err := st.HandleRespondHandshake(map[string]interface{}{
-		"node_id": float64(1),
-		"peer_id": float64(2),
-		"accept":  true,
+		"node_id":     float64(1),
+		"peer_id":     float64(2),
+		"accept":      true,
+		"admin_token": "secret", // keyless test nodes act through the operator
 	})
 	if err == nil {
 		t.Error("expected error for unknown responder")
@@ -93,6 +99,7 @@ func TestHandleRespondHandshake_AcceptCreatesTrustPair(t *testing.T) {
 	if _, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -121,6 +128,7 @@ func TestHandleRespondHandshake_RejectDoesNotCreatePair(t *testing.T) {
 	if _, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -145,6 +153,7 @@ func TestHandlePollHandshakes_HappyAndUnknown(t *testing.T) {
 	if _, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -188,6 +197,7 @@ func TestInboxSnapshot_AfterRequest(t *testing.T) {
 	if _, err := st.HandleRequestHandshake(map[string]interface{}{
 		"from_node_id": float64(1),
 		"to_node_id":   float64(2),
+		"admin_token":  "secret", // keyless test nodes act through the operator
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

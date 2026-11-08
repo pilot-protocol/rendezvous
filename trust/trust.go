@@ -361,8 +361,16 @@ func (st *Store) HandleRequestHandshake(req map[string]interface{}) (map[string]
 		return nil, fmt.Errorf("node %d: %w", toNodeID, protocol.ErrNodeNotFound)
 	}
 
-	// Phase 2: M12 fix: verify sender signature without lock (CPU-bound)
-	if fromPubKey != nil {
+	// Phase 2: M12 fix: verify sender signature without lock (CPU-bound).
+	// A node without a key can't sign: only the operator, with the admin
+	// token, may act for it. This used to skip verification for such a node
+	// altogether, so anyone could request (and, below, accept) a handshake
+	// in its name (audit, 2026-11-08).
+	if len(fromPubKey) == 0 {
+		if err := checkAdminToken(req, st.nodes.AdminToken()); err != nil {
+			return nil, fmt.Errorf("node %d has no public key: admin token required", fromNodeID)
+		}
+	} else {
 		sigB64, _ := req["signature"].(string)
 		if sigB64 == "" {
 			return nil, fmt.Errorf("handshake request requires signature")
@@ -471,8 +479,13 @@ func (st *Store) HandleRespondHandshake(req map[string]interface{}) (map[string]
 		return nil, fmt.Errorf("node %d: %w", peerID, protocol.ErrNodeNotFound)
 	}
 
-	// Phase 2: M12 fix: verify responder signature without lock (CPU-bound)
-	if respPubKey != nil {
+	// Phase 2: M12 fix: verify responder signature without lock (CPU-bound).
+	// A keyless responder: the admin token only, as for requests above.
+	if len(respPubKey) == 0 {
+		if err := checkAdminToken(req, st.nodes.AdminToken()); err != nil {
+			return nil, fmt.Errorf("node %d has no public key: admin token required", nodeID)
+		}
+	} else {
 		sigB64, _ := req["signature"].(string)
 		if sigB64 == "" {
 			return nil, fmt.Errorf("handshake response requires signature")

@@ -212,3 +212,32 @@ func TestHandshakeRelayStillMakesThePair(t *testing.T) {
 		t.Fatal("an accepted relayed handshake made no pair")
 	}
 }
+
+// A node without a key can't sign, so nobody may request or accept a
+// handshake in its name without the admin token. Both used to skip
+// verification for such a node (audit, 2026-11-08), so anyone could mint a
+// trust pair with it.
+func TestKeylessNodeHandshakeNeedsAdminToken(t *testing.T) {
+	t.Parallel()
+	nodes := newFakeNodes("secret", 1, 2) // no keys
+	st := trust.NewStore(nodes, noopCallbacks())
+
+	if _, err := st.HandleRequestHandshake(map[string]interface{}{"from_node_id": float64(2), "to_node_id": float64(1), "justification": "hi"}); err == nil {
+		t.Fatal("unsigned request in a keyless node's name accepted")
+	}
+	if _, err := st.HandleRequestHandshake(map[string]interface{}{"from_node_id": float64(2), "to_node_id": float64(1), "justification": "hi", "admin_token": "secret"}); err != nil {
+		t.Fatalf("operator's request: %v", err)
+	}
+	if _, err := st.HandleRespondHandshake(map[string]interface{}{"node_id": float64(1), "peer_id": float64(2), "accept": true}); err == nil {
+		t.Fatal("unsigned accept in a keyless node's name accepted")
+	}
+	if st.IsTrusted(1, 2) {
+		t.Fatal("an unsigned accept made a trust pair")
+	}
+	if _, err := st.HandleRespondHandshake(map[string]interface{}{"node_id": float64(1), "peer_id": float64(2), "accept": true, "admin_token": "secret"}); err != nil {
+		t.Fatalf("operator's accept: %v", err)
+	}
+	if !st.IsTrusted(1, 2) {
+		t.Fatal("the operator's accept made no pair")
+	}
+}

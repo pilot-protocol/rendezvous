@@ -57,10 +57,15 @@ backup() {
         log "Backed up registry.json to registry-$TIMESTAMP.json"
 
         # Rotate: keep last 5 backups
-        BACKUP_COUNT=$(ls -1 "$BACKUP_DIR"/registry-*.json 2>/dev/null | wc -l)
+        # Only this script's own backups (registry-YYYYMMDD-HHMMSS.json).
+        # The glob registry-*.json also matched hand-curated snapshots
+        # (registry-PRISTINE-*, registry-PRE-DEPLOY-*), and the rotation
+        # deleted one on 2026-11-08.
+        OWN=$(ls -1t "$BACKUP_DIR" 2>/dev/null | grep -E '^registry-[0-9]{8}-[0-9]{6}\.json$' || true)
+        BACKUP_COUNT=$(printf '%s\n' "$OWN" | grep -c . || true)
         if [ "$BACKUP_COUNT" -gt 5 ]; then
-            ls -1t "$BACKUP_DIR"/registry-*.json | tail -n +"6" | xargs sudo rm -f
-            log "Rotated backups — kept last 5"
+            printf '%s\n' "$OWN" | tail -n +"6" | sed "s#^#$BACKUP_DIR/#" | xargs sudo rm -f
+            log "Rotated backups — kept the last 5 of this script's own"
         fi
     fi
 }
