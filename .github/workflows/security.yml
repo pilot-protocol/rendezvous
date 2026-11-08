@@ -88,14 +88,17 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          # Scan with the toolchain the production registry binary is built
+          # with (scripts/deploy-rendezvous.sh; v0.2.9-beta.9-sec2 onward), so
+          # stdlib findings match what runs. go.mod's go line stays at the
+          # hub's 1.25.13 so pilotprotocol can still require this module.
+          go-version: "1.27.3"
           cache: true
 
       - name: Run govulncheck
         env:
           GOWORK: off
         run: |
-          # Keep the scanner compatible with the repository Go 1.25 toolchain.
           go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   gitleaks:
