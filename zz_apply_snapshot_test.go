@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -29,7 +30,7 @@ func buildSnapshot(t *testing.T, nodes int, networks int) []byte {
 		snap.Nodes[key] = &snapshotNode{
 			ID:        uint32(i),
 			Owner:     fmt.Sprintf("owner-%d", i),
-			PublicKey: "AAAA" + fmt.Sprintf("%032d", i),
+			PublicKey: base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%032d", i))), // 32 bytes: a valid key's length
 			RealAddr:  fmt.Sprintf("10.0.0.%d:9000", i%255),
 			Networks:  []uint16{1},
 			LastSeen:  now,
