@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A node without a public key can no longer be acted for by anyone:
+  `request_handshake` and `respond_handshake` skipped verification for such
+  a node, so any caller could mint a trust pair in its name. Both now need the
+  admin token for it, like every other authenticated handler, and the
+  snapshot and replication loaders never load a node whose key isn't a valid
+  Ed25519 key.
 - A trust pair now needs both nodes' consent. `report_trust` is signed by
   one node, yet it wrote the symmetric pair by itself, so one node could make
   a private node admit its streams and datagrams and resolve that node's
