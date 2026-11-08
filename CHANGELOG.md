@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A trust pair now needs both nodes' consent. `report_trust` is signed by
+  one node, yet it wrote the symmetric pair by itself, so one node could make
+  a private node admit its streams and datagrams and resolve that node's
+  endpoint. A report is now a claim that waits (up to 30 days, at most 10,000
+  per node) for the other node's own `report_trust`; then the pair is written.
+  The signed handshake relay and a keyless node's admin-token report write the
+  pair in one step as before. A waiting report answers `report_trust_ok` with
+  `"trusted": false`. Either node may still revoke alone, which also
+  withdraws its waiting claim.
 - Role-based network administration now requires proof of identity. A
   `delete_network`, `rename_network`, `kick_member`, `promote_member`,
   `demote_member`, `transfer_ownership`, `set_member_tags`,
