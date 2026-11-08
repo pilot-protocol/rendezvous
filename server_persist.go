@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -783,7 +784,12 @@ func (s *Server) load() error {
 
 	for _, n := range snap.Nodes {
 		pubKey, err := base64.StdEncoding.DecodeString(n.PublicKey)
+		if err == nil && len(pubKey) != ed25519.PublicKeySize {
+			err = fmt.Errorf("public key is %d bytes, want %d", len(pubKey), ed25519.PublicKeySize)
+		}
 		if err != nil {
+			// A node without a valid key can't sign, and some paths once
+			// let anyone act for a keyless node: never load one.
 			slog.Warn("registry load: skip node with bad public key", "node_id", n.ID, "err", err)
 			continue
 		}

@@ -125,6 +125,16 @@ func (s *Server) StrictDirectoryAuth() bool {
 	return s.strictDirectoryAuth.Load()
 }
 
+// SetAllowUnsignedNetworkRoleAuth toggles the migration escape hatch for
+// role-based network administration (delete/rename/kick/promote/demote/
+// transfer_ownership/set_member_tags/set_*_policy). Default off: a request
+// that authorizes on a node's role must be signed by that node. On, unsigned
+// role claims are accepted again for nodes that have not yet signed one —
+// the pre-fix behavior, in which any caller can act as any network owner.
+func (s *Server) SetAllowUnsignedNetworkRoleAuth(enabled bool) {
+	s.authz.SetAllowUnsignedNetworkRole(enabled)
+}
+
 func (s *Server) SetStrictRegistrationAuth(enabled bool) {
 	s.strictRegistrationAuth.Store(enabled)
 }

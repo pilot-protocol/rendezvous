@@ -94,11 +94,12 @@ func TestReRegister_DifferentKey_OwnerReclaim_Rejected(t *testing.T) {
 	}
 }
 
-// TestReRegister_ReapedOwnerNode_ReclaimAllowed asserts the legitimate
-// restart case: when the owner's node was reaped (no live binding), the same
-// owner may reclaim the node_id with a fresh key, and the reclaimed node
-// carries NO stale badge.
-func TestReRegister_ReapedOwnerNode_ReclaimAllowed(t *testing.T) {
+// TestReRegister_ReapedOwnerNode_NewKeyNeedsAdmin: when the owner's node
+// was reaped, the owner string alone does not hand its node_id to a fresh
+// key — the id still carries the reaped node's network roles and trust.
+// With the operator's authorization the reclaim goes through, and the
+// reclaimed node carries NO stale badge.
+func TestReRegister_ReapedOwnerNode_NewKeyNeedsAdmin(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 
@@ -109,15 +110,24 @@ func TestReRegister_ReapedOwnerNode_ReclaimAllowed(t *testing.T) {
 	}
 	nodeID := resp1["node_id"].(uint32)
 
-	// Simulate the node being reaped: drop from nodes + pubKeyIdx, keep ownerIdx
-	// (this is what ReapStaleNodes / restart leaves behind).
+	// Simulate the node being reaped: drop from nodes, keep ownerIdx and
+	// pubKeyIdx (this is what ReapStaleNodes leaves behind).
 	delete(st.nodes, nodeID)
-	delete(st.pubKeyIdx, pubKey)
 
 	newPubKey := genPubKeyB64(t)
-	resp2, err := st.HandleReRegister(newPubKey, "10.0.0.9:4000", "alice", "host1", nil, "2.0.0", false, false)
+	if _, err := st.HandleReRegister(newPubKey, "10.0.0.9:4000", "alice", "host1", nil, "2.0.0", false, false); err == nil {
+		t.Fatal("fresh key was given a reaped node's id on the owner string alone")
+	}
+	if _, ok := st.nodes[nodeID]; ok {
+		t.Fatal("refused reclaim still recreated the node")
+	}
+	if _, ok := st.pubKeyIdx[newPubKey]; ok {
+		t.Fatal("refused reclaim still indexed the new key")
+	}
+
+	resp2, err := st.reRegister(newPubKey, "10.0.0.9:4000", "alice", "host1", nil, "2.0.0", false, false, true)
 	if err != nil {
-		t.Fatalf("reaped-node owner reclaim should succeed: %v", err)
+		t.Fatalf("admin-authorized reclaim should succeed: %v", err)
 	}
 	if resp2["node_id"].(uint32) != nodeID {
 		t.Fatalf("reaped reclaim got wrong node_id: %v != %v", resp2["node_id"], nodeID)
@@ -125,5 +135,8 @@ func TestReRegister_ReapedOwnerNode_ReclaimAllowed(t *testing.T) {
 	node := st.nodes[nodeID]
 	if node.Badge != "" || node.BadgeSig != "" || node.VerificationProvider != "" {
 		t.Error("reclaimed reaped node carries a stale badge")
+	}
+	if _, ok := st.pubKeyIdx[pubKey]; ok {
+		t.Error("previous key still indexed to the reassigned node")
 	}
 }

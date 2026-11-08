@@ -13,7 +13,12 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -54,10 +59,26 @@ type NodeReader interface {
 	GetNodeNetworks(nodeID uint32) (netIDs []uint16, ok bool)
 }
 
+// NodeKeyReader is the optional view over node state that the RBAC path of
+// RequireNetworkRole uses to authenticate the claimed node_id. A
+// NetworkReader that does not also implement it has no keys to offer, so
+// every role claim made through it is refused.
+type NodeKeyReader interface {
+	// GetNodePublicKey returns the Ed25519 public key registered for
+	// nodeID. ok is false when the node is unknown or has no key.
+	GetNodePublicKey(nodeID uint32) (pubKey []byte, ok bool)
+}
+
 // Checker holds token configuration and exposes authorization gate methods.
 type Checker struct {
 	adminToken     string
 	dashboardToken string
+
+	// allowUnsignedRole is the migration escape hatch for RequireNetworkRole
+	// (see SetAllowUnsignedNetworkRole). roleSigned is its ratchet: node IDs
+	// that have presented a valid role signature since this process started.
+	allowUnsignedRole atomic.Bool
+	roleSigned        sync.Map // uint32 -> struct{}
 }
 
 // NewChecker returns a Checker configured with the given tokens.
@@ -120,16 +141,39 @@ func (c *Checker) checkAdminToken(msg map[string]interface{}, adminToken string)
 	return nil
 }
 
+// SetAllowUnsignedNetworkRole toggles the migration escape hatch for the
+// RBAC path of RequireNetworkRole. Off (the default), a role claim must be
+// signed by the claimed node's registered key. On, an unsigned claim is
+// honored as it was before signatures were required — which means anyone
+// who can reach the registry can act as any network owner — except for
+// nodes that have already presented a valid role signature to this process.
+// A signature that is present is always verified, in either mode.
+func (c *Checker) SetAllowUnsignedNetworkRole(enabled bool) {
+	c.allowUnsignedRole.Store(enabled)
+}
+
+// AllowUnsignedNetworkRole reports whether the escape hatch is on.
+func (c *Checker) AllowUnsignedNetworkRole() bool {
+	return c.allowUnsignedRole.Load()
+}
+
 // RequireNetworkRole checks whether the request is authorized to act in
 // netID with one of allowedRoles.  Authorization succeeds when any of the
 // following holds:
 //
 //  1. The global admin token in msg is valid.
 //  2. The per-network admin token in msg matches the network's AdminToken.
-//  3. The requesting node (identified by msg["node_id"]) has one of
-//     allowedRoles in netID according to nr.
+//  3. The requesting node (identified by msg["node_id"]) proves it is that
+//     node — msg["signature"] is a valid Ed25519 signature by the node's
+//     registered key over NetworkRoleChallenge(msg, nodeID, netID) — and
+//     has one of allowedRoles in netID according to nr.
 //
-// nr must not be nil.
+// Nothing on the accept/dispatch path binds a connection to a node, so
+// node_id alone is a claim, not an identity. A node with no registered key
+// cannot use path 3 and needs an admin token.
+//
+// nr must not be nil. It must also implement NodeKeyReader for path 3 to
+// succeed.
 func (c *Checker) RequireNetworkRole(msg map[string]interface{}, netID uint16, nr NetworkReader, allowedRoles ...Role) error {
 	// 1. Global admin token always authorizes.
 	if c.RequireAdminToken(msg) == nil {
@@ -153,6 +197,9 @@ func (c *Checker) RequireNetworkRole(msg map[string]interface{}, netID uint16, n
 	if nodeID == 0 {
 		return fmt.Errorf("rbac: node_id required for role-based authorization")
 	}
+	if err := c.verifyRoleClaim(msg, netID, nodeID, nr); err != nil {
+		return err
+	}
 	role, hasRole := nr.GetMemberRole(netID, nodeID)
 	if !hasRole {
 		return fmt.Errorf("rbac: node %d has no role in network %d", nodeID, netID)
@@ -163,6 +210,126 @@ func (c *Checker) RequireNetworkRole(msg map[string]interface{}, netID uint16, n
 		}
 	}
 	return fmt.Errorf("rbac: node %d has role %q, requires one of %v", nodeID, role, allowedRoles)
+}
+
+// verifyRoleClaim authenticates the node_id claimed on the RBAC path.
+func (c *Checker) verifyRoleClaim(msg map[string]interface{}, netID uint16, nodeID uint32, nr NetworkReader) error {
+	var pubKey []byte
+	if kr, ok := nr.(NodeKeyReader); ok {
+		pubKey, _ = kr.GetNodePublicKey(nodeID)
+	}
+	msgType, _ := msg["type"].(string)
+
+	if sigB64, _ := msg["signature"].(string); sigB64 == "" {
+		if c.allowUnsignedRole.Load() {
+			if _, signed := c.roleSigned.Load(nodeID); !signed {
+				slog.Warn("UNSIGNED network role claim accepted (-allow-unsigned-network-role-auth is on)",
+					"type", msgType, "node_id", nodeID, "network_id", netID)
+				return nil
+			}
+		}
+		if len(pubKey) == 0 {
+			return fmt.Errorf("rbac: node %d has no public key: admin token required", nodeID)
+		}
+		return fmt.Errorf("rbac: signature required to act as node %d (update the client, or use an admin token)", nodeID)
+	}
+
+	if len(pubKey) == 0 {
+		return fmt.Errorf("rbac: node %d has no public key: admin token required", nodeID)
+	}
+	if err := VerifyNodeSignature(pubKey, "", msg, NetworkRoleChallenge(msg, nodeID, netID)); err != nil {
+		return err
+	}
+	c.roleSigned.Store(nodeID, struct{}{})
+	return nil
+}
+
+// NetworkRoleChallenge returns the string a node signs to exercise its
+// network role for the operation in msg. It binds the operation (msg
+// "type"), the acting node, the network and the operation's argument, so a
+// signature authorizes exactly one request shape:
+//
+//	delete_network:<node>:<net>
+//	rename_network:<node>:<net>:<name>
+//	kick_member:<node>:<net>:<target_node_id>
+//	promote_member:<node>:<net>:<target_node_id>
+//	demote_member:<node>:<net>:<target_node_id>
+//	transfer_ownership:<node>:<net>:<new_owner_id>
+//	set_member_tags:<node>:<net>:<target_node_id>:<hex sha256 of tags joined by ",">
+//	set_network_policy:<node>:<net>:<hex sha256 of NetworkPolicyDigestInput>
+//	set_expr_policy:<node>:<net>:<hex sha256 of the expr_policy string>
+//
+// Any other type signs "<type>:<node>:<net>". The registry client in
+// common/registry/client builds the same strings; the two are pinned to
+// each other by golden vectors in both modules.
+func NetworkRoleChallenge(msg map[string]interface{}, nodeID uint32, netID uint16) string {
+	msgType, _ := msg["type"].(string)
+	base := fmt.Sprintf("%s:%d:%d", msgType, nodeID, netID)
+	switch msgType {
+	case "rename_network":
+		name, _ := msg["name"].(string)
+		return base + ":" + name
+	case "kick_member", "promote_member", "demote_member":
+		return fmt.Sprintf("%s:%d", base, jsonUint32(msg, "target_node_id"))
+	case "transfer_ownership":
+		return fmt.Sprintf("%s:%d", base, jsonUint32(msg, "new_owner_id"))
+	case "set_member_tags":
+		var tags []string
+		if raw, ok := msg["tags"].([]interface{}); ok {
+			for _, rt := range raw {
+				if t, ok := rt.(string); ok {
+					tags = append(tags, t)
+				}
+			}
+		}
+		return fmt.Sprintf("%s:%d:%s", base, jsonUint32(msg, "target_node_id"), hexSHA256(strings.Join(tags, ",")))
+	case "set_network_policy":
+		return base + ":" + hexSHA256(NetworkPolicyDigestInput(msg))
+	case "set_expr_policy":
+		var expr string
+		switch v := msg["expr_policy"].(type) {
+		case string:
+			expr = v
+		case map[string]interface{}:
+			b, _ := json.Marshal(v)
+			expr = string(b)
+		}
+		return base + ":" + hexSHA256(expr)
+	}
+	return base
+}
+
+// NetworkPolicyDigestInput is the canonical form of the three fields a
+// set_network_policy request may carry, as decoded from JSON. An absent
+// field is "-"; a present one is "=" followed by its value, so a signature
+// over "leave description alone" cannot be replayed as "clear it".
+func NetworkPolicyDigestInput(msg map[string]interface{}) string {
+	maxMembers := "-"
+	if v, ok := msg["max_members"].(float64); ok {
+		maxMembers = "=" + strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	ports := "-"
+	if v, ok := msg["allowed_ports"].([]interface{}); ok {
+		parts := make([]string, len(v))
+		for i, p := range v {
+			if f, ok := p.(float64); ok {
+				parts[i] = strconv.FormatFloat(f, 'f', -1, 64)
+			} else {
+				parts[i] = "?"
+			}
+		}
+		ports = "=" + strings.Join(parts, ",")
+	}
+	description := "-"
+	if v, ok := msg["description"].(string); ok {
+		description = "=" + v
+	}
+	return "max_members" + maxMembers + "\nallowed_ports" + ports + "\ndescription" + description
+}
+
+func hexSHA256(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
 }
 
 // RequireEnterprise returns nil when netID is an enterprise network, or a

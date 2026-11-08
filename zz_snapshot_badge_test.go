@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestApplySnapshotPreservesBadgeAndRecovery(t *testing.T) {
 	}
 	snap.Nodes["42"] = &snapshotNode{
 		ID:                   42,
-		PublicKey:            "AAAA" + "00000000000000000000000000000042",
+		PublicKey:            base64.StdEncoding.EncodeToString([]byte("00000000000000000000000000000042")), // 32 bytes: a valid key's length
 		Networks:             []uint16{1},
 		LastSeen:             now,
 		Badge:                "pilotbadge:v1:42:github:1700000000:0:bdg-v1:",
