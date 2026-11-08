@@ -82,6 +82,10 @@ type Store struct {
 
 	trustPairs *trustPairSet
 
+	// claims are report_trust calls waiting for the other node's (claims.go):
+	// a pair is written only once both of its nodes have reported it.
+	claims *claimSet
+
 	// handshakes holds the relay inboxes, responses and pending-request
 	// tracking, sharded by node id. Pending requests are NOT cleared by
 	// poll, so respond_handshake can verify a prior request existed even
@@ -95,6 +99,7 @@ func NewStore(nodes NodeView, cb Callbacks) *Store {
 		nodes:      nodes,
 		cb:         cb,
 		trustPairs: newTrustPairSet(),
+		claims:     newClaimSet(),
 		handshakes: newHandshakeState(),
 	}
 }
@@ -163,7 +168,12 @@ func (st *Store) InboxSize() (requests, responses int) {
 
 // --- Handlers ---
 
-// HandleReportTrust registers a mutual trust pair between two nodes.
+// HandleReportTrust records that node_id trusts peer_id, signed by node_id.
+// A trust pair is mutual, so it is written only when peer_id has reported
+// node_id too (claims.go), or by the signed handshake relay
+// (HandleRespondHandshake). Until then the report waits, and the answer
+// says so ("trusted": false). A node without a key reports with the admin
+// token, and the operator's report writes the pair at once.
 //
 //	func (s *Server) handleReportTrust(req map[string]interface{}) (map[string]interface{}, error) {
 //	    return s.trust.HandleReportTrust(req)
@@ -186,30 +196,61 @@ func (st *Store) HandleReportTrust(req map[string]interface{}) (map[string]inter
 	if err := verifyHeartbeatSignature(pubKey, adminToken, req, fmt.Sprintf("report_trust:%d:%d", nodeA, nodeB)); err != nil {
 		return nil, err
 	}
+	if nodeA == nodeB {
+		return nil, fmt.Errorf("node %d cannot report trust in itself", nodeA)
+	}
 
-	// Phase 3: re-check nodes exist, then write the trust pair
+	// Phase 3: re-check nodes exist, then record the report
 	if _, _, ok := st.nodes.LookupNode(nodeA); !ok {
 		return nil, fmt.Errorf("node %d: %w", nodeA, protocol.ErrNodeNotFound)
 	}
 	if _, _, ok := st.nodes.LookupNode(nodeB); !ok {
 		return nil, fmt.Errorf("node %d: %w", nodeB, protocol.ErrNodeNotFound)
 	}
-
-	key := pairKey(nodeA, nodeB)
-	st.trustPairs.add(key)
-
-	st.cb.Save()
 	st.cb.IncTrustReports()
 
-	slog.Info("trust pair registered", "node_a", nodeA, "node_b", nodeB)
+	key := pairKey(nodeA, nodeB)
+	if st.trustPairs.has(key) {
+		// Already mutual: the re-sync every daemon does on re-registration.
+		st.claims.withdraw(nodeA, nodeB)
+		return reportTrustOK(true), nil
+	}
+
+	how := "both nodes reported it"
+	if pubKey == nil {
+		how = "the admin token" // a node without a key: the operator's report
+		st.claims.withdraw(nodeA, nodeB)
+	} else {
+		switch st.claims.claim(nodeA, nodeB) {
+		case claimWaiting:
+			slog.Debug("trust report waits for the peer's", "node_a", nodeA, "node_b", nodeB)
+			st.cb.Audit("trust.claimed", "node_a", nodeA, "node_b", nodeB)
+			return reportTrustOK(false), nil
+		case claimRefused:
+			return nil, fmt.Errorf("node %d has %d trust reports waiting for the other node; try again later", nodeA, maxClaimsPerNode)
+		}
+	}
+
+	st.trustPairs.add(key)
+	st.cb.Save()
+
+	slog.Info("trust pair registered", "node_a", nodeA, "node_b", nodeB, "by", how)
 	st.cb.Audit("trust.created", "node_a", nodeA, "node_b", nodeB)
 
-	return map[string]interface{}{
-		"type": "report_trust_ok",
-	}, nil
+	return reportTrustOK(true), nil
 }
 
-// HandleRevokeTrust removes a trust pair between two nodes.
+// reportTrustOK is report_trust's answer: trusted is whether the pair now
+// stands (false: the report waits for the other node's).
+func reportTrustOK(trusted bool) map[string]interface{} {
+	return map[string]interface{}{
+		"type":    "report_trust_ok",
+		"trusted": trusted,
+	}
+}
+
+// HandleRevokeTrust removes a trust pair between two nodes, and node_id's
+// report on it if that is still waiting. Either node may revoke alone.
 func (st *Store) HandleRevokeTrust(req map[string]interface{}) (map[string]interface{}, error) {
 	nodeA := jsonUint32(req, "node_id")
 	nodeB := jsonUint32(req, "peer_id")
@@ -232,8 +273,14 @@ func (st *Store) HandleRevokeTrust(req map[string]interface{}) (map[string]inter
 	}
 
 	key := pairKey(nodeA, nodeB)
-	if !st.trustPairs.remove(key) {
+	removed := st.trustPairs.remove(key)
+	withdrawn := st.claims.withdraw(nodeA, nodeB)
+	if !removed && !withdrawn {
 		return nil, fmt.Errorf("no trust pair between %d and %d", nodeA, nodeB)
+	}
+	if !removed {
+		st.cb.Audit("trust.claim_withdrawn", "node_a", nodeA, "node_b", nodeB)
+		return map[string]interface{}{"type": "revoke_trust_ok"}, nil
 	}
 
 	st.cb.Save()
